@@ -250,6 +250,79 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
+/// Whether `shaders` are a compute pipeline that walks ray-tracing
+/// structures: a program with the node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`) that is not one of the builder's.
+#[cfg(windows)]
+fn of_tracer(shaders: &[Arc<Shader>]) -> bool {
+    use victory_shader::{Container, FourCC, gfx10::decode};
+    let [shader] = shaders else { return false };
+    if shader.stage != "compute" {
+        return false;
+    }
+    let Ok(c) = Container::parse(&shader.container) else {
+        return false;
+    };
+    let Some(Ok(programs)) = c.part(FourCC::DXIL).map(|part| victory_shader::native_programs(part.data)) else {
+        return false;
+    };
+    !programs.iter().any(victory_shader::spill::is_spilled)
+        && programs.iter().any(|p| {
+            decode(&p.code).is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+        })
+}
+
+/// The frame of the last dispatch of the structure builder that ran
+/// (`u64::MAX`: none yet).
+#[cfg(windows)]
+static BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// A builder dispatch is about to run.
+#[cfg(windows)]
+pub(crate) fn builder_ran() {
+    BUILT.store(crate::frame::current(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the title's pipeline `this` walks ray-tracing structures
+/// ([`of_tracer`]).
+#[cfg(windows)]
+pub(crate) fn is_tracer(this: This) -> bool {
+    !this.is_null() && pipeline(this).tracer
+}
+
+/// At a dispatch of a pipeline that walks ray-tracing structures: whether
+/// it runs. Only while the structure builder has run in this frame or the
+/// two before: without it the per-frame structures (the scene's instances)
+/// are not there, every ray misses, and the passes write "unshadowed" and
+/// "nothing hit" over the whole picture, which looked worse than not
+/// running them at all. Such a pass dropped leaves its output as it was
+/// before these programs translated.
+/// `VICTORY_RT_GATE=0` runs them regardless (to look at them without
+/// structures); `VICTORY_RT_SHADOWS=0` still keeps the shadow programs
+/// out (`draw.rs`).
+#[cfg(windows)]
+pub(crate) fn tracer_runs() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static GATE: OnceLock<bool> = OnceLock::new();
+    if !*GATE.get_or_init(|| std::env::var_os("VICTORY_RT_GATE").is_none_or(|v| v != "0")) {
+        return true;
+    }
+    let built = BUILT.load(Relaxed);
+    let runs = built != u64::MAX && crate::frame::current().saturating_sub(built) <= 2;
+    static WAS: AtomicBool = AtomicBool::new(false);
+    if WAS.swap(runs, Relaxed) != runs {
+        if runs {
+            tracing::info!("ray-traced passes run: the structure builder has run");
+        } else {
+            tracing::info!(
+                last_built = built,
+                "ray-traced passes are held back: the structure builder has not run lately (VICTORY_BVH_BUILDER=1 turns it on)"
+            );
+        }
+    }
+    runs
+}
+
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
 /// stays in the host's copies and is not copied back into title memory. A
 /// check for a first run of the whole builder: a stage that stores where
@@ -357,6 +430,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Walks ray-tracing structures ([`tracer_runs`]).
+    #[cfg(windows)]
+    tracer: bool,
     /// A precompiled graphics pipeline (device method 0x1c8): host
     /// pipelines made per set of bound target formats, as it names none.
     #[cfg(windows)]
@@ -611,6 +687,8 @@ fn hand_out_with(
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
+    let tracer = !builder && of_tracer(&shaders);
+    #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -624,6 +702,8 @@ fn hand_out_with(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        tracer,
         #[cfg(windows)]
         variants,
         shaders,

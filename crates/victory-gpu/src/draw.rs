@@ -1725,13 +1725,23 @@ impl State {
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            if !crate::pipeline::builder_runs() {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                    self.list_dropped_roots([x, y, z]);
+                }
+                return;
+            }
+            crate::pipeline::builder_ran();
+        }
+        // Passes that walk the structures run only while the builder does.
+        if crate::pipeline::is_tracer(self.pipeline as This) && !crate::pipeline::tracer_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
-                self.list_dropped_roots([x, y, z]);
-            }
+            crate::pipeline::note_why("a ray-traced pass, held back while the structure builder does not run".to_owned());
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.formats) else {
