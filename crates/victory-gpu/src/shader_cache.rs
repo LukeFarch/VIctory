@@ -33,7 +33,7 @@ pub fn use_shader_cache(dir: PathBuf) {
 }
 
 /// Shaders found in the cache and translated since the start.
-pub(crate) fn counts() -> (u64, u64) {
+pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
@@ -101,7 +101,12 @@ fn build() -> &'static [u8; 32] {
 /// keyed as a run of this same executable, with the same switches, looks
 /// it up, so a first world frame finds its shaders translated.
 pub fn warm(container: &[u8]) -> bool {
-    host_shader(container).is_ok()
+    warm_outcome(container).is_ok()
+}
+
+/// [`warm`], with the reason a container does not translate.
+pub fn warm_outcome(container: &[u8]) -> Result<(), String> {
+    host_shader(container).map(drop)
 }
 
 /// The translation of a console shader container, from the cache when
