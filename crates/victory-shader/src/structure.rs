@@ -643,11 +643,7 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
-            paired_masks: if self.p.wave64 {
-                self.masks
-            } else {
-                Map::default()
-            },
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             bools: self.b,
             exits,
