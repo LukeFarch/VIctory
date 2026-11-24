@@ -59,30 +59,34 @@ world loads and the game runs (audio plays, no hang with 578), but the picture i
 The title's own compute passes write the arguments, so most of these drops probably come from A and B (a pass that never
 runs writes no arguments). Re-measure after A and B. Then log drops by reason so the rest can be ranked.
 
-### D. Frame rate (85): the per-frame copy of title memory is the blocker
-Round 1 (93f94d9): menus run at 30 fps, but world frames are CPU-bound. Preparing submissions spends 150-230 ms a frame
-copying title memory (400-900 ms with diagnostics on). The GPU is not the limit yet.
+### D. Frame rate (85)
+Round 1 copy statistics (93f94d9, diagnostics build):
 
-What already exists: copies are by 64 KiB page and skip pages the title hasn't written (write watching, or guard faults
-on physical-page views), and shader writes are copied back by piece.
+| Stretch | Frame | Preparing (copies) | GPU | Copy back | Not accounted for |
+|---|---|---|---|---|---|
+| Heavy, early in the world | 1,017 ms | 373 ms (250 ms, 409 MB) | 82 ms | 57 ms | ~500 ms |
+| Calm, later | 445 ms | 51 ms (35 ms, 4.3 MB) | 65 ms | 17 ms | ~310 ms |
 
-Where the time most likely goes, in order of suspicion (to confirm from the per-frame `copies per frame` line and the top
-`copied from` ranges, logged by diagnostics builds every 5 s):
-1. **Snapshot and compare around shader writes.** Each submission that lets shaders write the world's 174 MB heap first
-   snapshots the whole declared range (`Shadow::writing`), then afterwards compares all of it (`Shadow::copy_back`). That is
-   several hundred MB of memory traffic per submission, times the submissions per frame.
-2. **Copies of pages the title rewrites every frame** (constants, command memory sharing the big heap).
-3. **Diagnostics overhead** (per-range stats), which explains the 400-900 ms.
+What this shows:
+- **Steady state is not copy-bound.** In the calm stretch, dirty-page tracking works: 293 MB checked, 288 MB unchanged,
+  4.3 MB copied. Most of the frame is time that none of these counters cover. Before optimizing anything else, that needs
+  a CPU profile. Windows Performance Recorder is built in (`wpr -start CPU`, play 20 s in the world, `wpr -stop world.etl`,
+  open it in Windows Performance Analyzer). Likely suspects: submissions run synchronously (the title's thread waits for the GPU
+  and the copy back before it continues, so CPU and GPU never overlap), shader and pipeline creation on the title's
+  threads, and HLE calls.
+- **The heavy stretch is warm-up.** First copies of the world's big buffers (409 MB a frame through `ReadProcessMemory`)
+  and about 10,000 page faults a frame. Part of that is the per-submission snapshot of shader-written ranges, which
+  branch `perf/snapshot` now keeps between submissions.
+- **Write-watch checks cost 35 ms a frame** in the calm stretch (72 checks). Checking each buffer once per frame
+  instead of per submission would cut that.
 
-Candidate wins, cheapest first:
-- **Keep the snapshot between submissions.** Update it where the copy changes (refreshes, copy-back) instead of re-copying the
-  whole range at every submission. This removes one full pass over the range.
-- **Find changes on the GPU.** Copy the declared range on the GPU at submission start (cheap there), have a small compute pass
-  compare it after the submission, and read back a bitmap of changed 64 KiB pieces. The CPU then touches only those pieces.
-  This removes both passes and is the real fix.
-- **Fewer submissions per frame:** batch the title's command lists into one host submission where their fences allow.
-- **Put hot buffers in GPU memory** (constants rewritten every frame stay in system memory, the static world heap moves
-  to video memory). This is the GPU side, for once the CPU side is fixed.
+Plan, in order:
+1. `perf/snapshot` (done, needs a run): no per-submission snapshot copy, fewer page faults.
+2. CPU profile of a calm stretch, to find the unaccounted ~310 ms.
+3. Most likely fix from that: **asynchronous submission.** Let the title continue while the GPU runs, and copy back
+   shader writes when the title next waits on that fence, not inline.
+4. Write-watch checks once per buffer per frame.
+5. GPU side, once the CPU side is fixed: hot static buffers in video memory instead of system memory.
 
 ### Upstream
 Upstream each piece after it runs clean for a full session: the mesh relaxation as a follow-up to 578, the watchdog, and
