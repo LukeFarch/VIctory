@@ -601,11 +601,12 @@ pub(crate) struct Plane {
 /// The part of the plane's first resource to show, if the plane names one
 /// that lies inside the resource and is not all of it. Read through the
 /// kernel, so a plane laid out otherwise than assumed costs nothing but
-/// this check (`VICTORY_PRESENT_RECT=0` turns it off).
+/// this check. Off until a run's log shows the layout is right
+(`VICTORY_PRESENT_RECT=1`): run 9 flickered blue and black with it on.
 #[cfg(windows)]
 fn source_rect(plane: &Plane, width: u64, height: u32) -> Option<[u32; 4]> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_RECT").is_none_or(|v| v != "0")) {
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_RECT").is_some_and(|v| v == "1")) {
         return None;
     }
     if plane.source_rects.is_null() {
