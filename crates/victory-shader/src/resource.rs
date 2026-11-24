@@ -46,6 +46,12 @@ pub const CODE: usize = usize::MAX;
 /// 64-bit address from the instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
 
+/// [`Address::param`] of the driver's table of a merged geometry program:
+/// the address in its first two user-data dwords, which no root parameter
+/// describes (the title's start at dword 8). The console driver fills it;
+/// the lowering gives the words the program reads.
+pub const DRIVER: usize = usize::MAX - 2;
+
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
 const RAW: [&str; 5] = [
@@ -947,6 +953,22 @@ impl<'a> Tracer<'a> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
+        }
+        // The driver table of a geometry program (user-data dword 0, no root
+        // parameter): its high half is the driver's too (masked to 40 bits),
+        // so it is not checked.
+        let driver = Reg::S(self.stage.user_sgpr(0));
+        if self.stage == HwStage::Gs
+            && s.base.is_none()
+            && s.dynamic
+                .is_some_and(|v| self.inputs[v.0 as usize] == Some(driver))
+            && self.param_of(driver).is_none()
+        {
+            return Ok(Address {
+                param: DRIVER,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: extra.dynamic,
+            });
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {

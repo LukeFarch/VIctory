@@ -84,6 +84,8 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod geometry_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -289,8 +291,8 @@ pub(crate) fn why_label() -> String {
     })
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, pixel, compute, mesh or geometry program of a
+/// console shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
@@ -301,12 +303,12 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
@@ -630,7 +632,13 @@ fn emit_program(
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
-    let interpolated = if pixel { &mut inputs } else { &mut outputs };
+    // A geometry shader's inputs carry the vertex shader's modes too.
+    let geometry = native.stage == HwStage::Gs;
+    let interpolated = match (pixel, geometry) {
+        (true, _) => inputs.iter_mut().collect::<Vec<_>>(),
+        (false, false) => outputs.iter_mut().collect(),
+        (false, true) => inputs.iter_mut().chain(outputs.iter_mut()).collect(),
+    };
     for e in interpolated {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,

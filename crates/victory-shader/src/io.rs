@@ -30,6 +30,14 @@
 //! bit 31 culls); `param` entries with bit 7 are per-primitive outputs. One
 //! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
 //! primitives << 12).
+//!
+//! Geometry programs are the second half of a merged stage. They get the
+//! merged wave info in s3, an output offset in s2, the LDS offsets of their
+//! input vertices in v0, v1 and v4 (two 16-bit dword offsets each), the
+//! primitive id in v2 and the GS instance in v3. They read their inputs
+//! from and write their output vertices to LDS, and export nothing:
+//! `s_sendmsg` says when a vertex or strip is complete (see
+//! [`crate::native::GeometryIo`]).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -68,8 +76,16 @@ pub enum Input {
     GroupInfo,
     /// Mesh: v5, the group id times the group size (read as uniform).
     MeshGroup,
-    /// Mesh: s3, the wave's index in the group in bits 24-27.
+    /// Mesh: s3, the wave's index in the group in bits 24-27. Geometry: s3
+    /// with the GS lanes in bits 8-15 as well.
     MergedWaveInfo,
+    /// Geometry: the LDS offsets in dwords of input vertices 2k and 2k + 1
+    /// (bits 0-15 and 16-31): v0, v1 and v4.
+    GsVertexPair(u8),
+    /// Geometry: the GS instance (v3).
+    GsInstance,
+    /// Geometry: s2, which the program adds to its output area's base.
+    GsOutputOffset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +318,19 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             ];
             (loaded, &[][..], &ms.outputs[..])
         }
+        (StageIo::Gs(_), HwStage::Gs) => {
+            let loaded = vec![
+                (Reg::V(0), Input::GsVertexPair(0)),
+                (Reg::V(1), Input::GsVertexPair(1)),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::V(3), Input::GsInstance),
+                (Reg::V(4), Input::GsVertexPair(2)),
+                (Reg::S(2), Input::GsOutputOffset),
+                (Reg::S(3), Input::MergedWaveInfo),
+            ];
+            // No parameter exports: the outputs leave through LDS.
+            (loaded, &[][..], &[][..])
+        }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
     let inputs: Vec<(Value, Input)> = p
@@ -416,6 +445,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                     _ => return Err(unsupported(at, "an interpolation form")),
                 },
+                Fields::Exp { .. } if native.stage == HwStage::Gs => {
+                    return Err(unsupported(at, "an export in a geometry program"));
+                }
                 Fields::Exp {
                     target,
                     src,

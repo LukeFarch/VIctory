@@ -58,10 +58,14 @@
 //!             u16 maximum primitives, u8 user SGPRs, u8 output topology
 //!             (2 triangles); code follows at E+0x45c
 //! record +0x4c u32 LDS bytes (`lds_byte_size`; mesh programs read it here)
+//! GS  E+0x150 outputs as VS (the VS layout 0x88 further on), E+0x210 count;
+//!             E+0x27c u32 output dwords per lane, E+0x284 u32 maximum
+//!             vertices, E+0x28c u32 output dwords per vertex
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! The other merged stages (LS, HS, ES) keep their stage data in another
+//! layout (not read).
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -119,6 +123,11 @@ const CS_RSRC2: usize = 0x24;
 const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
+/// A geometry program's stage data: the vertex layout this much further on.
+const GS_SHIFT: usize = 0x88;
+const GS_LANE_DWORDS: usize = 0x27c;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX_DWORDS: usize = 0x28c;
 const MS_INFO: usize = 0x448;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
@@ -268,6 +277,23 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// A geometry program's outputs and limits. It runs as the second half of
+/// a merged hardware stage: its input vertices are in LDS where the first
+/// half (the vertex program compiled as an ES) wrote them, input register r
+/// at dwords 4r..4r+3 from the vertex's offset. Its output vertices go to
+/// LDS as well, `vertex_dwords` each (slot 0 the position, slot 1 + p the
+/// output exported as parameter p), `lane_dwords` per lane; `s_sendmsg`
+/// GS_EMIT and GS_CUT say which make up the strips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryIo {
+    /// What each output slot after the position holds (`param`: slot - 1).
+    pub outputs: Vec<VsOutput>,
+    pub max_vertices: u32,
+    pub vertex_dwords: u32,
+    pub lane_dwords: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -538,6 +564,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::Gs => gs_io(stage_data)?,
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -611,6 +638,38 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     })
 }
 
+fn gs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
+    let outputs = vs_outputs(data, VS_OUTPUTS + GS_SHIFT, VS_OUTPUT_COUNT + GS_SHIFT)?;
+    let max_vertices = u32_at(data, GS_MAX_VERTICES)?;
+    let vertex_dwords = u32_at(data, GS_VERTEX_DWORDS)?;
+    // D3D's limit is 1024 scalars an invocation; anything far past it is
+    // not this layout.
+    if max_vertices > 1024 || vertex_dwords > 4 * 33 {
+        return Err(Malformed("implausible geometry output limits"));
+    }
+    Ok(StageIo::Gs(GeometryIo {
+        outputs,
+        max_vertices,
+        vertex_dwords,
+        lane_dwords: u32_at(data, GS_LANE_DWORDS)?,
+    }))
+}
+
+fn vs_outputs(data: &[u8], at: usize, count_at: usize) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, at, 6, count_at)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|e| VsOutput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            param: e[2],
+            fp16: e[5] & 1 != 0,
+            pack2: e[5] & 2 != 0,
+        })
+        .collect())
+}
+
 fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
         .as_chunks::<5>()
@@ -623,18 +682,7 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             vgpr: e[3],
         })
         .collect();
-    let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|e| VsOutput {
-            usage: Usage::from_raw(e[0]),
-            row: e[1],
-            param: e[2],
-            fp16: e[5] & 1 != 0,
-            pack2: e[5] & 2 != 0,
-        })
-        .collect();
+    let outputs = vs_outputs(data, VS_OUTPUTS, VS_OUTPUT_COUNT)?;
     Ok(StageIo::Vs { inputs, outputs })
 }
 
@@ -902,6 +950,40 @@ mod tests {
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].stage, stage);
         }
+    }
+
+    #[test]
+    fn reads_geometry_outputs_and_limits() {
+        let mut blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        // Two generic outputs: rows 1 and 2 as parameters 0 and 1.
+        let outputs = e + VS_OUTPUTS + GS_SHIFT;
+        blob[outputs..][..12].copy_from_slice(&[6, 1, 0, 0, 0, 0, 6, 2, 1, 0, 0, 0]);
+        blob[e + VS_OUTPUT_COUNT + GS_SHIFT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        // Three vertices of 12 dwords (position and the two outputs).
+        blob[e + GS_LANE_DWORDS..][..4].copy_from_slice(&36u32.to_le_bytes());
+        blob[e + GS_MAX_VERTICES..][..4].copy_from_slice(&3u32.to_le_bytes());
+        blob[e + GS_VERTEX_DWORDS..][..4].copy_from_slice(&12u32.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        let out = |row, param| VsOutput {
+            usage: Usage::Generic,
+            row,
+            param,
+            fp16: false,
+            pack2: false,
+        };
+        assert_eq!(p.stage, HwStage::Gs);
+        assert_eq!(
+            p.io,
+            StageIo::Gs(GeometryIo {
+                outputs: vec![out(1, 0), out(2, 1)],
+                max_vertices: 3,
+                vertex_dwords: 12,
+                lane_dwords: 36,
+            })
+        );
+        blob[e + GS_MAX_VERTICES..][..4].copy_from_slice(&5000u32.to_le_bytes());
+        assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
     }
 
     #[test]

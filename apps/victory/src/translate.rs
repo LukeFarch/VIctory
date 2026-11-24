@@ -438,7 +438,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || matches!(p.stage, HwStage::Ms | HwStage::Gs) {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -704,14 +704,12 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.
+        // (`get`: title memory and the driver table are no parameter either)
         if let Some(a) = a
-            && a.param != resource::CODE
-            && !matches!(
-                p.layout[a.param].root,
-                RootType::ResourceHeap | RootType::SamplerHeap
-            )
+            && let Some(rp) = p.layout.get(a.param)
+            && !matches!(rp.root, RootType::ResourceHeap | RootType::SamplerHeap)
         {
-            traced.insert(p.layout[a.param].user_data);
+            traced.insert(rp.user_data);
         }
     }
     // Root constants are listed as a CBV, read straight from the SGPRs.
