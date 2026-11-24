@@ -190,6 +190,7 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let shown = warm.then(|| crate::warm_progress::start(&paths, threads));
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -202,6 +203,9 @@ pub fn run(
                 continue;
             };
             let jobs = sources(&data);
+            if warm {
+                crate::warm_progress::file(data.len(), jobs.len());
+            }
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
@@ -228,6 +232,7 @@ pub fn run(
             });
         }
     }
+    let warm_summary = shown.map(crate::warm_progress::Shown::finish);
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "containers   {} ({} duplicates skipped)",
@@ -305,6 +310,9 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    if let Some(summary) = warm_summary {
+        println!("{summary}");
+    }
     Ok(())
 }
 
@@ -344,21 +352,29 @@ fn translate(
     if WARM.load(Ordering::Relaxed) {
         if !lock(seen).insert(blake3::hash(&bytes)) {
             t.duplicates += 1;
+            crate::warm_progress::duplicate();
+            return;
+        }
+        // The programs' code heads, for the precompiled pipeline methods.
+        if let Ok(c) = Container::parse(&bytes)
+            && let Some(dxil) = c.part(FourCC::DXIL)
+            && let Ok(programs) = native_programs(dxil.data)
+        {
+            for p in &programs {
+                victory_gpu::precompiled::record(&p.code, &format!("{:?}", p.stage), &bytes);
+            }
+        }
+        let name = || {
+            let file = path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned());
+            format!("{file} {} #{hash}", source.label())
+        };
+        crate::warm_progress::begin(name);
+        let outcome = victory_gpu::shader_cache::warm_outcome(&bytes);
+        crate::warm_progress::outcome(&outcome, name);
+        if outcome.is_ok() {
+            t.translated += 1;
         } else {
-            // The programs' code heads, for the precompiled pipeline methods.
-            if let Ok(c) = Container::parse(&bytes)
-                && let Some(dxil) = c.part(FourCC::DXIL)
-                && let Ok(programs) = native_programs(dxil.data)
-            {
-                for p in &programs {
-                    victory_gpu::precompiled::record(&p.code, &format!("{:?}", p.stage), &bytes);
-                }
-            }
-            if victory_gpu::shader_cache::warm(&bytes) {
-                t.translated += 1;
-            } else {
-                t.fail("does not translate".into(), example);
-            }
+            t.fail("does not translate".into(), example);
         }
         return;
     }

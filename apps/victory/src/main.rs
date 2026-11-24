@@ -8,6 +8,7 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+mod warm_progress;
 
 use std::path::PathBuf;
 
