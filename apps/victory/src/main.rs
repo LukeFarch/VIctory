@@ -169,6 +169,11 @@ fn main() -> Result<()> {
             if let Some(n) = host_wave("VICTORY_HOST_WAVE").or_else(|| host_wave("VICTORY_HOST_MAX_WAVE")) {
                 victory_shader::emit::set_host_max_wave(n);
             }
+            if warm && victory_shader::emit::host_max_wave() == 0 {
+                // Unset: this PC's GPU decides, as it does for the run.
+                victory_gpu::detect_host_wave();
+                println!("host wave    {} lanes (from this PC's GPU)", victory_shader::emit::host_max_wave());
+            }
             if warm {
                 // The run sets the host's widest wave from the GPU before it translates; the
                 // cache is keyed by it, so a warm without it fills entries no run finds.

@@ -20,6 +20,14 @@ pub const HEAD: usize = 24;
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// Whether the precompiled pipeline methods make pipelines (on unless
+/// `VICTORY_PRECOMPILED=0`, which leaves the title without them, as before:
+/// the A/B switch for anything they draw wrong).
+pub(crate) fn on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRECOMPILED").is_none_or(|v| v != "0"))
+}
+
 /// Looks programs up in (or, when warming, writes them to) `dir`.
 pub fn use_precompiled(dir: PathBuf) {
     let _ = DIR.set(dir);

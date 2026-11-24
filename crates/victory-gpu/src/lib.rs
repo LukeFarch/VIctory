@@ -37,6 +37,16 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 pub mod precompiled;
+
+/// Sets the translator's host wave width from this PC's GPU (as a run
+/// does when it starts), for tools that translate ahead of a run; whether
+/// a GPU was found.
+pub fn detect_host_wave() -> bool {
+    #[cfg(windows)]
+    return host::host().is_some();
+    #[cfg(not(windows))]
+    false
+}
 #[cfg(windows)]
 mod primitive;
 pub mod query;

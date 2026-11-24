@@ -737,6 +737,10 @@ pub(crate) extern "system" fn create_precompiled_compute(
     }
     #[cfg(windows)]
     {
+        if !crate::precompiled::on() {
+            missed(0x218, "VICTORY_PRECOMPILED=0");
+            return E_NOTIMPL;
+        }
         let Some(w) = words::<12>(desc) else {
             missed(0x218, "description unreadable");
             return E_INVALIDARG;
@@ -774,6 +778,10 @@ pub(crate) extern "system" fn create_precompiled_graphics(
     }
     #[cfg(windows)]
     {
+        if !crate::precompiled::on() {
+            missed(0x1c8, "VICTORY_PRECOMPILED=0");
+            return E_NOTIMPL;
+        }
         let Some(w) = words::<13>(desc) else {
             missed(0x1c8, "description unreadable");
             return E_INVALIDARG;
@@ -810,7 +818,7 @@ pub(crate) extern "system" fn create_precompiled_graphics(
             }
         }
         let Some(vertex) = vertex else {
-            missed(0x1c8, "no vertex program");
+            missed(0x1c8, &format!("no vertex program (description {:x?})", &w[..13]));
             return E_NOTIMPL;
         };
         let mut shaders = vec![shader("vertex", &vertex)];
