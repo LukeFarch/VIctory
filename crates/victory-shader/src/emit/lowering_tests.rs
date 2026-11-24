@@ -293,3 +293,64 @@ fn a_structured_store_through_a_table_finds_its_stride() {
     w.extend_from_slice(&[0xE07C_2000, 0x8000_0003]);
     lower_raw(layout, used, 6, w).unwrap();
 }
+
+/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], 0`.
+const fn s_load_dwordx8(dst: u8, base: u8) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25,
+    ]
+}
+
+/// `image_gather4_l v[7:10], v[14:16], s[12:19], s[20:23] dmask:0x1
+/// dim:2D` after loading the image and sampler from tables in s6 and s7.
+fn gather_l_program(dim: u32) -> Vec<u32> {
+    let mut w = vec![
+        s_mov_b32(26, 6),
+        s_mov_b32(27, 0x80),
+        s_mov_b32(28, 7),
+        s_mov_b32(29, 0x80),
+    ];
+    w.extend_from_slice(&s_load_dwordx8(12, 26));
+    w.extend_from_slice(&s_load_dwordx4(20, 28));
+    w.push(vop1(0x001, 14, 0xF0)); // v_mov_b32 v14, 0.5
+    w.push(vop1(0x001, 15, 0xF0)); // v_mov_b32 v15, 0.5
+    w.push(vop1(0x001, 16, 0xF4)); // v_mov_b32 v16, 2.0
+    w.push(0xF000_0000 | 0x44 << 18 | 1 << 8 | dim << 3);
+    w.push(5 << 21 | 3 << 16 | 7 << 8 | 14);
+    w.push(vop1(0x001, 0, 256 + 9)); // v_mov_b32 v0, v9
+    w
+}
+
+fn image_tables() -> (Vec<RootParam>, Vec<UsedResource>, u8) {
+    let (mut layout, mut used, _) = usual_layout();
+    layout.push(table(6, 0, 2));
+    layout.push(table(7, 0, 3));
+    used.push(UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 6,
+        slot: 2,
+    });
+    used.push(UsedResource {
+        kind: ResourceType::Sampler,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 7,
+        slot: 3,
+    });
+    (layout, used, 8)
+}
+
+#[test]
+fn a_gather_at_a_level_loads_the_footprint() {
+    let (l, u, n) = image_tables();
+    lower_cs_with(l, u, n, &gather_l_program(1)).unwrap();
+}
