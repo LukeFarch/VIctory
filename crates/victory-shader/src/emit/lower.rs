@@ -2644,6 +2644,48 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// The title address (low, high dword) of the buffer view that the
+    /// descriptor load at `site` picks from the view heap by an index the
+    /// code computes (root type `ResourceHeap`), read from the host's table
+    /// by heap slot ([`super::shader::SLOT_STRIDES`]: after the strides, two
+    /// dwords per slot); `None` for a load of another kind.
+    fn heap_view_address(&mut self, site: Site) -> Result<Option<(V, V)>, Why> {
+        use super::shader::{SLOT_STRIDES, SLOT_STRIDES_COUNT};
+        let heap = self
+            .scalar
+            .get(&site)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| p.root == RootType::ResourceHeap);
+        if !heap {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(site, 0, false)?;
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let past = self.s.m.i32(SLOT_STRIDES_COUNT * 4);
+        let byte = self.s.m.bin(c, Bin::Add, byte, past);
+        let h = self.s.root_srv_handle(SLOT_STRIDES);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(3);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let lo = self.s.m.extract(c, r, 0);
+        let hi = self.s.m.extract(c, r, 1);
+        Ok(Some((self.as_int(lo), self.as_int(hi))))
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -5602,6 +5644,28 @@ impl<'a> Lower<'a> {
             // from the host, the other dwords have no value.
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
+            {
+                for k in 0..count {
+                    let reg = Reg::S(code + k as u8);
+                    match k {
+                        0 => self.write(inst, reg, lo, None),
+                        1 => self.write(inst, reg, hi, None),
+                        _ => {
+                            if let Some(v) = inst.write(reg) {
+                                self.vals.insert(v, Val::Missing(OTHER));
+                                self.stale.insert(v);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // The same, for a buffer view the code picks from the view heap
+            // by an index it computes (the root of a ray-tracing structure
+            // per light, `shadowmask:CS_TraceShadowRays_*`): the address
+            // from the host's table by heap slot.
+            if count <= 4
+                && let Some((lo, hi)) = self.heap_view_address(site)?
             {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
