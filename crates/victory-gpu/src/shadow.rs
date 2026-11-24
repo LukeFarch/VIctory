@@ -40,7 +40,12 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
+    /// A mirror of the copy's bytes, from an offset on: what the copy held
+    /// before the running submission's shaders wrote it. Kept between
+    /// submissions and updated wherever the copy changes (refreshes from
+    /// title memory, bytes written back), so a submission need not take it
+    /// again. Before this, each submission re-copied the whole declared
+    /// range (the world's 174 MB heap) only to compare it afterwards.
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
 }
@@ -193,12 +198,13 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
-        {
-            let before = &before[from - taken..to - taken];
+        let covered = match &*snapshot {
+            Some((taken, before)) => {
+                (*taken <= from && to <= taken + before.len() && from < to).then_some(*taken)
+            }
+            None => None,
+        };
+        if let Some(taken) = covered {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -210,13 +216,16 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let Some((_, before)) = &mut *snapshot else {
+                    unreachable!("checked above")
+                };
+                let old = &mut before[at - taken..at - taken + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter()) {
                         if *h != *o && *t != *h {
                             *t = *h;
                             changed = true;
@@ -228,10 +237,14 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
+                    // The copy as it now is, for the next submission.
+                    old.copy_from_slice(host);
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
+            // Not held with `copied` (refreshes take `copied`, then this).
+            drop(snapshot);
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
@@ -249,14 +262,9 @@ impl Shadow {
             }
         }
         // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // submission runs at a time). The mirror stays for the next one.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
-        }
         written
     }
 
@@ -362,7 +370,23 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        self.mirror(from - start, to - start);
         to - from
+    }
+
+    /// Takes `[from, to)` of the copy (offsets) into the mirror where the
+    /// mirror covers it: the copy changed there outside a submission's
+    /// shader writes.
+    fn mirror(&self, from: usize, to: usize) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, bytes)) = &mut *before {
+            let (a, b) = (from.max(*at), to.min(*at + bytes.len()));
+            if a < b {
+                // SAFETY: inside the mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+                bytes[a - *at..b - *at].copy_from_slice(host);
+            }
+        }
     }
 }
 
