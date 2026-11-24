@@ -282,6 +282,10 @@ struct Lower<'a> {
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
     balloting: HashSet<Value>,
+    /// Masks [`Self::mask_computed`] is building as numbers.
+    computing: HashSet<Value>,
+    /// The next [`Self::sop`] is [`Self::mask_computed`]'s: its mask result is a number.
+    numbering: bool,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
@@ -1587,6 +1591,8 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
+            computing: HashSet::new(),
+            numbering: false,
             def_block: p
                 .blocks
                 .iter()
@@ -3227,6 +3233,9 @@ impl<'a> Lower<'a> {
         let whole = self.s.geometry.is_some()
             || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            if let Some(x) = self.mask_computed(v, lo, made) {
+                return Ok(x);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -3290,6 +3299,55 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// A mask with lanes elsewhere that a scalar operation writes, as the number the operation
+    /// makes of its sources' numbers, where it stands: a mask kept in a register that numbers
+    /// share (a node index joined with a saved mask, masked and ORed with a level's bits),
+    /// whose lane bit no ballot here gives. Exact where its sources are: masks among them
+    /// come as data their own way, numbers as they are. Compute only, whose host lanes are
+    /// the console's. None where the operation is not one or a source has no number.
+    fn mask_computed(&mut self, v: Value, lo: Value, made: Option<usize>) -> Option<V> {
+        if self.mask_data != MaskData::Console || self.s.geometry.is_some() {
+            return None;
+        }
+        let b = made?;
+        let p = self.x.p;
+        let inst: &'a Inst =
+            p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        if !matches!(inst.fields, Fields::Sop { .. }) || inst.write(Reg::S(EXEC)).is_some() {
+            return None;
+        }
+        let at = if b == self.cur_ir { self.cur } else { self.tail[b]? };
+        // (a mask computed from itself through a join has no number to start from)
+        if !self.computing.insert(lo) {
+            return None;
+        }
+        let kept: Vec<(Value, Option<Val>)> =
+            inst.writes.iter().map(|w| (w.1, self.vals.get(&w.1).copied())).collect();
+        let (cur, cur_ir) = (self.cur, self.cur_ir);
+        (self.cur, self.cur_ir) = (at, b);
+        self.numbering = true;
+        let r = self.sop(inst);
+        (self.cur, self.cur_ir) = (cur, cur_ir);
+        self.numbering = false;
+        self.computing.remove(&lo);
+        let x = match (r, self.vals.get(&v)) {
+            (Ok(()), Some(&Val::I32(x))) => Some(x),
+            _ => None,
+        };
+        // Only the mask's dwords keep their numbers: SCC and the like stay as they were.
+        let pair = self.x.st.highs.iter().find(|h| *h.1 == lo).map(|h| *h.0);
+        for (w, old) in kept {
+            if x.is_some() && (w == lo || Some(w) == pair) {
+                continue;
+            }
+            match old {
+                Some(val) => self.vals.insert(w, val),
+                None => self.vals.remove(&w),
+            };
+        }
+        x
     }
 
     // ---- operands ----
@@ -5109,7 +5167,11 @@ impl<'a> Lower<'a> {
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         // (A geometry invocation is lane 0 of a wave of its own: a mask it
         // computes is a number, of which only bit 0 means anything.)
-        if (inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo)) && self.s.geometry.is_none() {
+        // (Not one [`Self::mask_computed`] asks for as a number.)
+        let numbering = std::mem::take(&mut self.numbering);
+        if (inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !numbering)
+            && self.s.geometry.is_none()
+        {
             return Err(LANE_MASK);
         }
         if matches!(

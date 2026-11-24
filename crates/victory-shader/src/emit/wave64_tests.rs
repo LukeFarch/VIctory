@@ -401,6 +401,41 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
     eprintln!("ran on the hardware device: the mask's bits, or the number");
 }
 
+/// A 32-lane console wave. As above, with the joined register masked before it is read as a
+/// number (`s_and_b32` with a literal), as the trace programs take a node's index from a
+/// stack entry (`CS_TraceShadowRays`, s35 at 0x9c84 and 0xae74). The result
+/// holds lanes outside EXEC where it is written (the join's mask is a mask of elsewhere): it
+/// is the AND of the join's number with the literal, not a ballot there.
+#[test]
+fn a_joined_lane_mask_masked_with_a_number_is_read_as_the_number_it_is() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+        0xBE94_036A, // s_mov_b32 s20, vcc_lo
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0001, // s_cbranch_scc1 over the next
+        0xBE94_0385, // s_mov_b32 s20, 5
+        0x8715_FF14, // s_and_b32 s21, s20, lit
+        0x00FF_00FF,
+        0x7E00_0215, // v_mov_b32 v0, s21
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let cases = [(32u32, 0u32, 0x00FF_00FFu32), (10, 0, 0xFF), (0, 0, 0), (10, 1, 5)];
+    for (below, other, expected) in cases {
+        let Some(got) = on_the_card(&shader, [below, other]) else { return };
+        assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");
+    }
+    eprintln!("ran on the hardware device: the masked mask's bits, or the number");
+}
+
 /// A 32-lane console wave. `if (t < s0) { ... SCC = (s1 == 7) }` and a branch on SCC after
 /// the join: the skip brings the SCC of `s_and_saveexec` ("some lane is left") along
 /// (`rtdirectionalshadows:CS_RTShadowTrace32HQ_TiledFarOnly`, 0x360-0x39c). On the console
