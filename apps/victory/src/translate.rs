@@ -158,7 +158,9 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    warm: bool,
 ) -> Result<()> {
+    WARM.store(warm, Ordering::Relaxed);
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
@@ -306,6 +308,9 @@ pub fn run(
     Ok(())
 }
 
+/// `--warm`: translations only go to the shader cache.
+static WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -336,6 +341,16 @@ fn translate(
     }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
+    if WARM.load(Ordering::Relaxed) {
+        if !lock(seen).insert(blake3::hash(&bytes)) {
+            t.duplicates += 1;
+        } else if victory_gpu::shader_cache::warm(&bytes) {
+            t.translated += 1;
+        } else {
+            t.fail("does not translate".into(), example);
+        }
+        return;
+    }
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
