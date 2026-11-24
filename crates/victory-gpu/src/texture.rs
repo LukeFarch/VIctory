@@ -64,8 +64,20 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    /// The frame a partly mapped texture was last read in.
-    partial: Option<u64>,
+    /// When a partly mapped texture was last read.
+    partial: Option<std::time::Instant>,
+    /// When the guarded texture was last hashed.
+    hashed: Option<std::time::Instant>,
+}
+
+/// Retry and hash periods are wall-clock time, not frames: counted in
+/// frames, "every 30 frames" was 30 s at 1 fps and streaming slowed with
+/// the frame rate. The defaults are what the frame counts were at 60 fps.
+/// `VICTORY_TEXTURE_PARTIAL_MS` and `VICTORY_TEXTURE_HASH_MS` set them.
+fn period(name: &str, default: u64, cell: &'static std::sync::OnceLock<std::time::Duration>) -> std::time::Duration {
+    *cell.get_or_init(|| {
+        std::time::Duration::from_millis(std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
+    })
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -643,20 +655,23 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
+        // the hash, which is taken about every 133 ms only ([`period`]), by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            static HASH: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            // Staggered by the texture's address, so the textures take turns.
+            let every = period("VICTORY_TEXTURE_HASH_MS", 133, &HASH) + std::time::Duration::from_millis(((start >> 16) & 7) as u64 * 17);
+            let turn = last.hashed.is_none_or(|at| at.elapsed() >= every);
             if unwritten && !turn {
                 return 0;
             }
+            last.hashed = Some(std::time::Instant::now());
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -680,20 +695,21 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
+            // shortcut: read again at most every 500 ms (reading around
             // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
+            // arrive): a mip that streams in shows up to 500 ms late.
             // `VICTORY_TEXTURE_PARTIAL=0` passes partly mapped textures
             // over, as before this fork: what was uploaded stays.
             static PARTIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if !*PARTIAL.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PARTIAL").is_none_or(|v| v != "0")) {
                 return 0;
             }
-            let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            static RETRY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+            let every = period("VICTORY_TEXTURE_PARTIAL_MS", 500, &RETRY);
+            if last.partial.is_some_and(|at| at.elapsed() < every) {
                 return 0;
             }
-            last.partial = Some(frame);
+            last.partial = Some(std::time::Instant::now());
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {

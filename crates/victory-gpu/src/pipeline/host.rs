@@ -171,6 +171,32 @@ fn dword(bytes: &[u8], at: usize) -> u32 {
 /// a header whose u32 at 0x4c counts the elements, then from 0x50 per
 /// element: u32 name length (with its NUL), the name, u32 semantic index,
 /// u32 format, u32 input slot, u32 offset, u32 slot class, u32 step rate.
+/// Dual-source blending (a SRC1 factor) is legal in D3D12 on target 0
+/// only, with independent blending off: the console allows the other
+/// targets' blend state to stay set beside it, which D3D12 refuses with
+/// E_INVALIDARG (VS ed734c95, run 16a). The other targets' blend is
+/// dropped: with dual source the shader writes target 0 only.
+fn legal_dual_source(mut blend: D3D12_BLEND_DESC) -> D3D12_BLEND_DESC {
+    let src1 = |f: D3D12_BLEND| {
+        matches!(
+            f,
+            D3D12_BLEND_SRC1_COLOR | D3D12_BLEND_INV_SRC1_COLOR | D3D12_BLEND_SRC1_ALPHA | D3D12_BLEND_INV_SRC1_ALPHA
+        )
+    };
+    let t = &blend.RenderTarget[0];
+    if !(t.BlendEnable.as_bool()
+        && [t.SrcBlend, t.DestBlend, t.SrcBlendAlpha, t.DestBlendAlpha].into_iter().any(src1))
+    {
+        return blend;
+    }
+    blend.IndependentBlendEnable = false.into();
+    let first = blend.RenderTarget[0];
+    for t in &mut blend.RenderTarget[1..] {
+        *t = first;
+    }
+    blend
+}
+
 fn precompiled_inputs(layout: &[u8]) -> Vec<(CString, D3D12_INPUT_ELEMENT_DESC)> {
     let mut out = Vec::new();
     let count = dword(layout, 0x4c).min(32);
@@ -840,7 +866,7 @@ impl HostPipeline {
                 pShaderBytecode: gs.as_ptr().cast(),
                 BytecodeLength: gs.len(),
             }),
-            BlendState: g.blend,
+            BlendState: legal_dual_source(g.blend),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1003,7 +1029,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, legal_dual_source(g.blend)),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
