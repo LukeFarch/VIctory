@@ -5610,6 +5610,9 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// The size last given to `SetSourceSize` (the part of the back
+    /// buffer shown).
+    source: (u32, u32),
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -5869,7 +5872,13 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        rect: Option<[u32; 4]>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -5897,7 +5906,10 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    (p.width, p.height, p.format) = (width, height, format);
+                    p.source = (width, height);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
@@ -5943,7 +5955,37 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            // The part the title rendered into (dynamic resolution) goes to
+            // the corner of the back buffer, and the swap chain shows just
+            // that much, stretched to the window; else all of it.
+            let shown = match rect {
+                Some([l, t, r, b]) => {
+                    let src = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let dst = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&back),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let bx = D3D12_BOX {
+                        left: l,
+                        top: t,
+                        front: 0,
+                        right: r,
+                        bottom: b,
+                        back: 1,
+                    };
+                    list.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&bx));
+                    (r - l, b - t)
+                }
+                None => {
+                    list.CopyResource(&back, texture);
+                    (width, height)
+                }
+            };
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -5971,6 +6013,12 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            if p.source != shown
+                && let Ok(chain) = p.swap_chain.cast::<IDXGISwapChain2>()
+                && chain.SetSourceSize(shown.0, shown.1).is_ok()
+            {
+                p.source = shown;
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
@@ -6022,6 +6070,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                source: (width, height),
             })
         }
     }
