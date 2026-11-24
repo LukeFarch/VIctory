@@ -932,6 +932,10 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
+/// Why an interpolation's first half (`v_interp_p1_f32`, `v_interp_p1ll_f16`) has no value
+/// of its own: the second half, which reads it, interpolates whole.
+const FIRST_HALF: Why = "the first half of an interpolation";
+
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2431,6 +2435,17 @@ impl<'a> Lower<'a> {
         e.interp = mode;
         self.s.flags |= flags::BARYCENTRICS;
         self.load_any_input(id, index + 1)
+    }
+
+    /// The old value of a register a 16-bit result goes into one half of, for the half that
+    /// stays. The first half of an f16 interpolation (`v_interp_p1ll_f16`) is an f32 only the
+    /// second half reads; its register is often reused for a 16-bit result
+    /// (`v_fma_mixlo_f16`, a `_d16` load) whose other half nothing reads then: zero there.
+    fn kept_half(&mut self, v: Value) -> Result<V, Why> {
+        match self.i32_of(v) {
+            Err(FIRST_HALF) => Ok(self.s.m.i32(0)),
+            r => r,
+        }
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -4362,7 +4377,7 @@ impl<'a> Lower<'a> {
                     x
                 } else {
                     let old = match inst.read(Reg::V(reg)) {
-                        Some(v) => self.i32_of(v)?,
+                        Some(v) => self.kept_half(v)?,
                         None => self.s.m.i32(0),
                     };
                     let half = self.s.m.i32(0xFFFF);
@@ -7039,7 +7054,7 @@ impl<'a> Lower<'a> {
                     return Err("a mixed-precision result");
                 };
                 let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
+                    Some(o) => self.kept_half(o)?,
                     None => self.s.m.i32(0),
                 };
                 let h = self
@@ -8538,7 +8553,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
