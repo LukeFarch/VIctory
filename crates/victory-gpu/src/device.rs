@@ -388,6 +388,39 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // The first calls' blobs, whole, to decode the description from:
+        // each (address, size) pair of words, written to
+        // %TEMP%\victory-unknown-pipelines\<slot>-<call>-w<word>.bin with
+        // the description itself (`-desc.bin`, 512 bytes).
+        #[cfg(windows)]
+        if calls <= 4 {
+            let dir = std::env::temp_dir().join("victory-unknown-pipelines");
+            let _ = std::fs::create_dir_all(&dir);
+            let mut head = vec![0u8; 512];
+            if crate::host::read_into(desc, &mut head) {
+                let _ = std::fs::write(dir.join(format!("{SLOT:x}-{calls}-desc.bin")), &head);
+            }
+            let mut firsts = Vec::new();
+            if let Some(w) = &description {
+                for i in 1..w.len() - 1 {
+                    let (at, size) = (w[i] as usize, w[i + 1] as usize);
+                    if at > 0x10000 && (1..=0x100000).contains(&size) {
+                        let mut blob = vec![0u8; size];
+                        if crate::host::read_into(at as *const u8, &mut blob) {
+                            let _ = std::fs::write(dir.join(format!("{SLOT:x}-{calls}-w{i}.bin")), &blob);
+                            firsts.push(format!("w{i}: {:02x?}", &blob[..blob.len().min(16)]));
+                        }
+                    }
+                }
+            }
+            tracing::warn!(
+                slot = format_args!("{:#x}", SLOT),
+                calls,
+                dir = %dir.display(),
+                "unknown pipeline method's blobs written: {}",
+                firsts.join("; ")
+            );
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
