@@ -68,12 +68,20 @@ struct Last {
     partial: Option<std::time::Instant>,
     /// When the guarded texture was last hashed.
     hashed: Option<std::time::Instant>,
+    /// The guard saw no write, yet the hash found the texture changed: it
+    /// is written where the guard cannot see (the intro video's planes,
+    /// run 19: shown up to a few frames late, the zoom jumping back and
+    /// forth). Such a texture is hashed at every check from then on.
+    blind: bool,
 }
 
 /// Retry and hash periods are wall-clock time, not frames: counted in
 /// frames, "every 30 frames" was 30 s at 1 fps and streaming slowed with
 /// the frame rate. The defaults are what the frame counts were at 60 fps.
 /// `VICTORY_TEXTURE_PARTIAL_MS` and `VICTORY_TEXTURE_HASH_MS` set them.
+/// Textures found written where the guard cannot see (`Last::blind`).
+pub(crate) static BLIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn period(name: &str, default: u64, cell: &'static std::sync::OnceLock<std::time::Duration>) -> std::time::Duration {
     *cell.get_or_init(|| {
         std::time::Duration::from_millis(std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
@@ -668,11 +676,27 @@ impl Staging {
             // Staggered by the texture's address, so the textures take turns.
             let every = period("VICTORY_TEXTURE_HASH_MS", 133, &HASH) + std::time::Duration::from_millis(((start >> 16) & 7) as u64 * 17);
             let turn = last.hashed.is_none_or(|at| at.elapsed() >= every);
-            if unwritten && !turn {
+            if unwritten && !turn && !last.blind {
                 return 0;
             }
             last.hashed = Some(std::time::Instant::now());
+            if unwritten && !last.blind {
+                let before = last.hash;
+                let read = self.refresh_read(last, size);
+                if before.is_some() && last.hash != before {
+                    last.blind = true;
+                    BLIND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(memory = ?self.memory, size, "a texture changed where the guard saw no write: hashed at every check");
+                }
+                return read;
+            }
         }
+        self.refresh_read(last, size)
+    }
+
+    /// The texture's memory read (or read around what is unmapped) and
+    /// detiled if its hash changed. Returns the bytes of title memory read.
+    fn refresh_read(&self, last: &mut Last, size: usize) -> usize {
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
