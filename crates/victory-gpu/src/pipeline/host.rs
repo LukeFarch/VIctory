@@ -6,7 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -179,7 +179,12 @@ impl GraphicsState {
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
                 )
             })
             .collect();
@@ -299,6 +304,46 @@ fn dxil_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
     Some((min.max(1), if max == 0 { u32::MAX } else { max }))
 }
 
+/// Whether an emitted DXIL container's feature flags (`SFI0`) say the
+/// program uses wave operations (`D3D_SHADER_REQUIRES_WAVE_OPS`). A
+/// container without `SFI0` counts as using them.
+fn dxil_wave_ops(dxil: &[u8]) -> bool {
+    const WAVE_OPS: u64 = 0x4000;
+    let Some(part) = victory_shader::Container::parse(dxil).ok().and_then(|c| {
+        c.part(victory_shader::FourCC::SFI0)
+            .map(|p| p.data.to_vec())
+    }) else {
+        return true;
+    };
+    match part.get(..8).and_then(|b| b.try_into().ok()) {
+        Some(b) => u64::from_le_bytes(b) & WAVE_OPS != 0,
+        None => true,
+    }
+}
+
+/// `VICTORY_MESH_WAVE64=strict`: refuse every console wave64 mesh program on
+/// hosts without 64-lane waves, as before lane-independent ones were let
+/// through (to tell whether one of those hangs the host).
+fn mesh_wave64_strict() -> bool {
+    static STRICT: OnceLock<bool> = OnceLock::new();
+    *STRICT.get_or_init(|| {
+        std::env::var("VICTORY_MESH_WAVE64").is_ok_and(|v| v.eq_ignore_ascii_case("strict"))
+    })
+}
+
+/// Counts wave64 mesh pipelines let through on a host without 64-lane
+/// waves; logs the first and every 64th.
+fn count_narrow_mesh() {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        tracing::info!(
+            pipelines = n,
+            "wave64 mesh programs run in 32-lane waves (no wave operations, LDS ordered by barriers)"
+        );
+    }
+}
+
 /// Whether a translated `stage` program cannot run on a host whose waves have
 /// `host_lanes = (min, max)` lanes.
 ///
@@ -410,16 +455,38 @@ impl HostPipeline {
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+            return refuse(
+                "the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+            );
         }
         let host_lanes = host()?.wave_lanes();
+        // A wave64 mesh program whose lanes never meet (no wave operations
+        // in its translation, no LDS shared within one console wave without
+        // a barrier) runs the same in 32-lane waves; only the rest are
+        // refused on hosts without 64-lane waves.
+        let mesh_runs_narrow = match mesh {
+            Some(ms) if ms.wave64() && host_lanes.1 < 64 && !mesh_wave64_strict() => {
+                let t = ms.translated()?;
+                let free = !dxil_wave_ops(&t.host.dxil) && !ms.mesh_lds_unsynced();
+                if free {
+                    count_narrow_mesh();
+                }
+                free
+            }
+            _ => false,
+        };
         if let Some(ms) = mesh
+            && !mesh_runs_narrow
             && let Some(reason) = wave_lanes_refusal(ms.stage, ms.wave64(), None, host_lanes)
         {
             return refuse(&reason, shaders);
         }
         for (s, _) in &stages {
             let t = s.translated()?;
+            if mesh_runs_narrow && s.stage == "mesh" {
+                continue;
+            }
             let emitted = dxil_wave_lanes(&t.host.dxil);
             if let Some(reason) = wave_lanes_refusal(s.stage, s.wave64(), emitted, host_lanes) {
                 return refuse(&reason, shaders);
@@ -500,13 +567,14 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
-        };
+        let (root, root_blob) =
+            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+                Ok(root) => root,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                    return None;
+                }
+            };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -684,15 +752,27 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
     }
     let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        root: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            root.as_raw(),
+        ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+        mask: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            g.sample_mask,
+        ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+        targets: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            g.targets,
+        ),
+        dsv: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            g.depth_format,
+        ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
@@ -715,7 +795,8 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         return Vec::new();
     }
     // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }
+        .to_vec()
 }
 
 fn root_signature(

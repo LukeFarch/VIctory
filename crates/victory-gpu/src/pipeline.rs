@@ -121,6 +121,41 @@ impl Shader {
         })
     }
 
+    /// For a console mesh program: whether lanes of one console wave share
+    /// LDS with no barrier between them. The console compiler may leave
+    /// barriers out there because a wave runs in lockstep; a host running
+    /// the group as 32-lane waves then races. `false` when the program has
+    /// no LDS, spans several console waves, or has an `s_barrier` (it
+    /// orders its LDS itself); `true` when the program cannot be read.
+    pub(crate) fn mesh_lds_unsynced(&self) -> bool {
+        let Some(programs) = victory_shader::Container::parse(&self.container)
+            .ok()
+            .and_then(|c| {
+                c.part(victory_shader::FourCC::DXIL)
+                    .map(|p| p.data.to_vec())
+            })
+            .and_then(|d| victory_shader::native::native_programs(&d).ok())
+        else {
+            return true;
+        };
+        programs.iter().any(|p| {
+            let victory_shader::native::StageIo::Ms(ms) = &p.io else {
+                return false;
+            };
+            if ms.lds_bytes == 0 || ms.threads > 64 {
+                return false;
+            }
+            match victory_shader::ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+                Ok(ir) => !ir
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| i.name() == "s_barrier"),
+                Err(_) => true,
+            }
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -294,7 +329,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
