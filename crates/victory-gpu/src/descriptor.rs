@@ -72,6 +72,15 @@ impl Heap {
         self.desc.kind == SAMPLERS
     }
 
+    /// The host's table of the title addresses of this view heap's buffer
+    /// views by slot, made on first use (`HostHeap::view_addresses`), and
+    /// its buffer.
+    #[cfg(windows)]
+    pub(crate) fn view_addresses(&self) -> Option<(u64, &windows::Win32::Graphics::Direct3D12::ID3D12Resource)> {
+        let step = u64::from(increment(self.desc.kind)?);
+        self.host()?.view_addresses(self.start, step)
+    }
+
     /// The host heap, made on first use from what the title wrote so far.
     /// Made late because a host view heap the size of the title's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
