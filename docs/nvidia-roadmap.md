@@ -59,9 +59,30 @@ world loads and the game runs (audio plays, no hang with 578), but the picture i
 The title's own compute passes write the arguments, so most of these drops probably come from A and B (a pass that never
 runs writes no arguments). Re-measure after A and B. Then log drops by reason so the rest can be ranked.
 
-### D. Frame rate (85)
-Measure on the second run of a build (pipeline cache warm), once the frame is complete. Known costs: copying title memory
-back after each submission, slow passes (`VICTORY_GPU_TIMING`), and pipelines built on first use.
+### D. Frame rate (85): the per-frame copy of title memory is the blocker
+Round 1 (93f94d9): menus run at 30 fps, but world frames are CPU-bound. Preparing submissions spends 150-230 ms a frame
+copying title memory (400-900 ms with diagnostics on). The GPU is not the limit yet.
+
+What already exists: copies are by 64 KiB page and skip pages the title hasn't written (write watching, or guard faults
+on physical-page views), and shader writes are copied back by piece.
+
+Where the time most likely goes, in order of suspicion (to confirm from the per-frame `copies per frame` line and the top
+`copied from` ranges, logged by diagnostics builds every 5 s):
+1. **Snapshot and compare around shader writes.** Each submission that lets shaders write the world's 174 MB heap first
+   snapshots the whole declared range (`Shadow::writing`), then afterwards compares all of it (`Shadow::copy_back`). That is
+   several hundred MB of memory traffic per submission, times the submissions per frame.
+2. **Copies of pages the title rewrites every frame** (constants, command memory sharing the big heap).
+3. **Diagnostics overhead** (per-range stats), which explains the 400-900 ms.
+
+Candidate wins, cheapest first:
+- **Keep the snapshot between submissions.** Update it where the copy changes (refreshes, copy-back) instead of re-copying the
+  whole range at every submission. This removes one full pass over the range.
+- **Find changes on the GPU.** Copy the declared range on the GPU at submission start (cheap there), have a small compute pass
+  compare it after the submission, and read back a bitmap of changed 64 KiB pieces. The CPU then touches only those pieces.
+  This removes both passes and is the real fix.
+- **Fewer submissions per frame:** batch the title's command lists into one host submission where their fences allow.
+- **Put hot buffers in GPU memory** (constants rewritten every frame stay in system memory, the static world heap moves
+  to video memory). This is the GPU side, for once the CPU side is fixed.
 
 ### Upstream
 Upstream each piece after it runs clean for a full session: the mesh relaxation as a follow-up to 578, the watchdog, and
