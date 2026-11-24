@@ -2836,6 +2836,18 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if let Some(a) = self.scalar.get(&site).copied()
+            && name.starts_with("s_load_dword")
+            && self
+                .x
+                .native
+                .layout
+                .get(a.param)
+                .is_some_and(|rp| rp.root == RootType::Descriptor)
+            && !self.read_as_descriptor(site)
+        {
+            return self.root_data(inst, a);
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -3086,6 +3098,88 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Some descriptor (resource or sampler) is read from what the scalar
+    /// load at `site` reads.
+    fn read_as_descriptor(&self, site: Site) -> bool {
+        self.x.res.descriptors.iter().any(|d| {
+            d.source.leaves().into_iter().any(|l| {
+                matches!(*l, Source::Loaded { load, .. } | Source::Fetched { load, .. } if load == site)
+            })
+        })
+    }
+
+    /// `s_load_dword*` through a root descriptor's address: the console
+    /// reads a root constant buffer (or a root raw buffer) with plain
+    /// scalar loads instead of `s_buffer_load`. The dwords come from the
+    /// host's root view at the same byte offsets.
+    fn root_data(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar load through a root descriptor"),
+        };
+        let rp = self.x.native.layout[a.param];
+        let kind = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data)
+            .map(|u| u.kind);
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        match kind {
+            Some(ResourceType::Srv) => {
+                let h = self.s.root_srv_handle(rp.slot);
+                for k in 0..count {
+                    let off = self.s.m.i32(4 * k);
+                    let at = self.s.m.bin(c, Bin::Add, addr, off);
+                    let (mask, u, al) = (
+                        self.s.m.i8(1),
+                        self.s.m.undef(self.s.t.i32),
+                        self.s.m.i32(4),
+                    );
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, at, u, mask, al],
+                    );
+                    let x = self.s.m.extract(c, r, 0);
+                    let x = self.as_int(x);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+            }
+            Some(ResourceType::Cbv) | None => {
+                let h = self.s.root_cbv_handle(rp.slot);
+                for k in 0..count {
+                    let off = self.s.m.i32(4 * k);
+                    let at = self.s.m.bin(c, Bin::Add, addr, off);
+                    let x = self.cbuffer_dword(h, at);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+            }
+            _ => return Err("a scalar load through a root UAV"),
         }
         Ok(())
     }
