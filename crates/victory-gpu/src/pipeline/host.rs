@@ -905,7 +905,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, state = %g.describe(), "host pipeline refused");
                 host.log_messages();
                 return None;
             }
