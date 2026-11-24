@@ -895,16 +895,25 @@ impl Host {
         })
     }
 
-    /// The host GPU's supported wave-lane range `(WaveLaneCountMin,
-    /// WaveLaneCountMax)` from `D3D12_FEATURE_D3D12_OPTIONS1` (defaults to
-    /// `(32, 64)` when the query fails, so nothing is refused for it).
-    /// Note: WARP (`VICTORY_D3D12_WARP=1`) reports `(4, 4)` even on 64-lane
-    /// hardware, so shaders requiring wider waves are refused there too.
+    /// The host GPU's wave-lane range `(min, max)`, from [`Self::target`]
+    /// (`(32, 64)` when the query fails, so nothing is refused for it).
     pub(crate) fn wave_lanes(&self) -> (u32, u32) {
-        static LANES: OnceLock<(u32, u32)> = OnceLock::new();
-        *LANES.get_or_init(|| {
+        let t = self.target();
+        if t == victory_shader::emit::Target::ANY {
+            (32, 64)
+        } else {
+            (t.lanes_min, t.lanes_max)
+        }
+    }
+
+    /// The wave sizes the host runs (D3D12 options 1), which translated
+    /// compute shaders that declare the console's wave size must fit;
+    /// logged once. Unknown (the query fails): any.
+    pub(crate) fn target(&self) -> victory_shader::emit::Target {
+        static TARGET: OnceLock<victory_shader::emit::Target> = OnceLock::new();
+        *TARGET.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-            // SAFETY: the query writes its own structure of the given size.
+            // SAFETY: the query writes the structure of the given size.
             let ok = unsafe {
                 self.device
                     .CheckFeatureSupport(
@@ -914,24 +923,25 @@ impl Host {
                     )
                     .is_ok()
             };
-            let (min, max) = if ok
-                && options.WaveLaneCountMin > 0
-                && options.WaveLaneCountMax >= options.WaveLaneCountMin
-            {
-                (options.WaveLaneCountMin, options.WaveLaneCountMax)
+            let target = if ok && options.WaveOps.as_bool() && options.WaveLaneCountMin > 0 {
+                victory_shader::emit::Target {
+                    lanes_min: options.WaveLaneCountMin,
+                    lanes_max: options.WaveLaneCountMax,
+                }
             } else {
-                (32, 64)
+                victory_shader::emit::Target::ANY
             };
-            if max < 32 {
-                tracing::info!(
-                    min,
-                    max,
-                    "host wave lanes (software/WARP adapter reports narrow waves; wider-wave shaders will be refused)"
+            tracing::info!(
+                lanes_min = target.lanes_min,
+                lanes_max = target.lanes_max,
+                "host wave sizes"
+            );
+            if !target.runs(64) {
+                tracing::warn!(
+                    "the host has no 64-lane waves: console wave64 compute programs that read                      other lanes do not translate, and their dispatches are dropped"
                 );
-            } else {
-                tracing::info!(min, max, "host wave lanes");
             }
-            (min, max)
+            target
         })
     }
 
