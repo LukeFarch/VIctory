@@ -851,7 +851,10 @@ impl HostPipeline {
             return refuse("a rectangle pipeline with a geometry stage", shaders);
         }
         let title_gs = code_of(D3D12_SHADER_VISIBILITY_GEOMETRY);
-        if g.topology.0 == RECTANGLES {
+        // `VICTORY_RECT_GS=0`: no rectangle geometry stage; rectangles are
+        // expanded in vertex buffers as before the fork (an A/B).
+        static RECT_GS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if g.topology.0 == RECTANGLES && *RECT_GS.get_or_init(|| std::env::var_os("VICTORY_RECT_GS").is_none_or(|v| v != "0")) {
             let ps = stages
                 .iter()
                 .find(|(_, v)| *v == D3D12_SHADER_VISIBILITY_PIXEL)
