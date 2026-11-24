@@ -54,6 +54,11 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the title address of the buffer view at each slot, two
+    /// dwords per slot (`victory_shader::emit::SLOT_VIEW_ADDRESSES`), made
+    /// when a shader that needs it first runs with this heap: an upload
+    /// buffer, its GPU address and its mapping. Written under `buffers`.
+    addresses: std::sync::OnceLock<Option<(ID3D12Resource, u64, usize)>>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -634,6 +639,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            addresses: std::sync::OnceLock::new(),
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -785,6 +791,47 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The table of the title addresses of the buffer views by slot (view
+    /// heaps; `victory_shader::emit::SLOT_VIEW_ADDRESSES`): its GPU address
+    /// and buffer. Made on first use from the slots holding buffer views,
+    /// whose title descriptors lie from `start` on, `step` bytes apart; a
+    /// heap no such shader runs with never pays its 16 MB.
+    pub(crate) fn view_addresses(&self, start: u64, step: u64) -> Option<(u64, &ID3D12Resource)> {
+        if let Some(made) = self.addresses.get() {
+            return made.as_ref().map(|a| (a.1, &a.0));
+        }
+        if self.sampler {
+            return None;
+        }
+        // Held while the table is filled: a slot written meanwhile waits,
+        // then writes its own address into the finished table.
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        self.addresses
+            .get_or_init(|| {
+                let count = victory_shader::emit::SLOT_STRIDES_COUNT;
+                let bytes = u64::from(count) * 8;
+                let (buffer, data) = host()?.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "buffer view addresses by view heap slot".to_owned());
+                for &index in buffers.iter() {
+                    let view = super::view(start + u64::from(index) * step);
+                    write_view_address(data as usize, index, view.as_ref());
+                }
+                tracing::info!(
+                    buffer_slots = buffers.len(),
+                    mb = bytes >> 20,
+                    "a table of buffer view addresses by heap slot is made: a shader takes the address of a view it picks"
+                );
+                Some((buffer, gpu, data as usize))
+            })
+            .as_ref()
+            .map(|a| (a.1, &a.0))
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1060,6 +1107,9 @@ impl HostHeap {
             }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some((_, _, data))) = self.addresses.get() {
+            write_view_address(*data, index, view);
+        }
         let was = if stride.is_some() {
             buffers.insert(index);
             true
@@ -1361,6 +1411,26 @@ impl HostHeap {
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
+    }
+}
+
+/// Writes into the table of buffer view addresses mapped at `data`
+/// ([`HostHeap::view_addresses`]) the title address of `view`, the view at
+/// slot `index` (0: none, or not a buffer). Low dword zeroed first and set
+/// last: a shader reading meanwhile never pairs a new high dword with an
+/// old low one.
+fn write_view_address(data: usize, index: u32, view: Option<&View>) {
+    if index >= victory_shader::emit::SLOT_STRIDES_COUNT {
+        return;
+    }
+    let address = view.and_then(buffer_range).map_or(0, |r| r.0);
+    // SAFETY: inside the mapping (two dwords per slot); shaders read it
+    // while we write.
+    unsafe {
+        let words = (data as *mut u32).add(2 * index as usize);
+        words.write_volatile(0);
+        words.add(1).write_volatile((address >> 32) as u32);
+        words.write_volatile(address as u32);
     }
 }
 

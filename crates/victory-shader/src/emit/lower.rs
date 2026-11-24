@@ -2647,10 +2647,10 @@ impl<'a> Lower<'a> {
     /// The title address (low, high dword) of the buffer view that the
     /// descriptor load at `site` picks from the view heap by an index the
     /// code computes (root type `ResourceHeap`), read from the host's table
-    /// by heap slot ([`super::shader::SLOT_STRIDES`]: after the strides, two
-    /// dwords per slot); `None` for a load of another kind.
+    /// by heap slot ([`super::shader::SLOT_VIEW_ADDRESSES`]); `None` for a
+    /// load of another kind.
     fn heap_view_address(&mut self, site: Site) -> Result<Option<(V, V)>, Why> {
-        use super::shader::{SLOT_STRIDES, SLOT_STRIDES_COUNT};
+        use super::shader::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES};
         let heap = self
             .scalar
             .get(&site)
@@ -2667,9 +2667,7 @@ impl<'a> Lower<'a> {
         self.s.m.tag(slot, Tag::Clamp);
         let three = self.s.m.i32(3);
         let byte = self.s.m.bin(c, Bin::Shl, slot, three);
-        let past = self.s.m.i32(SLOT_STRIDES_COUNT * 4);
-        let byte = self.s.m.bin(c, Bin::Add, byte, past);
-        let h = self.s.root_srv_handle(SLOT_STRIDES);
+        let h = self.s.root_srv_handle(SLOT_VIEW_ADDRESSES);
         let iu = self.s.m.undef(i32t);
         let mask = self.s.m.i8(3);
         let align = self.s.m.i32(4);

@@ -961,6 +961,25 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the title addresses of the view heap's
+                        // buffer views, by slot.
+                        match self.heap_view_addresses(list) {
+                            // SAFETY: an open list; the list holds the table.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => {
+                                once!("a shader takes the address of a buffer view it picks, and there is no table of them");
+                                return false;
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -1267,6 +1286,24 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
+    /// The GPU address of the bound view heap's table of buffer view
+    /// addresses by slot ([`victory_shader::emit::SLOT_VIEW_ADDRESSES`]),
+    /// made on first use; the list holds it.
+    fn heap_view_addresses(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let (gpu, buffer) = heap.view_addresses()?;
+        const ONCE: usize = usize::MAX - 0x5f;
+        if list.first_use(ONCE) {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
         let heap = self
             .heaps
