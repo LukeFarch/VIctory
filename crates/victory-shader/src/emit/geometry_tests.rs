@@ -194,6 +194,29 @@ fn a_geometry_program_becomes_a_geometry_shader() {
     {
         v.validate(&mut dxil.clone()).unwrap();
     }
+    #[cfg(windows)]
+    pipeline_check(&super::HostShader {
+        stage: HwStage::Gs,
+        dxil,
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
+    });
+}
+
+/// On a host device: a stub vertex shader, the geometry shader in the
+/// geometry slot, and a stub pixel shader make a pipeline.
+#[cfg(windows)]
+fn pipeline_check(gs: &super::HostShader) {
+    let Ok(host) = super::host::Host::new(true) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    host.geometry_pipeline(gs, &super::host::stub_ps()).unwrap();
 }
 
 #[test]
@@ -232,5 +255,7 @@ fn title_geometry_containers_translate() {
             v.validate(&mut shader.dxil.clone())
                 .unwrap_or_else(|e| panic!("{path}: {e}"));
         }
+        #[cfg(windows)]
+        pipeline_check(&shader);
     }
 }
