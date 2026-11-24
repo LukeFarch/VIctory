@@ -65,6 +65,7 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    ORIGIN.set(None);
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -222,6 +223,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// For diagnosis: where each reason first left a value missing.
+    missing_at: HashMap<Why, usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -362,6 +365,18 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
             (o.row, (o.pack2, b.map(|i| free.remove(i))))
         })
         .collect()
+}
+
+std::thread_local! {
+    /// See [`failure_origin`].
+    static ORIGIN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// For diagnosis: where the last program this thread failed to lower first
+/// left a value missing for the reason it stopped with (the instruction
+/// whose result the failing one reads, perhaps through others), if known.
+pub fn failure_origin() -> Option<usize> {
+    ORIGIN.get()
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -542,6 +557,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            missing_at: HashMap::new(),
         }
     }
 
@@ -2331,8 +2347,12 @@ impl<'a> Lower<'a> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Err(why) if effect => {
+                ORIGIN.set(self.missing_at.get(why).copied());
+                Err(unsupported(offset, why))
+            }
             Err(why) => {
+                self.missing_at.entry(why).or_insert(offset);
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -2995,6 +3015,28 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
+        // The compiler often loads a descriptor twice: once early for a
+        // field it tests (a buffer's record count: is anything bound?), and
+        // again where it accesses the view. The early load then has no
+        // access of its own; one reading the same address tells the view.
+        let use_at = use_at.or_else(|| {
+            let here = self.scalar.get(&site).copied()?;
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first }
+                            if load != site && self.scalar.get(&load) == Some(&here) =>
+                        {
+                            Some((d.site, first))
+                        }
+                        _ => None,
+                    })
+                })
+        });
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };

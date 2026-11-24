@@ -445,14 +445,28 @@ fn dump_failure(reason: &str, label: &str, p: &NativeProgram, offset: usize) {
     let Ok(insts) = victory_shader::gfx10::decode(&p.patched_code()) else {
         return;
     };
+    // Only lowering records an origin (resources fail before it runs).
+    let origin = reason
+        .starts_with("emit:")
+        .then(emit::failure_origin)
+        .flatten();
     let mut text = format!(
-        "{label}\n{reason}\nfailing offset {offset:#x}\nstage {:?} wave64 {} vgprs {}\n",
-        p.stage, p.wave64, p.vgprs
+        "{label}\n{reason}\nfailing offset {offset:#x}\norigin {}\nstage {:?} wave64 {} vgprs {}\n",
+        origin.map_or("unknown".into(), |o| format!("{o:#x}")),
+        p.stage,
+        p.wave64,
+        p.vgprs
     );
     text.extend(p.layout.iter().map(|l| format!("    {l:?}\n")));
     text.extend(p.used.iter().map(|u| format!("    {u:?}\n")));
     for i in &insts {
-        let mark = if i.offset == offset { "==>" } else { "   " };
+        let mark = if i.offset == offset {
+            "==>"
+        } else if Some(i.offset) == origin {
+            "-->"
+        } else {
+            "   "
+        };
         text.push_str(mark);
         text.push_str(&crate::shader::format_instruction(i, p.wave64));
         text.push('\n');

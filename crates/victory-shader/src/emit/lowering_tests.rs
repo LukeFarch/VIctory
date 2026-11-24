@@ -212,3 +212,13 @@ fn a_scalar_load_from_a_root_srv_reads_the_buffer() {
     let (l, u, n) = root_cbv(ResourceType::Srv);
     lower_cs_with(l, u, n, &body).unwrap();
 }
+
+/// A descriptor loaded a second time only to test a field (dword 2, the
+/// record count): the view comes from the load that accesses it.
+#[test]
+fn a_descriptor_reloaded_for_its_record_count_reads_the_views_size() {
+    // s_load_dwordx4 s[12:15], s[4:5], 0; v_mov_b32 v0, s14
+    let mut body = s_load_dwordx4(12, 4).to_vec();
+    body.push(vop1(0x001, 0, 14));
+    lower_cs(&body).unwrap();
+}
