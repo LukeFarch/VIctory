@@ -1623,6 +1623,118 @@ mod barycentric_tests {
         let _ = shader;
     }
 
+    /// Translates a pixel program with these attributes and signature
+    /// elements (`SV_Target0` the one output).
+    fn pixel_with(
+        words: &[u32],
+        inputs: Vec<PsInput>,
+        input_addr: u32,
+        elements: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs,
+                input_addr,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let isg1 = container::signature(elements, true);
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage, None)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// Attribute 0 in row `row`, channel x, 32-bit.
+    fn attribute(row: u8) -> PsInput {
+        PsInput {
+            usage: Usage::Generic,
+            row,
+            mask: 1,
+            attr: 0,
+            flat: false,
+            fp16: false,
+            pack2: false,
+            row2: 0,
+        }
+    }
+
+    /// A one-channel input element at `row`, `col`.
+    fn scalar(name: &str, kind: u8, comp: u8, row: u32, col: u8) -> SigElement {
+        SigElement {
+            comp,
+            col,
+            cols: 1,
+            ..element(name, kind, row)
+        }
+    }
+
+    /// The `PSV0` interpolation mode of the one-channel element at `row`,
+    /// `col` of PSV semantic kind `kind` and component type `comp`.
+    fn psv_mode(shader: &HostShader, row: u8, col: u8, kind: u8, comp: u8) -> u8 {
+        let c = Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let want = [1, row, 0x41 | col << 4, kind, comp];
+        let at = psv.windows(5).position(|w| w == want).unwrap();
+        psv[at + 5]
+    }
+
+    const TEXCOORD_X: [u32; 2] = [
+        0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+        0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+    ];
+
+    /// An unread float input packed beside the front face (as console
+    /// signatures have it when the float was `nointerpolation`) takes the
+    /// row's constant mode, in the module and in `PSV0`: DXIL wants one mode
+    /// per row. The interpolated COLOR in its own row stays linear.
+    #[test]
+    fn an_unread_input_takes_its_rows_constant_mode() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [TEXCOORD_X[0], TEXCOORD_X[1], e0, e1, S_ENDPGM];
+        let elements = [
+            scalar("TEXCOORD", 0, 9, 0, 0),
+            scalar("SV_IsFrontFace", 13, 5, 0, 1),
+            scalar("COLOR", 0, 9, 1, 0),
+        ];
+        let shader = pixel_with(&words, vec![attribute(1)], PERSP_CENTER, &elements).unwrap();
+        let texcoord = psv_mode(&shader, 0, 0, 0, 3);
+        assert_eq!(texcoord, 1, "TEXCOORD0 beside the front face");
+        assert_eq!(psv_mode(&shader, 0, 1, 13, 1), 1, "SV_IsFrontFace");
+        assert_eq!(psv_mode(&shader, 1, 0, 0, 3), 2, "COLOR0 interpolated");
+        validate(&shader);
+    }
+
+    /// Two elements sharing a row, the one at the higher channel listed
+    /// first (as console signatures have them): the emitted part keeps them
+    /// in element order within the row, as the validator does.
+    #[test]
+    fn elements_sharing_a_row_keep_their_order_in_isg1() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [TEXCOORD_X[0], TEXCOORD_X[1], e0, e1, S_ENDPGM];
+        let mut high = scalar("TEXCOORD", 0, 9, 0, 1);
+        (high.index, high.cols) = (1, 2);
+        let elements = [high, scalar("TEXCOORD", 0, 9, 0, 0)];
+        let shader = pixel_with(&words, vec![attribute(0)], PERSP_CENTER, &elements).unwrap();
+        let (_, isg1) = parts(&shader);
+        let order: Vec<(u32, u8)> = isg1.iter().map(|e| (e.index, e.col)).collect();
+        assert_eq!(order, [(1, 1), (0, 0)]);
+        validate(&shader);
+    }
+
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
     /// weights of vertices 1 and 2.
