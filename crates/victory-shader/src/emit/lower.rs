@@ -5951,7 +5951,9 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l" => {
+                (73, true)
+            }
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -6177,6 +6179,93 @@ impl<'a> Lower<'a> {
                         62,
                         &args,
                     )
+                }
+                _ if name == "image_gather4_l" => {
+                    // DXIL gathers from the top level only: the four texels
+                    // of the footprint at the nearest level are loaded,
+                    // in gather order (-u+v, +u+v, +u-v, -u-v).
+                    // shortcut: coordinates clamp at the edges whatever
+                    // the sampler's address mode (Hi-Z reads, which this
+                    // is for, clamp).
+                    if !matches!(kind, 2 | 7) {
+                        return Err("a gather at a level of a 1D, 3D or cube image");
+                    }
+                    if dmask.count_ones() != 1 {
+                        return Err("a gather of several channels");
+                    }
+                    let lod = addr_val(self, first + coords)?;
+                    let lod = to_float(self, lod);
+                    let i32t = self.s.t.i32;
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let zero = self.s.m.i32(0);
+                    let top = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, zero]);
+                    let levels = self.s.m.extract(c, top, 3);
+                    let half = self.s.m.f32(0.5f32.to_bits());
+                    let l = self.s.m.bin(c, Bin::Add, lod, half);
+                    let l = self.unary(27, l);
+                    let l = self.s.m.cast(c, Cast::FpToSi, l, i32t);
+                    let one = self.s.m.i32(1);
+                    let last = self.s.m.bin(c, Bin::Sub, levels, one);
+                    let clamp = |me: &mut Self, x: V, hi: V| {
+                        let z = me.s.m.i32(0);
+                        let neg = me.s.m.cmp(c, pred::SLT, x, z);
+                        let x = me.s.m.select(c, neg, z, x);
+                        let over = me.s.m.cmp(c, pred::SGT, x, hi);
+                        me.s.m.select(c, over, hi, x)
+                    };
+                    let level = clamp(self, l, last);
+                    let d = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, level]);
+                    let mut base = Vec::new();
+                    let mut bound = Vec::new();
+                    for k in 0..2 {
+                        let size = self.s.m.extract(c, d, k);
+                        let fsize = self.s.m.cast(c, Cast::UiToFp, size, self.s.t.f32);
+                        let x = self.s.m.bin(c, Bin::Mul, cs[k as usize], fsize);
+                        let x = self.s.m.bin(c, Bin::Sub, x, half);
+                        let x = self.unary(27, x);
+                        base.push(self.s.m.cast(c, Cast::FpToSi, x, i32t));
+                        bound.push(self.s.m.bin(c, Bin::Sub, size, one));
+                    }
+                    let slice = if kind == 7 {
+                        let z = self.unary(26, cs[2]);
+                        self.s.m.cast(c, Cast::FpToSi, z, i32t)
+                    } else {
+                        iu
+                    };
+                    let ch = dmask.trailing_zeros();
+                    let mut texels = Vec::new();
+                    for (dx, dy) in [(0, 1), (1, 1), (1, 0), (0, 0)] {
+                        let mut at = Vec::new();
+                        for (k, delta) in [dx, dy].into_iter().enumerate() {
+                            let x = if delta == 0 {
+                                base[k]
+                            } else {
+                                self.s.m.bin(c, Bin::Add, base[k], one)
+                            };
+                            at.push(clamp(self, x, bound[k]));
+                        }
+                        let r = self.s.op(
+                            c,
+                            "textureLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            66,
+                            &[h, level, at[0], at[1], slice, iu, iu, iu],
+                        );
+                        texels.push(self.s.m.extract(c, r, ch));
+                    }
+                    let Operand::Vector { reg, .. } = *data else {
+                        return Err("an image result");
+                    };
+                    for (k, x) in texels.into_iter().enumerate() {
+                        let x = self.as_int(x);
+                        self.write(inst, Reg::V(reg + k as u8), x, guard);
+                    }
+                    return Ok(());
                 }
                 _ => {
                     if name == "image_gather4" {
