@@ -221,9 +221,108 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             what: "a branch to the program entry",
         });
     }
+    close_sections(&mut blocks);
     split_irreducible(&mut blocks)?;
 
     Ok(rename(blocks, wave64, vgprs))
+}
+
+/// The register code that keeps the saved EXEC, if `inst` makes every lane active
+/// (`s_or_saveexec -1`, `s_nand_saveexec 0`): the start of a whole-wave section
+/// (`crate::emit::wave`).
+fn opens_wave(inst: &Inst) -> Option<u8> {
+    let all = match inst.name() {
+        "s_or_saveexec_b64" | "s_or_saveexec_b32" => Operand::Const(193),
+        "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Operand::Const(128),
+        _ => return None,
+    };
+    match &inst.fields {
+        Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            src,
+            ..
+        } if src.first() == Some(&all) => Some(*code),
+        _ => None,
+    }
+}
+
+/// Whole-wave sections that leave their block by an unconditional jump and restore EXEC
+/// in the block they jump to, with their ends moved into their own blocks. The compiler
+/// gives each side of a uniform branch its own reduction (a maximum on one side, a minimum
+/// on the other) and lets both end in the join, where the last `v_readlane` and the
+/// restore of EXEC stand once for both. The section simulation (`crate::emit::wave`)
+/// follows one block, so the join's instructions up to the restore are copied to the end
+/// of each such way in, which then jumps to the rest of the join. Every way in runs those
+/// instructions anyway, so the program is the same. A join every way in of which is such
+/// a section loses its first instructions; otherwise the ways in that are go to a copy of
+/// the rest of it.
+fn close_sections(blocks: &mut Vec<Block>) {
+    let writes = |inst: &Inst, r: Reg| inst.writes.iter().any(|w| w.0 == r);
+    let reads = |inst: &Inst, r: Reg| inst.reads.iter().any(|w| w.0 == r);
+    // (way in, join, the restore's index in the join)
+    let mut found: Vec<(usize, usize, usize)> = Vec::new();
+    for (b, block) in blocks.iter().enumerate() {
+        let Exit::Jump(j) = block.exit else {
+            continue;
+        };
+        if j == b {
+            continue;
+        }
+        // the last section start of the block, if nothing after it changes EXEC or the
+        // saved mask
+        let Some((s, code)) = block
+            .insts
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, inst)| opens_wave(inst).map(|c| (i, c)))
+        else {
+            continue;
+        };
+        let saved = Reg::S(code);
+        let open = |inst: &Inst| !writes(inst, Reg::S(EXEC)) && !writes(inst, saved);
+        if !block.insts[s + 1..].iter().all(open) {
+            continue;
+        }
+        // the join's first write of EXEC restores the saved mask, which nothing before
+        // it changes
+        let join = &blocks[j].insts;
+        let Some(e) = join.iter().position(|inst| !open(inst)) else {
+            continue;
+        };
+        if writes(&join[e], Reg::S(EXEC)) && !writes(&join[e], saved) && reads(&join[e], saved) {
+            found.push((b, j, e));
+        }
+    }
+    let mut joins: Vec<(usize, usize)> = found.iter().map(|&(_, j, e)| (j, e)).collect();
+    joins.sort_unstable();
+    joins.dedup();
+    for (j, e) in joins {
+        let ways: Vec<usize> = found.iter().filter(|f| (f.1, f.2) == (j, e)).map(|f| f.0).collect();
+        // (ways from two sections with different restores are left as they are)
+        if found.iter().any(|f| f.1 == j && f.2 != e) {
+            continue;
+        }
+        let head: Vec<Inst> = blocks[j].insts[..=e].to_vec();
+        let rest = if blocks[j].preds.iter().all(|q| ways.contains(q)) {
+            blocks[j].insts.drain(..=e);
+            j
+        } else {
+            let mut copy = blocks[j].clone();
+            copy.insts.drain(..=e);
+            blocks.push(copy);
+            blocks.len() - 1
+        };
+        for &b in &ways {
+            let insts = &mut blocks[b].insts;
+            if insts.last().is_some_and(|i| i.name() == "s_branch") {
+                insts.pop();
+            }
+            insts.extend(head.iter().cloned());
+            blocks[b].exit = Exit::Jump(rest);
+        }
+    }
+    link(blocks);
 }
 
 /// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.

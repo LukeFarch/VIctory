@@ -294,6 +294,9 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// The sums in doubles the section being lowered left (low source, high source, mask):
+    /// their two dwords, made once for both.
+    f64_sums: HashMap<(Value, Value, Value), (V, V)>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1608,6 +1611,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            f64_sums: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1858,6 +1862,7 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
+            Shape::SumF64(lo, hi, mask, high) => return self.sum_f64(lo, hi, mask, high),
         };
         // Mesh: no host wave size can be declared, so a reduction is over this host wave
         // only. A minimum or maximum is taken that way: the compiler's "next distinct
@@ -2011,6 +2016,104 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
+    /// Dword `high` of the sum in doubles over the wave of `mask ? {lo, hi} : +0.0`
+    /// ([`super::wave::Shape::SumF64`]): DXIL's `WaveActiveSum` of doubles, the two host waves
+    /// of 32 that hold a console wave adding their halves' sums as [`Self::shape`] adds sums
+    /// of floats. As there, the order the lanes are added in is the host's.
+    fn sum_f64(&mut self, lo: Value, hi: Value, mask: Value, high: bool) -> Result<V, Why> {
+        if self.mask_data == MaskData::None {
+            return Err("a wave reduction in a mesh shader");
+        }
+        let pick = |(a, b): (V, V)| if high { b } else { a };
+        if let Some(&pair) = self.f64_sums.get(&(lo, hi, mask)) {
+            return Ok(pick(pair));
+        }
+        let c = self.cur;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let on = self.boolean(m, c)?;
+        let (x0, x1) = (self.i32_of(lo)?, self.i32_of(hi)?);
+        let z = self.s.m.i32(0);
+        let x0 = self.s.m.select(c, on, x0, z);
+        let x1 = self.s.m.select(c, on, x1, z);
+        let x = self.make_double(x0, x1);
+        self.s.flags |= flags::WAVE_OPS;
+        let (f64t, k0) = (self.s.m.double(), self.s.m.i8(0));
+        let mut r = self
+            .s
+            .op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[x, k0, k0]);
+        // (each host wave on its own, a group one host wave holds, or the approximate form
+        // where the halves cannot exchange: this host wave's sum, as in `shape`)
+        let alone = self.local
+            || self.exchange.as_ref().is_none_or(|e| e.1)
+            || !self.all_lanes(self.cur_ir) && LOOSE_LDS.get();
+        if !alone {
+            if !self.all_lanes(self.cur_ir) {
+                need(self.cur_ir);
+                return Err("a wave reduction where not every lane runs");
+            }
+            let (a, b) = self.split_double(r);
+            let c = self.cur;
+            let (a_lower, a_upper) = self.exchange_halves(c, a);
+            let (b_lower, b_upper) = self.exchange_halves(c, b);
+            let lower = self.make_double(a_lower, b_lower);
+            let upper = self.make_double(a_upper, b_upper);
+            r = self.s.m.bin(c, Bin::Add, lower, upper);
+        }
+        let pair = self.split_double(r);
+        self.f64_sums.insert((lo, hi, mask), pair);
+        Ok(pick(pair))
+    }
+
+    /// The double whose low dword is `lo` and high dword `hi`.
+    fn make_double(&mut self, lo: V, hi: V) -> V {
+        let f64t = self.s.m.double();
+        self.s.flags |= flags::DOUBLES;
+        self.s
+            .op(self.cur, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi])
+    }
+
+    /// The low and high dwords of a double.
+    fn split_double(&mut self, x: V) -> (V, V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let ty = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let r = self.s.op(c, "splitDouble.f64", Attr::ReadNone, ty, 102, &[x]);
+        (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1))
+    }
+
+    /// A double source: a register pair, its `abs` and `neg` on the sign (bit 31 of the
+    /// high dword).
+    fn src_f64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let (r0, r1) = match v.src.get(k) {
+            Some(&Operand::Vector { reg, .. }) if reg < 255 => (Reg::V(reg), Reg::V(reg + 1)),
+            Some(&Operand::Scalar { code, .. }) if code != NULL => (Reg::S(code), Reg::S(code + 1)),
+            _ => return Err("a double constant"),
+        };
+        let lo = self.i32_of(inst.read(r0).ok_or("an unread operand")?)?;
+        let mut hi = self.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, m);
+        }
+        Ok(self.make_double(lo, hi))
+    }
+
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's
     /// `v_add_f16` gives it: added in f32 and rounded to 16 bits, to nearest
     /// ([`Self::f16_nearest`]).
@@ -2159,6 +2262,7 @@ impl<'a> Lower<'a> {
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    self.f64_sums.clear();
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
                     }
@@ -7582,6 +7686,12 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                // rounded to nearest, the console's mode unless the program sets another
+                let x = self.src_f64(inst, 0)?;
+                let r = self.s.m.cast(c, Cast::FpTrunc, x, self.s.t.f32);
+                float(self, r)
             }
             "v_cvt_f32_f16" if v.opsel == 0 => {
                 let a = s(self, 0)?;
