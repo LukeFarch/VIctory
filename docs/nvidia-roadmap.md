@@ -52,8 +52,8 @@ world loads and the game runs (audio plays, no hang with 578), but the picture i
 | select on an untracked mask | 123 | translation thread | track masks through selects and phis like EXEC |
 | descriptor read as data | 114 | translation thread | side table of console descriptor words (size, format, base) the shader can read |
 | lane mask holding lanes elsewhere | 108 | this thread (`nvidia-lanemask`) | console flow for wave32 programs: every lane runs every block, ballots are the wave's own |
-| structured buffer of unknown stride | 56 | translation thread | stride from the view the title creates at bind time, or fall back to raw |
-| SGPR address | 35 | translation thread | follow addresses through scalar registers |
+| structured buffer of unknown stride | 56 | translation thread | all bindless heap buffers, mostly `CS_RaytracingResolve` (ray-traced lighting): needs a host-side stride table per heap slot, filled when the title creates the view |
+| SGPR address not a root parameter | 35 | – | all `GS_VoxelizeGeneric`: VIctory doesn't run the console's merged geometry stage yet. That's a feature (merged ES/GS on the host), not a translation fix, and comes after the frame is otherwise complete |
 
 ### C. Indirect draws (70): about 4,945 dropped
 The title's own compute passes write the arguments, so most of these drops probably come from A and B (a pass that never
