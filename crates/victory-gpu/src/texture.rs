@@ -76,13 +76,13 @@ struct Last {
     /// streamed texture written once that way goes back to the guard.
     blind: bool,
     still: u32,
-    /// Changes the guard did not see in a row, each within `AGAIN` of the
-    /// one before, and when the last was found: a texture becomes blind
+    /// Hash turns in a row that found a change the guard did not see (any
+    /// turn finding none starts over; counted in turns, not time, so the
+    /// frame rate does not decide it, run 21d): a texture becomes blind
     /// only after `UNSEEN` of them (rewritten over and over, as a video
     /// is), not when it streams in once (run 20: marking those cost as
     /// much as no guard at all, 2.9 s of uploads in a frame).
     unseen: u32,
-    unseen_at: Option<std::time::Instant>,
 }
 
 /// Retry and hash periods are wall-clock time, not frames: counted in
@@ -714,15 +714,14 @@ impl Staging {
             }
             if unwritten && !last.blind {
                 use std::sync::atomic::Ordering::Relaxed;
-                const UNSEEN: u32 = 4;
-                const AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+                const UNSEEN: u32 = 3;
                 const MAX_BLIND: u64 = 32;
                 let before = last.hash;
                 let read = self.refresh_read(last, size);
-                if before.is_some() && last.hash != before {
-                    let now = std::time::Instant::now();
-                    last.unseen = if last.unseen_at.is_some_and(|at| now - at <= AGAIN) { last.unseen + 1 } else { 1 };
-                    last.unseen_at = Some(now);
+                if before.is_none() || last.hash == before {
+                    last.unseen = 0;
+                } else {
+                    last.unseen += 1;
                     if last.unseen >= UNSEEN
                         && BLIND.fetch_update(Relaxed, Relaxed, |n| (n < MAX_BLIND).then_some(n + 1)).is_ok()
                     {
