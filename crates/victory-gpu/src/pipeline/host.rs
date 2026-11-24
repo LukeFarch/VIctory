@@ -332,16 +332,17 @@ fn mesh_wave64_strict() -> bool {
 }
 
 /// Counts wave64 mesh pipelines let through on a host without 64-lane
-/// waves; logs the first and every 64th.
-fn count_narrow_mesh() {
+/// waves and logs each one's shaders, so a hang that DRED pins on a mesh
+/// program can be checked against this list (`VICTORY_MESH_WAVE64=strict`
+/// turns them all off).
+fn count_narrow_mesh(shaders: &[Arc<Shader>]) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if n == 1 || n % 64 == 0 {
-        tracing::info!(
-            pipelines = n,
-            "wave64 mesh programs run in 32-lane waves (no wave operations, LDS ordered by barriers)"
-        );
-    }
+    tracing::info!(
+        pipelines = n,
+        ?shaders,
+        "wave64 mesh program runs in 32-lane waves (no wave operations, LDS ordered by barriers)"
+    );
 }
 
 /// Whether a translated `stage` program cannot run on a host whose waves have
@@ -470,7 +471,7 @@ impl HostPipeline {
                 let t = ms.translated()?;
                 let free = !dxil_wave_ops(&t.host.dxil) && !ms.mesh_lds_unsynced();
                 if free {
-                    count_narrow_mesh();
+                    count_narrow_mesh(shaders);
                 }
                 free
             }
