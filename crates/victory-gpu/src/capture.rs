@@ -19,15 +19,23 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    // Ranges too (`1200-1260`): consecutive frames, to see a flicker.
+    static LIST: std::sync::OnceLock<Vec<(u64, u64)>> = std::sync::OnceLock::new();
     let named = LIST
         .get_or_init(|| {
             let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
             list.split(',')
-                .filter_map(|f| f.trim().parse().ok())
+                .filter_map(|f| {
+                    let f = f.trim();
+                    match f.split_once('-') {
+                        Some((a, b)) => Some((a.trim().parse().ok()?, b.trim().parse().ok()?)),
+                        None => f.parse().ok().map(|n| (n, n)),
+                    }
+                })
                 .collect()
         })
-        .contains(&n);
+        .iter()
+        .any(|&(a, b)| (a..=b).contains(&n));
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
