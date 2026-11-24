@@ -410,6 +410,9 @@ impl Formats {
 struct Variants {
     regs: Vec<u8>,
     layout: Vec<u8>,
+    /// Boxed: [`host_pipeline_for`] hands out references into them, which
+    /// must not move when the map grows.
+    #[allow(clippy::redundant_allocation)]
     made: Mutex<HashMap<Formats, Box<Arc<make::Pending>>>>,
 }
 
@@ -766,6 +769,7 @@ pub(crate) extern "system" fn create_precompiled_compute(
 /// the stage is absent). Each program is looked up among the title's
 /// containers; the host pipelines are made per set of bound target formats
 /// ([`host_pipeline_for`]).
+#[allow(clippy::needless_return)]
 pub(crate) extern "system" fn create_precompiled_graphics(
     _: This,
     desc: *const u8,
