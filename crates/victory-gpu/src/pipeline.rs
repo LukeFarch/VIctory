@@ -357,6 +357,90 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A precompiled graphics pipeline (device method 0x1c8): host
+    /// pipelines made per set of bound target formats, as it names none.
+    #[cfg(windows)]
+    variants: Option<Box<Variants>>,
+}
+
+/// The bound render target and depth formats (host formats), and samples.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Formats {
+    targets: [i32; 8],
+    count: u32,
+    depth: i32,
+    samples: u32,
+}
+
+#[cfg(windows)]
+impl Formats {
+    /// Target `i`: its view's format, else its resource's.
+    pub(crate) fn target(
+        &mut self,
+        i: usize,
+        view: Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>,
+        texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    ) {
+        if i >= 8 {
+            return;
+        }
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        self.targets[i] = view.filter(|f| f.0 != 0).unwrap_or(desc.Format).0;
+        self.count = self.count.max(i as u32 + 1);
+        self.samples = desc.SampleDesc.Count;
+    }
+
+    /// The depth view's format, else its resource's.
+    pub(crate) fn depth(
+        &mut self,
+        view: Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>,
+        texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    ) {
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        self.depth = view.filter(|f| f.0 != 0).unwrap_or(desc.Format).0;
+        self.samples = desc.SampleDesc.Count;
+    }
+}
+
+/// What a precompiled graphics pipeline's host pipelines are made from:
+/// its register and input layout blocks, and those made so far by formats.
+#[cfg(windows)]
+struct Variants {
+    regs: Vec<u8>,
+    layout: Vec<u8>,
+    made: Mutex<HashMap<Formats, Box<Arc<make::Pending>>>>,
+}
+
+/// The host pipeline of a title pipeline for draws into targets of
+/// `formats` (only a precompiled one depends on them; see [`host_pipeline`]).
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, formats: &Formats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let Some(v) = p.variants.as_ref() else {
+        return make::ready(&p.host);
+    };
+    let pending: *const Arc<make::Pending> = {
+        let mut made = v.made.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = made.entry(*formats).or_insert_with(|| {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY;
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+            let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: formats.count, ..Default::default() };
+            for (t, &f) in targets.RTFormats.iter_mut().zip(&formats.targets) {
+                *t = DXGI_FORMAT(f);
+            }
+            let state = host::GraphicsState::precompiled(&v.regs, &v.layout, targets, DXGI_FORMAT(formats.depth), formats.samples);
+            Box::new(Arc::new(make::Pending::new(p.shaders.clone(), Some(Box::new(state)))))
+        });
+        &**entry
+    };
+    // SAFETY: the box is kept, unmoved, for as long as the title pipeline
+    // lives (entries are never removed), as the pipeline itself is.
+    make::ready(unsafe { &*pending })
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -501,11 +585,26 @@ fn hand_out(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(windows)]
+    return hand_out_with(shaders, graphics, None, iid, out);
+    #[cfg(not(windows))]
+    hand_out_with(shaders, iid, out)
+}
+
+fn hand_out_with(
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] variants: Option<Box<Variants>>,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    make::early(&host);
+    if variants.is_none() {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -522,6 +621,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        variants,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -651,6 +752,77 @@ pub(crate) extern "system" fn create_precompiled_compute(
     #[cfg(not(windows))]
     let _ = (desc, iid);
     E_NOTIMPL
+}
+
+/// Device method 0x1c8: a graphics pipeline from precompiled console code,
+/// `(desc, iid, out)`. The description: the root signature, then
+/// (address, size) pairs: the register block (0x17c-0x184 bytes of GFX10
+/// register values), the input layout block, the pixel program's code and
+/// metadata, the vertex program's code and metadata (a pair is null when
+/// the stage is absent). Each program is looked up among the title's
+/// containers; the host pipelines are made per set of bound target formats
+/// ([`host_pipeline_for`]).
+pub(crate) extern "system" fn create_precompiled_graphics(
+    _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    #[cfg(windows)]
+    {
+        let Some(w) = words::<13>(desc) else {
+            missed(0x1c8, "description unreadable");
+            return E_INVALIDARG;
+        };
+        let block = |at: usize, most: u64| -> Option<Vec<u8>> {
+            let (address, size) = (w[at], w[at + 1]);
+            if address < 0x10000 || size == 0 || size > most {
+                return None;
+            }
+            let mut bytes = vec![0u8; size as usize];
+            crate::host::read_into(address as *const u8, &mut bytes).then_some(bytes)
+        };
+        let (Some(regs), layout) = (block(1, 0x1000), block(3, 0x4000).unwrap_or_default()) else {
+            missed(0x1c8, "register block unreadable");
+            return E_INVALIDARG;
+        };
+        let mut vertex = None;
+        let mut pixel = None;
+        for at in [5, 9] {
+            if w[at] == 0 {
+                continue;
+            }
+            match precompiled(&w, at) {
+                Some((stage, c)) if stage == "Vs" => vertex = Some(c),
+                Some((stage, c)) if stage == "Ps" => pixel = Some(c),
+                Some((stage, _)) => {
+                    missed(0x1c8, &format!("code found in a container of stage {stage}"));
+                    return E_NOTIMPL;
+                }
+                None => {
+                    missed(0x1c8, "code not in the precompiled index");
+                    return E_NOTIMPL;
+                }
+            }
+        }
+        let Some(vertex) = vertex else {
+            missed(0x1c8, "no vertex program");
+            return E_NOTIMPL;
+        };
+        let mut shaders = vec![shader("vertex", &vertex)];
+        shaders.extend(pixel.map(|p| shader("pixel", &p)));
+        let variants = Variants { regs, layout, made: Mutex::new(HashMap::new()) };
+        return hand_out_with(shaders, None, Some(Box::new(variants)), iid, out);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (desc, iid);
+        E_NOTIMPL
+    }
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a

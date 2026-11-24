@@ -89,7 +89,159 @@ impl Default for GraphicsState {
     }
 }
 
+/// Where the precompiled pipeline method 0x1c8's state block (0x184
+/// bytes of GFX10 register values) keeps what a host pipeline needs.
+mod regs {
+    /// `SPI_SHADER_COL_FORMAT`: 4 bits per target, 0 none.
+    pub const COL_FORMAT: usize = 0x70;
+    /// `CB_TARGET_MASK`: 4 bits per target (red to alpha).
+    pub const TARGET_MASK: usize = 0x78;
+    /// `CB_BLEND0_CONTROL` to `CB_BLEND7_CONTROL`.
+    pub const BLEND: usize = 0xd0;
+}
+
+/// A GFX10 blend factor as D3D12's.
+fn blend_factor(f: u32) -> D3D12_BLEND {
+    match f {
+        0 => D3D12_BLEND_ZERO,
+        2 => D3D12_BLEND_SRC_COLOR,
+        3 => D3D12_BLEND_INV_SRC_COLOR,
+        4 => D3D12_BLEND_SRC_ALPHA,
+        5 => D3D12_BLEND_INV_SRC_ALPHA,
+        6 => D3D12_BLEND_DEST_ALPHA,
+        7 => D3D12_BLEND_INV_DEST_ALPHA,
+        8 => D3D12_BLEND_DEST_COLOR,
+        9 => D3D12_BLEND_INV_DEST_COLOR,
+        10 => D3D12_BLEND_SRC_ALPHA_SAT,
+        13 | 19 => D3D12_BLEND_BLEND_FACTOR,
+        14 | 20 => D3D12_BLEND_INV_BLEND_FACTOR,
+        15 => D3D12_BLEND_SRC1_COLOR,
+        16 => D3D12_BLEND_INV_SRC1_COLOR,
+        17 => D3D12_BLEND_SRC1_ALPHA,
+        18 => D3D12_BLEND_INV_SRC1_ALPHA,
+        _ => D3D12_BLEND_ONE,
+    }
+}
+
+/// A GFX10 blend function as D3D12's.
+fn blend_op(f: u32) -> D3D12_BLEND_OP {
+    match f {
+        1 => D3D12_BLEND_OP_SUBTRACT,
+        2 => D3D12_BLEND_OP_MIN,
+        3 => D3D12_BLEND_OP_MAX,
+        4 => D3D12_BLEND_OP_REV_SUBTRACT,
+        _ => D3D12_BLEND_OP_ADD,
+    }
+}
+
+fn dword(bytes: &[u8], at: usize) -> u32 {
+    bytes.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The input elements of the precompiled pipeline method's layout block:
+/// a header whose u32 at 0x4c counts the elements, then from 0x50 per
+/// element: u32 name length (with its NUL), the name, u32 semantic index,
+/// u32 format, u32 input slot, u32 offset, u32 slot class, u32 step rate.
+fn precompiled_inputs(layout: &[u8]) -> Vec<(CString, D3D12_INPUT_ELEMENT_DESC)> {
+    let mut out = Vec::new();
+    let count = dword(layout, 0x4c).min(32);
+    let mut at = 0x50;
+    for _ in 0..count {
+        let len = dword(layout, at) as usize;
+        let Some(name) = layout.get(at + 4..at + 4 + len) else { break };
+        let Ok(name) = CStr::from_bytes_until_nul(name) else { break };
+        let f = at + 4 + len;
+        if layout.len() < f + 24 {
+            break;
+        }
+        out.push((
+            name.to_owned(),
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR::null(),
+                SemanticIndex: dword(layout, f),
+                Format: DXGI_FORMAT(crate::resource::pc_format(dword(layout, f + 4)) as i32),
+                InputSlot: dword(layout, f + 8),
+                AlignedByteOffset: dword(layout, f + 12),
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(dword(layout, f + 16) as i32),
+                InstanceDataStepRate: dword(layout, f + 20),
+            },
+        ));
+        at = f + 24;
+    }
+    out
+}
+
 impl GraphicsState {
+    /// The state of a pipeline of the precompiled method 0x1c8: from its
+    /// register block (`regs`) and input layout block (`layout`), drawing
+    /// into targets of `targets` and depth of `depth_format` (the method
+    /// names no formats: the pipeline is made per set of targets bound).
+    /// shortcut: depth testing is off and nothing is culled until the
+    /// registers that hold them are placed in the block.
+    pub(crate) fn precompiled(
+        regs: &[u8],
+        layout: &[u8],
+        targets: D3D12_RT_FORMAT_ARRAY,
+        depth_format: DXGI_FORMAT,
+        samples: u32,
+    ) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        let (names, inputs): (Vec<CString>, Vec<D3D12_INPUT_ELEMENT_DESC>) =
+            precompiled_inputs(layout).into_iter().unzip();
+        g.names = names;
+        g.inputs = inputs
+            .into_iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC { SemanticName: PCSTR(name.as_ptr().cast()), ..e })
+            .collect();
+        let mask = dword(regs, regs::TARGET_MASK);
+        g.blend.IndependentBlendEnable = true.into();
+        for (i, t) in g.blend.RenderTarget.iter_mut().enumerate() {
+            let c = dword(regs, regs::BLEND + 4 * i);
+            t.RenderTargetWriteMask = ((mask >> (4 * i)) & 0xf) as u8;
+            t.BlendEnable = (c & (1 << 30) != 0).into();
+            t.SrcBlend = blend_factor(c & 0x1f);
+            t.BlendOp = blend_op((c >> 5) & 7);
+            t.DestBlend = blend_factor((c >> 8) & 0x1f);
+            if c & (1 << 29) != 0 {
+                t.SrcBlendAlpha = blend_factor((c >> 16) & 0x1f);
+                t.BlendOpAlpha = blend_op((c >> 21) & 7);
+                t.DestBlendAlpha = blend_factor((c >> 24) & 0x1f);
+            } else {
+                (t.SrcBlendAlpha, t.BlendOpAlpha, t.DestBlendAlpha) = (t.SrcBlend, t.BlendOp, t.DestBlend);
+            }
+            // Alpha factors that name colour are not allowed for alpha.
+            for f in [&mut t.SrcBlendAlpha, &mut t.DestBlendAlpha] {
+                *f = match *f {
+                    D3D12_BLEND_SRC_COLOR => D3D12_BLEND_SRC_ALPHA,
+                    D3D12_BLEND_INV_SRC_COLOR => D3D12_BLEND_INV_SRC_ALPHA,
+                    D3D12_BLEND_DEST_COLOR => D3D12_BLEND_DEST_ALPHA,
+                    D3D12_BLEND_INV_DEST_COLOR => D3D12_BLEND_INV_DEST_ALPHA,
+                    D3D12_BLEND_SRC1_COLOR => D3D12_BLEND_SRC1_ALPHA,
+                    D3D12_BLEND_INV_SRC1_COLOR => D3D12_BLEND_INV_SRC1_ALPHA,
+                    f => f,
+                };
+            }
+        }
+        // Targets the shader exports nothing to keep their format but are
+        // not written.
+        let exports = dword(regs, regs::COL_FORMAT);
+        for i in 0..8 {
+            if (exports >> (4 * i)) & 0xf == 0 {
+                g.blend.RenderTarget[i].RenderTargetWriteMask = 0;
+                g.blend.RenderTarget[i].BlendEnable = false.into();
+            }
+        }
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g.depth.DepthEnable = false.into();
+        g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets = targets;
+        g.depth_format = depth_format;
+        g.samples.Count = samples.max(1);
+        g
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
