@@ -391,6 +391,23 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_CODE_INDEX=<file>`: one line per native program, the
+    // container's hash, the stage and the first 24 bytes of its code (where
+    // the console compiler puts the program's hash), so that the programs
+    // the title hands to the device's precompiled pipeline methods (0x1c8,
+    // 0x218) can be matched to containers.
+    if let Some(file) = std::env::var_os("VICTORY_CODE_INDEX") {
+        use std::io::Write;
+        static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+        if let Some(out) = OUT.get_or_init(|| std::fs::File::create(&file).ok().map(Mutex::new)) {
+            let mut text = String::new();
+            for p in &programs {
+                let head: String = p.code.iter().take(24).map(|b| format!("{b:02x}")).collect();
+                text.push_str(&format!("{hash} {:?} {} {head}\n", p.stage, p.code.len()));
+            }
+            let _ = lock(out).write_all(text.as_bytes());
+        }
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
