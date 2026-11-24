@@ -585,12 +585,52 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// The start of a present plane: frame token, then the plane's resources
+/// and, per resource, the rectangle of it to show (left, top, right,
+/// bottom; null: all of it). With dynamic resolution the title renders
+/// into a part of its target whose size changes from frame to frame, and
+/// that part is what the console scales to the screen.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rects: *const [i32; 4],
+}
+
+/// The part of the plane's first resource to show, if the plane names one
+/// that lies inside the resource and is not all of it. Read through the
+/// kernel, so a plane laid out otherwise than assumed costs nothing but
+/// this check (`VICTORY_PRESENT_RECT=0` turns it off).
+#[cfg(windows)]
+fn source_rect(plane: &Plane, width: u64, height: u32) -> Option<[u32; 4]> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_RECT").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    if plane.source_rects.is_null() {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    if !crate::host::read_into(plane.source_rects.cast(), &mut bytes) {
+        return None;
+    }
+    let r: [i32; 4] = std::array::from_fn(|i| {
+        i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap_or_default())
+    });
+    let [l, t, rr, b] = r;
+    let fits = 0 <= l && l < rr && 0 <= t && t < b && rr as u64 <= width && b as u32 <= height;
+    // Distinct rectangles, the first few, to check the layout in a log.
+    static SEEN: std::sync::Mutex<Vec<[i32; 4]>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() < 16 && !seen.contains(&r) {
+            seen.push(r);
+            tracing::info!(rect = ?r, width, height, used = fits, "present source rectangle");
+        }
+    }
+    let full = l == 0 && t == 0 && rr as u64 == width && b as u32 == height;
+    (fits && !full).then_some([l as u32, t as u32, rr as u32, b as u32])
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -828,7 +868,10 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        let rect = source_rect(plane, desc.Width, desc.Height);
+        let shown = host.present(texture, state, frame, rect);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

@@ -89,6 +89,14 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// Puts the translation of `container` in the cache ahead of a run
+/// (`victory translate --warm`): whether it translated. The entry is
+/// keyed as a run of this same executable, with the same switches, looks
+/// it up, so a first world frame finds its shaders translated.
+pub fn warm(container: &[u8]) -> bool {
+    host_shader(container).is_ok()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
