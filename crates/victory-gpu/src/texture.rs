@@ -76,13 +76,20 @@ struct Last {
     /// streamed texture written once that way goes back to the guard.
     blind: bool,
     still: u32,
+    /// Changes the guard did not see in a row, each within `AGAIN` of the
+    /// one before, and when the last was found: a texture becomes blind
+    /// only after `UNSEEN` of them (rewritten over and over, as a video
+    /// is), not when it streams in once (run 20: marking those cost as
+    /// much as no guard at all, 2.9 s of uploads in a frame).
+    unseen: u32,
+    unseen_at: Option<std::time::Instant>,
 }
 
 /// Retry and hash periods are wall-clock time, not frames: counted in
 /// frames, "every 30 frames" was 30 s at 1 fps and streaming slowed with
 /// the frame rate. The defaults are what the frame counts were at 60 fps.
 /// `VICTORY_TEXTURE_PARTIAL_MS` and `VICTORY_TEXTURE_HASH_MS` set them.
-/// Textures found written where the guard cannot see (`Last::blind`).
+/// Textures blind now (`Last::blind`), at most 32.
 pub(crate) static BLIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn period(name: &str, default: u64, cell: &'static std::sync::OnceLock<std::time::Duration>) -> std::time::Duration {
@@ -691,16 +698,28 @@ impl Staging {
                 if last.still >= STILL {
                     last.blind = false;
                     last.still = 0;
+                    BLIND.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 return read;
             }
             if unwritten && !last.blind {
+                use std::sync::atomic::Ordering::Relaxed;
+                const UNSEEN: u32 = 4;
+                const AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+                const MAX_BLIND: u64 = 32;
                 let before = last.hash;
                 let read = self.refresh_read(last, size);
                 if before.is_some() && last.hash != before {
-                    last.blind = true;
-                    BLIND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::debug!(memory = ?self.memory, size, "a texture changed where the guard saw no write: hashed at every check");
+                    let now = std::time::Instant::now();
+                    last.unseen = if last.unseen_at.is_some_and(|at| now - at <= AGAIN) { last.unseen + 1 } else { 1 };
+                    last.unseen_at = Some(now);
+                    if last.unseen >= UNSEEN
+                        && BLIND.fetch_update(Relaxed, Relaxed, |n| (n < MAX_BLIND).then_some(n + 1)).is_ok()
+                    {
+                        last.blind = true;
+                        last.unseen = 0;
+                        tracing::info!(memory = ?self.memory, size, "a texture keeps changing where the guard sees no write: hashed at every check");
+                    }
                 }
                 return read;
             }
