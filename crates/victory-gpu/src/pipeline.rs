@@ -446,6 +446,12 @@ pub(crate) struct Formats {
     count: u32,
     depth: i32,
     samples: u32,
+    /// Drawn as rectangles: a precompiled pipeline names no topology, and
+    /// one drawn with rectangles needs the geometry stage that completes
+    /// them (`HostPipeline::rects`). Without it a rectangle whose corners
+    /// come from the vertex index alone lost its second triangle: half of
+    /// every screen tile unlit (run 17's triangle grid).
+    pub(crate) rects: bool,
 }
 
 #[cfg(windows)]
@@ -512,7 +518,10 @@ pub(crate) fn host_pipeline_for<'a>(this: This, formats: &Formats) -> Option<&'a
             for (t, &f) in targets.RTFormats.iter_mut().zip(&formats.targets) {
                 *t = DXGI_FORMAT(f);
             }
-            let state = host::GraphicsState::precompiled(&v.regs, &v.layout, targets, DXGI_FORMAT(formats.depth), formats.samples);
+            let mut state = host::GraphicsState::precompiled(&v.regs, &v.layout, targets, DXGI_FORMAT(formats.depth), formats.samples);
+            if formats.rects {
+                state.rectangles();
+            }
             Box::new(Arc::new(make::Pending::new(p.shaders.clone(), Some(Box::new(state)))))
         });
         &**entry

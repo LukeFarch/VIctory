@@ -426,6 +426,11 @@ impl State {
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
         self.topology = topology;
         self.topology_set = true;
+        // `VICTORY_PRECOMPILED_RECTS=0`: precompiled pipelines drawn with
+        // rectangles get no geometry stage, as before.
+        static RECTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.formats.rects =
+            topology == RECTANGLES && *RECTS.get_or_init(|| std::env::var_os("VICTORY_PRECOMPILED_RECTS").is_none_or(|v| v != "0"));
         let host = match topology {
             RECTANGLES => 4,
             TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
@@ -514,7 +519,9 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        let rects = self.formats.rects;
         self.formats = crate::pipeline::Formats::default();
+        self.formats.rects = rects;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {

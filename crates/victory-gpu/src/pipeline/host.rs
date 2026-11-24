@@ -233,6 +233,11 @@ impl GraphicsState {
     /// names no formats: the pipeline is made per set of targets bound).
     /// shortcut: nothing is culled until the register that holds it is
     /// confirmed (`VICTORY_PRECOMPILED_CULL=1` tries it).
+    /// Drawn as the console's rectangles (see `Formats::rects`).
+    pub(crate) fn rectangles(&mut self) {
+        self.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(RECTANGLES);
+    }
+
     pub(crate) fn precompiled(
         regs: &[u8],
         layout: &[u8],
