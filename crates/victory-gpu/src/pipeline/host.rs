@@ -256,6 +256,9 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// The root parameter of the view heap's slot records, when the shader
+    /// reads them (`t0` in `HEAP_WORDS_SPACE`).
+    pub(crate) heap_words: Option<u32>,
 }
 
 impl Stage {
@@ -506,7 +509,22 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                heap_words: None,
             };
+            if t.heap_words {
+                stage.heap_words = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: victory_shader::emit::HEAP_WORDS_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
             let dwords = t.user_data_dwords();
             if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));

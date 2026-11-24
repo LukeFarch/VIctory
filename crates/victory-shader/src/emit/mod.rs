@@ -100,7 +100,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use lower::failure_origin;
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    HEAP_WORD_COUNT, HEAP_WORD_KIND, HEAP_WORD_OFFSET, HEAP_WORD_STRIDE, HEAP_WORDS_RECORD,
+    HEAP_WORDS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -159,6 +162,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Whether the shader reads the heap's slot records (`t0` in
+    /// [`HEAP_WORDS_SPACE`]).
+    pub heap_words: bool,
 }
 
 impl HostShader {
@@ -311,6 +317,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        heap_words: false,
     })
 }
 
@@ -568,6 +575,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            heap_words: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -578,6 +586,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                heap_words: false,
+                heap_words: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

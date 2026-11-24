@@ -353,6 +353,9 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    // Bytes 12..28 of a view slot (none for samplers).
+    let slot_record = (!matches!(view, View::Sampler(_) | View::ConsoleSampler(_)))
+        .then(|| buffer_record(&view).unwrap_or([0; 4]));
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
@@ -377,9 +380,100 @@ fn record(handle: u64, view: View) {
     let generation = views.list[i as usize].1;
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    // A slot that held a buffer view before keeps no stale record.
+    if let Some(words) = slot_record {
+        // SAFETY: view slots are 32 bytes (`increment`); bytes 12..28.
+        unsafe {
+            (handle as *mut u8)
+                .add(12)
+                .cast::<[u32; 4]>()
+                .write_unaligned(words)
+        };
+    }
     drop(views);
     #[cfg(windows)]
     mirror(handle);
+}
+
+/// What a slot record says about the host view (bytes 24..28, see
+/// `victory_shader::emit::HEAP_WORDS_SPACE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub(crate) enum RecordKind {
+    /// Not a buffer view the shader may address raw.
+    None = 0,
+    /// A structured SRV, made raw on the host.
+    SrvStructured = 1,
+    /// A raw SRV.
+    SrvRaw = 2,
+    /// A structured UAV, made raw on the host.
+    UavStructured = 4,
+    /// A raw UAV.
+    UavRaw = 5,
+}
+
+/// Whether structured buffer views are made raw on the host, with their
+/// stride in the slot record for shaders to address them by
+/// (`VICTORY_RAW_BUFFER_VIEWS=0` turns it off: structured views as the
+/// title made them, records of kind 0).
+pub(crate) fn raw_buffer_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RAW_BUFFER_VIEWS").map_or(true, |v| v != "0"))
+}
+
+/// A buffer view's layout in bytes: first byte from the resource's start,
+/// length, element stride, whether unordered, whether the title made it
+/// raw. `None` for typed views and anything not a buffer view.
+pub(crate) fn buffer_layout(view: &View) -> Option<(u64, u64, u32, bool, bool)> {
+    // D3D12_SHADER_RESOURCE_VIEW_DESC: format, dimension, mapping,
+    // FirstElement (2 words), NumElements, StructureByteStride, Flags.
+    // D3D12_UNORDERED_ACCESS_VIEW_DESC: format, dimension, FirstElement (2),
+    // NumElements, StructureByteStride, CounterOffsetInBytes (2), Flags.
+    const BUFFER: u32 = 1;
+    const RAW: u32 = 1;
+    let (uav, w): (bool, &[u32]) = match view {
+        View::Shader(_, Some(d)) => (false, d),
+        View::Unordered(_, _, Some(d)) => (true, d),
+        View::Placed(uav, resource, d) if resource[0] == 1 => (*uav, &d[..10]),
+        _ => return None,
+    };
+    if w[1] != BUFFER {
+        return None;
+    }
+    let (first, count, stride, flags) = if uav {
+        (u64::from(w[2]) | u64::from(w[3]) << 32, w[4], w[5], w[8])
+    } else {
+        (u64::from(w[3]) | u64::from(w[4]) << 32, w[5], w[6], w[7])
+    };
+    let raw = flags & RAW != 0;
+    let stride = match (stride, raw) {
+        (s, _) if s > 0 => s,
+        (0, true) => 4,
+        _ => return None,
+    };
+    Some((
+        first * u64::from(stride),
+        u64::from(count) * u64::from(stride),
+        stride,
+        uav,
+        raw,
+    ))
+}
+
+/// Slot record bytes 12..28 for a buffer view: stride, element count,
+/// first byte from the host view's start, kind.
+fn buffer_record(view: &View) -> Option<[u32; 4]> {
+    let (first, len, stride, uav, raw) = buffer_layout(view)?;
+    let count = u32::try_from(len / u64::from(stride)).ok()?;
+    let dwords = first % 4 == 0 && len % 4 == 0;
+    let kind = match (raw_buffer_views() && dwords, uav, raw) {
+        (false, ..) => RecordKind::None,
+        (true, false, false) => RecordKind::SrvStructured,
+        (true, false, true) => RecordKind::SrvRaw,
+        (true, true, false) => RecordKind::UavStructured,
+        (true, true, true) => RecordKind::UavRaw,
+    };
+    Some([stride, count, 0, kind as u32])
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -789,5 +883,37 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn buffer_views_record_their_stride() {
+        // SRV: format, dimension 1 (buffer), mapping, FirstElement 3,
+        // NumElements 10, stride 12, flags 0.
+        let srv = View::Shader(1, Some([0, 1, 0, 3, 0, 10, 12, 0, 0, 0]));
+        assert_eq!(buffer_layout(&srv), Some((36, 120, 12, false, false)));
+        let kind = if raw_buffer_views() {
+            RecordKind::SrvStructured
+        } else {
+            RecordKind::None
+        };
+        assert_eq!(buffer_record(&srv), Some([12, 10, 0, kind as u32]));
+        // Raw UAV: FirstElement 2, NumElements 8, stride 0, flags RAW.
+        let uav = View::Unordered(1, 0, Some([0, 1, 2, 0, 8, 0, 0, 0, 1, 0]));
+        assert_eq!(buffer_layout(&uav), Some((8, 32, 4, true, true)));
+        // Off dwords (stride 6, one element in): not addressable raw.
+        let odd = View::Shader(1, Some([0, 1, 0, 1, 0, 3, 6, 0, 0, 0]));
+        assert_eq!(
+            buffer_record(&odd),
+            Some([6, 3, 0, RecordKind::None as u32])
+        );
+        // Typed and texture views have no record.
+        assert_eq!(
+            buffer_layout(&View::Shader(1, Some([2, 1, 0, 0, 0, 4, 0, 0, 0, 0]))),
+            None
+        );
+        assert_eq!(
+            buffer_layout(&View::Shader(1, Some([2, 4, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            None
+        );
     }
 }

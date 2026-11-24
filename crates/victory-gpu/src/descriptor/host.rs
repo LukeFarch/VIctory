@@ -33,6 +33,10 @@ pub(crate) struct HostHeap {
     /// Dynamic slot allocator segregating single-slot (`n == 1`) from
     /// multi-slot table (`n > 1`) allocations until lists are reset.
     next: Mutex<DynamicPool>,
+    /// View heaps: the title slots' 32-byte records, readable by shaders
+    /// (`t0` in `HEAP_WORDS_SPACE`), mapped for writing; kept in step by
+    /// [`Self::mirror`].
+    words: Option<(ID3D12Resource, usize)>,
 }
 
 /// Free-slot tracker separating top-down single-slot (`n == 1`) and bottom-up
@@ -202,6 +206,18 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new(DynamicPool::new(extra as usize)),
+            words: if sampler {
+                None
+            } else {
+                let words = host.shared_buffer(u64::from(count) * 32);
+                if words.is_none() {
+                    tracing::warn!(count, "no slot records for the host view heap");
+                }
+                words.map(|(b, data)| {
+                    crate::host::name(&b, || format!("slot records ({count} slots)"));
+                    (b, data as usize)
+                })
+            },
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -396,6 +412,17 @@ impl HostHeap {
             }
             return None;
         }
+        if let Some((_, words)) = self.words {
+            // SAFETY: a 32-byte view slot in title memory, and record
+            // `index` of the mapped records.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    handle as *const u8,
+                    (words as *mut u8).add(index as usize * 32),
+                    32,
+                );
+            }
+        }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
@@ -546,6 +573,37 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
+impl HostHeap {
+    /// The GPU address of the slot records, for a shader that reads them.
+    pub(crate) fn words_gpu(&self) -> Option<(u64, &ID3D12Resource)> {
+        let (buffer, _) = self.words.as_ref()?;
+        // SAFETY: a live buffer.
+        Some((unsafe { buffer.GetGPUVirtualAddress() }, buffer))
+    }
+}
+
+/// Makes a structured buffer view raw (dwords from the same first byte),
+/// when [`crate::descriptor::raw_buffer_views`] is on and the view lies on
+/// dwords: shaders address it by the stride in its slot record. Returns
+/// whether it did.
+fn make_raw(first: &mut u64, count: &mut u32, stride: &mut u32, format: &mut DXGI_FORMAT) -> bool {
+    if *stride == 0 || !crate::descriptor::raw_buffer_views() {
+        return false;
+    }
+    let (bytes, len) = (
+        *first * u64::from(*stride),
+        u64::from(*count) * u64::from(*stride),
+    );
+    if bytes % 4 != 0 || len % 4 != 0 {
+        return false;
+    }
+    let Ok(n) = u32::try_from(len / 4) else {
+        return false;
+    };
+    (*first, *count, *stride, *format) = (bytes / 4, n, 0, DXGI_FORMAT_R32_TYPELESS);
+    true
+}
+
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
@@ -556,6 +614,18 @@ fn buffer_srv(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    {
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        if make_raw(
+            &mut buffer.FirstElement,
+            &mut buffer.NumElements,
+            &mut buffer.StructureByteStride,
+            &mut desc.Format,
+        ) {
+            buffer.Flags |= D3D12_BUFFER_SRV_FLAG_RAW;
+        }
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -598,6 +668,14 @@ fn buffer_uav(
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    if make_raw(
+        &mut buffer.FirstElement,
+        &mut buffer.NumElements,
+        &mut buffer.StructureByteStride,
+        &mut desc.Format,
+    ) {
+        buffer.Flags |= D3D12_BUFFER_UAV_FLAG_RAW;
+    }
     let element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {

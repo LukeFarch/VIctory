@@ -504,6 +504,28 @@ impl State {
                     }
                 }
             }
+            if let Some(param) = stage.heap_words {
+                // The bound view heap's slot records.
+                let words = self
+                    .heaps
+                    .iter()
+                    .filter(|&&h| h != 0)
+                    .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                    .find_map(|h| h.words_gpu().map(|(gpu, b)| (gpu, b.clone())));
+                let Some((gpu, buffer)) = words else {
+                    once!("a shader reads slot records, and no view heap with them is bound");
+                    return false;
+                };
+                list.keep(&buffer);
+                // SAFETY: an open list; a live buffer.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))

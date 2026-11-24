@@ -12,6 +12,23 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the heap's slot records are bound, when a shader reads them
+/// ([`super::HostShader::heap_words`]): a raw buffer `t0` in this space,
+/// 32 bytes per slot of the CBV/SRV/UAV heap. Bytes 12..16 of a slot's
+/// record are a buffer view's element stride, 16..20 its element count,
+/// 20..24 its first byte from the start of the host view (0), 24..28 the
+/// host view's kind (see `victory-gpu`'s `descriptor::RecordKind`: 0 not a
+/// raw-addressable buffer, 1 SRV made raw from structured, 2 SRV raw, 4 UAV
+/// made raw from structured, 5 UAV raw).
+pub const HEAP_WORDS_SPACE: u32 = 3;
+/// Bytes per slot record in the heap words buffer.
+pub const HEAP_WORDS_RECORD: u32 = 32;
+/// Dword indices in a slot record: element stride, element count, first
+/// byte from the host view's start, host view kind.
+pub const HEAP_WORD_STRIDE: u32 = 3;
+pub const HEAP_WORD_COUNT: u32 = 4;
+pub const HEAP_WORD_OFFSET: u32 = 5;
+pub const HEAP_WORD_KIND: u32 = 6;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
