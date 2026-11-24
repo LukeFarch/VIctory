@@ -970,6 +970,14 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
                         // Ours: the title addresses of the view heap's
                         // buffer views, by slot.
+                        // `VICTORY_RT_SHADOWS=0`: such a shader (the
+                        // ray-traced shadow programs) is not run, as before
+                        // they translated.
+                        static RT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        if !*RT.get_or_init(|| std::env::var_os("VICTORY_RT_SHADOWS").is_none_or(|v| v != "0")) {
+                            once!("VICTORY_RT_SHADOWS=0: a ray-traced shadow program is not run");
+                            return false;
+                        }
                         match self.heap_view_addresses(list) {
                             // SAFETY: an open list; the list holds the table.
                             Some(gpu) => unsafe {
