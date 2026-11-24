@@ -15,55 +15,58 @@ from collaborators). Test GPU: RTX 5070 Ti (32-lane waves only). Status as of 20
 The picture is black because most of the frame is dropped, not because one thing is broken. The lighting and composite
 passes need the earlier passes' output, so a dark scene follows from any large dropped share.
 
-## The ranked list
+## Milestones (Luke's scale)
 
-Each item is ranked by how many frames' worth of work it unblocks and by how stable the result is.
+**Where NVIDIA stands: 55, partly 70.** Runs 1, 2 and A get through boot, intro video, start screen, profile and saves,
+and into the world (the README's status matches). The menus respond to input, so 55 is reached. 70 is only partial: the
+world loads and the game runs (audio plays, no hang with 578), but the picture is black and moving around hasn't been checked.
 
-### 1. Never hang the GPU (stability floor)
-A hang kills the session, so everything else depends on this.
-- **Done:** 578 refuses wave64 programs that assume 64 lanes; 334 adds buffer transitions; 949 stops dynamic descriptor fragmentation.
-- **Next, the DRED-named hang:** mesh `db4835a364449a45` reads several null descriptor slots. A null view reads zeros, and
-  a console loop that walks data until a terminator or a count it never reaches then spins until `LOOP_LIMIT` (2^20 per lane,
-  per loop, so nested loops take seconds) and trips the 2 s TDR. Two fixes:
-  a. Find why those slots are null (the descriptor isn't created yet, was freed, or its kind isn't supported) and fix the cause.
-  b. A watchdog. Lower the loop limit for mesh and pixel stages (2^14 or so), and cap total iterations per lane across all
-     loops, so a bad input costs a wrong triangle rather than the device. This costs nothing when inputs are right.
-- **Check:** the mesh relaxation (`VICTORY_MESH_WAVE64`, below) now logs every wave64 mesh pipeline it lets through. If
-  `db4835a364449a45` is in that list and hangs, it goes back to refused until a/b land.
+| # | Milestone | NVIDIA status | What blocks it | Work that clears it |
+|---|---|---|---|---|
+| 1 | 0-25 Groundwork | done | – | – |
+| 2 | 25 Exe runs | done | – | – |
+| 3 | 40 First frame | done | – | – |
+| 4 | 55 Main menu | done | – | – |
+| 5 | 70 In-game | **partial**: world loads, runs, renders black | Dropped work (A, B, C below), and hangs on main without 578 | A, B, C |
+| 6 | 85 30 FPS | not started (4 fps, frame incomplete) | Profile only means something once the frame is complete | D |
+| 7 | 100 Stable | not started | GPU hangs (S), memory and descriptor growth over long sessions | S, then long soak runs |
 
-### 2. Get the dropped pipelines running (biggest visual win)
-About 2,300 draws a frame have no host pipeline. Two causes:
-- **578 refusals (wave64).** Mesh: lane-independent wave64 mesh programs now run (no wave ops, LDS ordered by barriers;
-  `VICTORY_MESH_WAVE64=strict` reverts). Compute (`cedbff472d562f54`, `13dfdd3b1136e407`, and others hidden by
-  "logged once"): PR 233's split and console flow, being merged into a `nvidia-lanemask` branch, then step 6 (multi-wave groups with LDS).
-- **Translation gaps**, by count of shaders (each shader can drop many draws):
+### S. Never hang the GPU (needed for every milestone from 70 up)
+- **Done on `nvidia`:** 578 (refuse wave64 programs that assume 64 lanes), 334 (buffer transitions), 949 (descriptor
+  fragmentation), and a **watchdog**: graphics-stage loops stop at 2^14 iterations instead of 2^20, so a loop walking
+  zeros from a null descriptor costs a wrong triangle, not the device. That is run A's hang (indirect mesh
+  `db4835a364449a45` reading null slots).
+- **Next:** find why those slots are null (not created yet, freed, or an unsupported view kind). The relaxed mesh path
+  logs every wave64 mesh pipeline it lets through. If a hang names one of them, `VICTORY_MESH_WAVE64=strict` takes it out.
+- **For 100:** hour-long soak runs with DRED on, and watch descriptor heap use and committed memory over time.
+
+### A. Get the refused wave64 programs running (70)
+- Mesh: lane-independent wave64 mesh programs now run on `nvidia` (no wave ops; LDS absent, shared by several waves, or ordered by barriers).
+- Compute (`cedbff472d562f54`, `13dfdd3b1136e407`, plus others hidden because refusals are logged once): PR 233's split and
+  console flow on the `nvidia-lanemask` branch, then 233's step 6 (multi-wave groups with LDS).
+
+### B. Close the translation gaps (70), by number of shaders
 
 | Gap | Shaders | Owner | Approach |
 |---|---|---|---|
 | select on an untracked mask | 123 | translation thread | track masks through selects and phis like EXEC |
-| descriptor read as data | 114 | translation thread | side table of console descriptor words (size, format, base) readable by the shader |
-| lane mask holding lanes elsewhere | 108 | this thread (`nvidia-lanemask`) | console flow for wave32 programs: every lane runs every block, ballots are the wave's own (no exchange needed) |
-| structured buffer of unknown stride | 56 | translation thread | take the stride from the view the title creates at bind time, or fall back to raw |
+| descriptor read as data | 114 | translation thread | side table of console descriptor words (size, format, base) the shader can read |
+| lane mask holding lanes elsewhere | 108 | this thread (`nvidia-lanemask`) | console flow for wave32 programs: every lane runs every block, ballots are the wave's own |
+| structured buffer of unknown stride | 56 | translation thread | stride from the view the title creates at bind time, or fall back to raw |
 | SGPR address | 35 | translation thread | follow addresses through scalar registers |
 
-Order: lane mask and untracked mask first, since they are the same masking model and fix the most shaders.
+### C. Indirect draws (70): about 4,945 dropped
+The title's own compute passes write the arguments, so most of these drops probably come from A and B (a pass that never
+runs writes no arguments). Re-measure after A and B. Then log drops by reason so the rest can be ranked.
 
-### 3. Indirect draws (about 4,945 dropped)
-Indirect execution needs the argument clamp, and the argument buffers are written by the title's own compute passes. Most
-drops are probably downstream of item 2: a compute pass that is refused or untranslated never writes its arguments.
-Re-measure after item 2. Then log drops by reason (no clamp pipeline, no command signature, missing pipeline) so the rest
-can be ranked.
+### D. Frame rate (85)
+Measure on the second run of a build (pipeline cache warm), once the frame is complete. Known costs: copying title memory
+back after each submission, slow passes (`VICTORY_GPU_TIMING`), and pipelines built on first use.
 
-### 4. Frame rate (4 fps, target 30)
-Do this only once the frame is complete, since the profile changes completely as passes come back. Known costs today:
-copying changed title memory back after each submission (`COPY_BACK`), loop limits on slow passes, and pipelines built
-on first use. `VICTORY_GPU_TIMING` already logs slow submissions. The pipeline cache on disk means second runs are
-the ones to measure.
-
-### 5. Upstream
-Upstream each piece once it has run clean for a full session: the mesh relaxation as a follow-up to 578, the watchdog,
-and the lane-mask console flow on top of 233. XCL's design notes may inform ideas, but no XCL code is used (GPL-2.0-only
-vs VIctory's GPL-3.0).
+### Upstream
+Upstream each piece after it runs clean for a full session: the mesh relaxation as a follow-up to 578, the watchdog, and
+the lane-mask console flow on top of 233. XCL's design notes may inform ideas, but no XCL code is used (GPL-2.0-only vs
+VIctory's GPL-3.0).
 
 ## Scorecard (one line per nvidia head)
 Head commit, minutes without a hang, fps, draws per frame, draws dropped (no pipeline), indirect dropped, translation
