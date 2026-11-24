@@ -48,7 +48,7 @@ Fix these first, in this order:
 | Pass | Fails on | Fix | Owner |
 |---|---|---|---|
 | InstanceCulling, BatchCull | structured buffer of unknown stride (bindless heap buffers) | stride table per heap slot: host writes each buffer view's stride and size into its heap slot record and binds the records as `t0, space 3`; shaders address the buffer raw with that stride | host side: this thread (`host/heap-words`); shader side: translation thread |
-| meshlet_culling | `image_gather4_l` not translated | lower to `TextureGatherLevel`-style sampling (SM 6.7 has no gather with LOD on all drivers; emulate with 4 `SampleLevel` / `Load` taps) | translation thread |
+| meshlet_culling | `image_gather4_l` not translated | D3D12's Gather takes no LOD (it reads the top mip), so use Gather when the LOD is 0 and otherwise four `Load` taps at the requested mip | translation thread |
 | ped skinning | scalar memory reads as data | same descriptor-data work as B, plus the heap records above where it reads sizes | translation thread |
 
 Once these run, re-measure: indirect drops should fall sharply and the scene should start to draw. Items A to C below
