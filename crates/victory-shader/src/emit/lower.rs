@@ -233,6 +233,10 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// The loop limit in vertex, pixel and mesh programs (see
+/// [`Lower::count_iteration`]): 2^14.
+pub(super) const GRAPHICS_LOOP_LIMIT: u32 = 1 << 14;
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -6837,7 +6841,15 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        // Graphics stages get a much lower limit: a loop walking zeros from
+        // a null descriptor would otherwise run for seconds across a draw
+        // and trip the host's GPU timeout; legitimate per-vertex and
+        // per-pixel loops stay far below it.
+        let limit = match self.x.native.stage {
+            HwStage::Cs => super::loop_limit(),
+            _ => super::loop_limit().min(GRAPHICS_LOOP_LIMIT),
+        };
+        let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -7099,9 +7111,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7128,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7150,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
