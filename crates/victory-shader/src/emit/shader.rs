@@ -160,6 +160,11 @@ pub(crate) struct Shader {
     pub samplers: u32,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
+    /// Runs of immediate samplers bound as one array (first, count), for a
+    /// sampler the code picks among constants by control flow: its handle
+    /// takes the register it picks. Every other sampler has a range of its
+    /// own.
+    pub sampler_arrays: Vec<(u32, u32)>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -223,6 +228,7 @@ impl Shader {
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
+            sampler_arrays: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -399,6 +405,35 @@ impl Shader {
         self.annotate(block, h, 14 | cmp, 0)
     }
 
+    /// The handle of the immediate sampler at register `index` (an i32
+    /// value, uniform) of the array of `count` samplers from `first` (one of
+    /// [`Self::sampler_arrays`]), a comparison sampler when the first's bit
+    /// in `cmp_samplers` is set (every one's is).
+    pub fn sampler_array_handle(&mut self, block: usize, first: u32, count: u32, index: V) -> V {
+        let bind = [
+            self.m.i32(first),
+            self.m.i32(first + count - 1),
+            self.m.i32(SAMPLER_SPACE),
+            self.m.i8(3), // sampler
+        ];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, index, f],
+        );
+        let cmp = if self.cmp_samplers >> first & 1 != 0 {
+            0x8000
+        } else {
+            0
+        };
+        self.annotate(block, h, 14 | cmp, 0)
+    }
+
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
@@ -522,6 +557,7 @@ impl Shader {
                     kind: 2,
                     space: USER_DATA_SPACE,
                     register: 0,
+                    upper: 0,
                     dxil_kind: 13,
                 });
             }
@@ -545,6 +581,7 @@ impl Shader {
                     kind: 2,
                     space: ROOT_CBV_SPACE,
                     register: u32::from(slot),
+                    upper: u32::from(slot),
                     dxil_kind: 13,
                 });
             }
@@ -576,6 +613,7 @@ impl Shader {
                         kind: 4,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
+                        upper: u32::from(slot),
                         dxil_kind: 11,
                     });
                 }
@@ -613,6 +651,7 @@ impl Shader {
                         kind: 7,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
+                        upper: u32::from(slot),
                         dxil_kind: 11,
                     });
                 }
@@ -624,15 +663,28 @@ impl Shader {
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for n in 0..self.samplers {
+                let mut n = 0;
+                while n < self.samplers {
+                    let count = self
+                        .sampler_arrays
+                        .iter()
+                        .find(|a| a.0 == n)
+                        .map_or(1, |a| a.1);
                     let kind = (self.cmp_samplers >> n & 1) as u32;
+                    let u = if count > 1 {
+                        let a = self.m.array(count, ty);
+                        let p = self.m.ptr(a);
+                        self.m.undef(p)
+                    } else {
+                        u
+                    };
                     let ops = vec![
-                        Some(i32c(&mut self, n)),
+                        Some(i32c(&mut self, list.len() as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
                         Some(i32c(&mut self, SAMPLER_SPACE)),
                         Some(i32c(&mut self, n)),
-                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, count)),
                         // Sampler kind: 1 comparison.
                         Some(i32c(&mut self, kind)),
                         None,
@@ -642,8 +694,10 @@ impl Shader {
                         kind: 1,
                         space: SAMPLER_SPACE,
                         register: n,
+                        upper: n + count - 1,
                         dxil_kind: 14,
                     });
+                    n += count;
                 }
                 samplers = Some(self.m.md_node(list));
             }

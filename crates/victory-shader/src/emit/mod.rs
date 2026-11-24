@@ -106,6 +106,8 @@ mod waterfall_tests;
 mod wave64_tests;
 #[cfg(test)]
 mod lds_split_tests;
+#[cfg(test)]
+mod sampler_choice_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};

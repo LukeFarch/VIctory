@@ -68,6 +68,9 @@ pub(crate) struct Lowered {
     /// The functions the module calls (`dx.op.*`), by name.
     #[cfg(test)]
     pub functions: Vec<String>,
+    /// Immediate samplers bound as arrays (first, count).
+    #[cfg(test)]
+    pub sampler_arrays: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -205,6 +208,10 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
+    /// Arrays of immediate samplers made for samplers picked among constants
+    /// by control flow: the candidates in register order, whether they are
+    /// comparison samplers, and the first one's register.
+    sampler_choices: Vec<(Vec<[u32; 4]>, bool, u32)>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -1539,6 +1546,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
+            sampler_choices: Vec::new(),
             descriptors: x
                 .res
                 .descriptors
@@ -2194,6 +2202,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             functions: self.s.m.function_names(),
+            #[cfg(test)]
+            sampler_arrays: self.s.sampler_arrays.clone(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6508,7 +6518,20 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                // One of its own (a register in an array of choices is
+                // bound with the array).
+                let arrays = &self.s.sampler_arrays;
+                let in_array = |n: usize| {
+                    arrays
+                        .iter()
+                        .any(|&(f, c)| (f as usize..(f + c) as usize).contains(&n))
+                };
+                let found = self
+                    .samplers
+                    .iter()
+                    .enumerate()
+                    .position(|(n, w)| *w == words && !in_array(n));
+                let n = match found {
                     Some(n) => n,
                     None => {
                         self.samplers.push(words);
@@ -6557,6 +6580,11 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
+            Source::Phi { .. } | Source::Select { .. }
+                if sampler && Self::constant_choices(src).is_some() =>
+            {
+                self.chosen_sampler(site, src, props)
+            }
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
@@ -6587,6 +6615,121 @@ impl<'a> Lower<'a> {
                 let index = self.lane_heap_index(src, sampler)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
+        }
+    }
+
+    /// The distinct sampler words, in order of first appearance, that `src`
+    /// picks among by control flow (phis and SCC selects) when each of its
+    /// leaves is an immediate sampler; `None` when any is not.
+    fn constant_choices(src: &Source) -> Option<Vec<[u32; 4]>> {
+        let mut out: Vec<[u32; 4]> = Vec::new();
+        for leaf in src.leaves() {
+            let Source::Constant(words) = leaf else {
+                return None;
+            };
+            let words: [u32; 4] = words.get(..4)?.try_into().ok()?;
+            if !out.contains(&words) {
+                out.push(words);
+            }
+        }
+        Some(out)
+    }
+
+    /// The handle of an immediate sampler the code picks among constants by
+    /// control flow (the console compiler sets the words of one sampler on
+    /// each arm of a uniform branch, or with `s_cselect`). The candidates are
+    /// bound as one array of static samplers, and the handle takes the
+    /// register the same control flow picks: a phi at each join, a select
+    /// for each `s_cselect`. Exact: each candidate is a static sampler of its
+    /// words, and the choice is the program's own.
+    fn chosen_sampler(&mut self, site: Site, src: &Source, props: (u32, u32)) -> Result<V, Why> {
+        let words = Self::constant_choices(src).ok_or("a sampler constant")?;
+        let cmp = props.0 & 0x8000 != 0;
+        if let [only] = &words[..] {
+            return self.handle(site, &Source::Constant(only.to_vec()), true, props);
+        }
+        let first = match self
+            .sampler_choices
+            .iter()
+            .find(|c| c.0 == words && c.1 == cmp)
+        {
+            Some(c) => c.2,
+            None => {
+                let first = self.samplers.len() as u32;
+                let count = words.len() as u32;
+                if first + count > 64 {
+                    return Err("more than 64 immediate samplers");
+                }
+                self.samplers.extend_from_slice(&words);
+                if cmp {
+                    self.s.cmp_samplers |= ((1u64 << count) - 1) << first;
+                }
+                self.s.sampler_arrays.push((first, count));
+                self.sampler_choices.push((words.clone(), cmp, first));
+                first
+            }
+        };
+        let register = self.chosen_index(src, Some((&words, first)), false, 8)?;
+        Ok(self
+            .s
+            .sampler_array_handle(self.cur, first, words.len() as u32, register))
+    }
+
+    /// The index control flow picks for `src` in the current block: with
+    /// `consts` (the candidate words and the first one's register), the
+    /// register of the immediate sampler each leaf is; without, the heap
+    /// index of the descriptor each leaf loads. A phi joins the index each
+    /// predecessor computes at its end, at most `depth` joins deep; an SCC
+    /// select picks between two.
+    fn chosen_index(
+        &mut self,
+        src: &Source,
+        consts: Option<(&[[u32; 4]], u32)>,
+        sampler: bool,
+        depth: u32,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        match (src, consts) {
+            (Source::Loaded { load, first }, None) => self.heap_index(*load, *first, sampler),
+            (Source::Constant(words), Some((choices, first))) => {
+                let n = choices
+                    .iter()
+                    .position(|c| words.get(..4) == Some(&c[..]))
+                    .ok_or(WHY)?;
+                Ok(self.s.m.i32(first + n as u32))
+            }
+            (Source::Phi { block, args }, _) if depth > 0 => {
+                let p = self.x.p;
+                let mut incoming = Vec::new();
+                for (&q, arg) in p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail = self.tail[q].ok_or(WHY)?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.chosen_index(arg, consts, sampler, depth - 1);
+                    self.cur = here;
+                    incoming.push((index?, at));
+                }
+                let join = self.block[*block].ok_or(WHY)?;
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
+            }
+            (Source::Select { scc, args }, _) => {
+                let [a, b] = &args[..] else {
+                    return Err(WHY);
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.chosen_index(a, consts, sampler, depth)?;
+                let clear = self.chosen_index(b, consts, sampler, depth)?;
+                Ok(self.s.m.select(self.cur, cond, set, clear))
+            }
+            _ => Err(WHY),
         }
     }
 

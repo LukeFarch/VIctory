@@ -139,6 +139,8 @@ pub(crate) struct Binding {
     pub kind: u32,
     pub space: u32,
     pub register: u32,
+    /// The last register of the range (`register` for one resource).
+    pub upper: u32,
     /// DXIL resource kind (13 cbuffer, 14 sampler).
     pub dxil_kind: u32,
 }
@@ -226,7 +228,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         for b in p.bindings {
             u32s(
                 &mut out,
-                &[b.kind, b.space, b.register, b.register, b.dxil_kind, 0],
+                &[b.kind, b.space, b.register, b.upper, b.dxil_kind, 0],
             );
         }
     }
