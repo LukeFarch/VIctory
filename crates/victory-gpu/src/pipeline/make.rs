@@ -33,6 +33,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// The frame a draw or dispatch first asked for it (`u64::MAX` none).
+    asked: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,6 +58,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            asked: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -124,10 +127,41 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        // Asked for again in a later frame: a pipeline the title draws
+        // with frame after frame (a loading screen's art, the HUD) goes
+        // ahead of the hundreds asked for once while a world streams in.
+        let frame = crate::frame::current();
+        let first = p.asked.load(Ordering::Relaxed);
+        if first == u64::MAX {
+            p.asked.store(frame, Ordering::Relaxed);
+            start(p, REQUESTED);
+        } else if frame > first && hot_first() {
+            start(p, HOT);
+        } else {
+            start(p, REQUESTED);
+        }
+        wait(p, frame);
+        if p.made.get().is_none() {
+            UNREADY.fetch_add(1, Ordering::Relaxed);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Draws and dispatches dropped since the last [`take_unready`] because
+/// their pipeline was still being made.
+static UNREADY: AtomicU64 = AtomicU64::new(0);
+
+/// See [`UNREADY`].
+pub(crate) fn take_unready() -> u64 {
+    UNREADY.swap(0, Ordering::Relaxed)
+}
+
+/// Whether pipelines asked for in more than one frame are made first
+/// (`VICTORY_PIPELINE_HOT=0`: in the order first asked, as before).
+fn hot_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_HOT").is_none_or(|v| v != "0"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -216,11 +250,14 @@ fn wait(p: &Pending, frame: u64) {
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+/// Asked for in more than one frame (see [`ready`]).
+const HOT: u8 = 3;
+const MAKING: u8 = 4;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    hot: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -228,6 +265,7 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            hot: VecDeque::new(),
         }
     }
 
@@ -239,20 +277,23 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match priority {
+            HOT => self.hot.push_back(p.clone()),
+            REQUESTED => self.requested.push_back(p.clone()),
+            _ => self.early.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        // An entry can have been promoted (to a queue ahead) and claimed
+        // already: each queue keeps only those still in its state.
+        let of = |q: &mut VecDeque<Arc<Pending>>, state: u8| {
+            std::iter::from_fn(|| q.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
+        };
+        let p = of(&mut self.hot, HOT)
+            .or_else(|| of(&mut self.requested, REQUESTED))
+            .or_else(|| of(&mut self.early, EARLY))?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }

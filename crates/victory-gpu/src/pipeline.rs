@@ -482,6 +482,13 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Draws and dispatches dropped since the last call because their host
+/// pipeline was still being made.
+#[cfg(windows)]
+pub(crate) fn take_unready() -> u64 {
+    make::take_unready()
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

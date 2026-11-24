@@ -872,7 +872,11 @@ extern "system" fn present(
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let rect = source_rect(plane, desc.Width, desc.Height);
-        let shown = host.present(texture, state, frame, rect);
+        let shown = if hold_partial() {
+            None
+        } else {
+            host.present(texture, state, frame, rect)
+        };
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -883,6 +887,40 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Whether this frame is left off the screen, the last one staying there:
+/// a frame that dropped draws or dispatches because their pipelines were
+/// still being made is missing part of its picture (run 14: the loading
+/// screen's art was dropped while 1,200 pipelines were made, and the frame
+/// showed its dark-blue background alone), so it is held back for up to
+/// `VICTORY_HOLD_PARTIAL_MS` (3000 unless set; 0 shows every frame, as
+/// before) after the last whole frame shown; past that, frames are shown
+/// as they are, until a whole one comes. Before any whole frame was shown
+/// nothing is held.
+#[cfg(windows)]
+fn hold_partial() -> bool {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *MS.get_or_init(|| {
+        std::env::var("VICTORY_HOLD_PARTIAL_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000)
+    });
+    let unready = crate::pipeline::take_unready();
+    // When the last whole frame was shown, if one was.
+    static WHOLE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static HELD: AtomicU64 = AtomicU64::new(0);
+    let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+    if unready == 0 || limit == 0 {
+        *whole = Some(std::time::Instant::now());
+        return false;
+    }
+    let hold = whole.is_some_and(|t| t.elapsed().as_millis() < u128::from(limit));
+    if hold {
+        let n = HELD.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            tracing::info!(held = n, unready, "a frame missing draws whose pipelines are being made is not shown");
+        }
+    }
+    hold
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
