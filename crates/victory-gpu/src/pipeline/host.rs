@@ -98,6 +98,35 @@ mod regs {
     pub const TARGET_MASK: usize = 0x78;
     /// `CB_BLEND0_CONTROL` to `CB_BLEND7_CONTROL`.
     pub const BLEND: usize = 0xd0;
+    /// `DB_DEPTH_CONTROL` (seen: 0x7007f0 with depth off and every test
+    /// ALWAYS; 0x7007f6, test and write on, in a pipeline without pixel
+    /// program), then `DB_STENCIL_CONTROL`, then front and back
+    /// `DB_STENCILREFMASK`.
+    pub const DEPTH: usize = 0xb8;
+    pub const STENCIL: usize = 0xbc;
+    pub const STENCIL_MASKS: usize = 0xc0;
+    /// What looks like `PA_SU_SC_MODE_CNTL` (2 cull back, 0, 0x80); used
+    /// only with `VICTORY_PRECOMPILED_CULL=1` until a run confirms it.
+    pub const MODE: usize = 0x84;
+}
+
+/// A GFX10 compare function as D3D12's (NEVER 0 to ALWAYS 7).
+fn compare(f: u32) -> D3D12_COMPARISON_FUNC {
+    D3D12_COMPARISON_FUNC((f & 7) as i32 + 1)
+}
+
+/// A GFX10 stencil operation as D3D12's.
+fn stencil_op(op: u32) -> D3D12_STENCIL_OP {
+    match op & 0xf {
+        1 => D3D12_STENCIL_OP_ZERO,
+        3 | 4 => D3D12_STENCIL_OP_REPLACE,
+        5 => D3D12_STENCIL_OP_INCR_SAT,
+        6 => D3D12_STENCIL_OP_DECR_SAT,
+        7 => D3D12_STENCIL_OP_INVERT,
+        8 => D3D12_STENCIL_OP_INCR,
+        9 => D3D12_STENCIL_OP_DECR,
+        _ => D3D12_STENCIL_OP_KEEP,
+    }
 }
 
 /// A GFX10 blend factor as D3D12's.
@@ -176,8 +205,8 @@ impl GraphicsState {
     /// register block (`regs`) and input layout block (`layout`), drawing
     /// into targets of `targets` and depth of `depth_format` (the method
     /// names no formats: the pipeline is made per set of targets bound).
-    /// shortcut: depth testing is off and nothing is culled until the
-    /// registers that hold them are placed in the block.
+    /// shortcut: nothing is culled until the register that holds it is
+    /// confirmed (`VICTORY_PRECOMPILED_CULL=1` tries it).
     pub(crate) fn precompiled(
         regs: &[u8],
         layout: &[u8],
@@ -232,9 +261,38 @@ impl GraphicsState {
                 g.blend.RenderTarget[i].BlendEnable = false.into();
             }
         }
+        let depth = dword(regs, regs::DEPTH);
+        let stencil = dword(regs, regs::STENCIL);
+        let masks = dword(regs, regs::STENCIL_MASKS);
+        g.depth.DepthEnable = (depth & 2 != 0).into();
+        g.depth.DepthWriteMask =
+            if depth & 4 != 0 { D3D12_DEPTH_WRITE_MASK_ALL } else { D3D12_DEPTH_WRITE_MASK_ZERO };
+        g.depth.DepthFunc = compare(depth >> 4);
+        g.depth.StencilEnable = (depth & 1 != 0).into();
+        g.depth.StencilReadMask = (masks >> 8) as u8;
+        g.depth.StencilWriteMask = (masks >> 16) as u8;
+        let face = |func: u32, ops: u32| D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: stencil_op(ops),
+            StencilPassOp: stencil_op(ops >> 4),
+            StencilDepthFailOp: stencil_op(ops >> 8),
+            StencilFunc: compare(func),
+        };
+        g.depth.FrontFace = face(depth >> 8, stencil);
+        g.depth.BackFace = if depth & 0x80 != 0 {
+            face(depth >> 20, stencil >> 12)
+        } else {
+            g.depth.FrontFace
+        };
         g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
-        g.depth.DepthEnable = false.into();
-        g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        if std::env::var_os("VICTORY_PRECOMPILED_CULL").is_some_and(|v| v == "1") {
+            let mode = dword(regs, regs::MODE);
+            g.rasterizer.CullMode = match mode & 3 {
+                1 => D3D12_CULL_MODE_FRONT,
+                2 => D3D12_CULL_MODE_BACK,
+                _ => D3D12_CULL_MODE_NONE,
+            };
+            g.rasterizer.FrontCounterClockwise = (mode & 4 == 0).into();
+        }
         g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         g.targets = targets;
         g.depth_format = depth_format;
