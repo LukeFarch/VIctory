@@ -18,8 +18,6 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
 /// element of the buffer view at heap slot `i` (0: none or not a buffer).
-/// After those, two dwords per slot: the title address of the buffer view
-/// at that slot (0: none), for code that takes a picked view's address.
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this

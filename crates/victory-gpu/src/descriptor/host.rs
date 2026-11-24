@@ -613,9 +613,7 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                // The strides, then the title address of each slot's buffer
-                // view (two dwords).
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 12;
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -1091,20 +1089,6 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
-            // The title address of a buffer view, for code that walks the
-            // memory behind a view it picks (the ray-traced shadow
-            // programs' structure roots). Low dword zeroed first and set
-            // last, so a reader never pairs a new high dword with an old
-            // low one.
-            let address = view.and_then(buffer_range).map_or(0, |r| r.0);
-            let at = victory_shader::emit::SLOT_STRIDES_COUNT as usize + 2 * index as usize;
-            // SAFETY: inside the mapping (three dwords per slot).
-            unsafe {
-                let words = (*data as *mut u32).add(at);
-                words.write_volatile(0);
-                words.add(1).write_volatile((address >> 32) as u32);
-                words.write_volatile(address as u32);
-            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(Some((_, _, data))) = self.addresses.get() {
