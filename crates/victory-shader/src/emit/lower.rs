@@ -75,6 +75,12 @@ pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange la
 
 /// Why the console flow ([`CONSOLE_FLOW`]) refuses a descriptor each lane
 /// holds by the path it took ([`Source::LanePhi`]).
+/// Why the per-lane form stops at a lane mask read as a number where some of
+/// its lanes are on another path. A wave32 compute program then runs in the
+/// console flow with one host wave per console wave (see [`lower`]'s
+/// caller): every lane runs every block, so the mask is the wave's ballot.
+pub(crate) const LANES_ELSEWHERE: &str = "a lane mask holding lanes elsewhere read as data";
+
 pub(crate) const LANE_PHI_IN_CONSOLE_FLOW: &str =
     "a per-lane descriptor chosen by control flow in the console flow";
 
@@ -477,7 +483,10 @@ impl<'a> Lower<'a> {
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             if x.console_cf {
                 console_lanes = true;
-                split = true;
+                // Wave64: two 32-lane halves exchange. Wave32: the host
+                // wave is the console wave (`WaveSize(32)`), nothing to
+                // exchange.
+                split = x.native.wave64;
             }
             if split {
                 s.wave_size = Some(32);
@@ -1318,7 +1327,7 @@ impl<'a> Lower<'a> {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
         if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
+            return Err(LANES_ELSEWHERE);
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
@@ -4431,7 +4440,12 @@ impl<'a> Lower<'a> {
                         _ => Err(LANE_MASK),
                     }
                 };
-                let (lo, hi) = (word(self, EXEC)?, word(self, EXEC + 1)?);
+                let lo = word(self, EXEC)?;
+                let hi = if self.x.native.wave64 {
+                    word(self, EXEC + 1)?
+                } else {
+                    self.s.m.i32(0)
+                };
                 let i32t = self.s.t.i32;
                 let flo = self
                     .s
@@ -7178,6 +7192,10 @@ impl<'a> Lower<'a> {
     fn console_lane(&mut self) -> (V, V) {
         let f = self.console_flat();
         let e = self.s.entry;
+        if !self.x.native.wave64 {
+            let (k31, z) = (self.s.m.i32(31), self.s.m.i32(0));
+            return (self.s.m.bin(e, Bin::And, f, k31), z);
+        }
         let (k63, k5, one) = (self.s.m.i32(63), self.s.m.i32(5), self.s.m.i32(1));
         let lane = self.s.m.bin(e, Bin::And, f, k63);
         let h = self.s.m.bin(e, Bin::LShr, f, k5);
@@ -7193,7 +7211,9 @@ impl<'a> Lower<'a> {
     fn exchange(&mut self, at: usize, x: V) -> (V, V) {
         let threads: u32 = self.s.threads.expect("compute").iter().product();
         let z = self.s.m.i32(0);
-        if threads <= 32 {
+        if threads <= 32 || !self.x.native.wave64 {
+            // No upper half, or a wave32 program: one host wave is the
+            // whole console wave.
             return (x, z);
         }
         let (_, half) = self.console_lane();

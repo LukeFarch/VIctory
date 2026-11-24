@@ -347,6 +347,20 @@ pub fn emit(
             parts.console_cf = true;
             lower::lower(&parts)?
         }
+        // A wave32 compute program whose per-lane form cannot read a mask
+        // some lanes left: the console flow, one host wave per console
+        // wave. If that fails too, the per-lane reason stands.
+        Err(e @ ShaderError::Unsupported { what, .. })
+            if what == lower::LANES_ELSEWHERE
+                && native.stage == HwStage::Cs
+                && !native.wave64
+                && target.runs(32) =>
+        {
+            let console = structure::structure_console(p)?;
+            parts.st = &console;
+            parts.console_cf = true;
+            lower::lower(&parts).map_err(|_| e)?
+        }
         l => l?,
     };
     Ok(HostShader {
