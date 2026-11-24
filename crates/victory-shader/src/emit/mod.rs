@@ -102,6 +102,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(test)]
+mod lds_split_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -268,6 +270,25 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// See [`set_why_label`].
+    static WHY_LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The program the `VICTORY_WAVE_WHY` lines of this thread are about from now on (the
+/// translate command's label, with the hash the game's log names it by).
+pub fn set_why_label(label: &str) {
+    WHY_LABEL.with(|l| *l.borrow_mut() = label.to_owned());
+}
+
+/// [`set_why_label`]'s label to append to a diagnostic line ("" when none is set).
+pub(crate) fn why_label() -> String {
+    WHY_LABEL.with(|l| {
+        let l = l.borrow();
+        if l.is_empty() { String::new() } else { format!("  ({l})") }
+    })
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -327,8 +348,8 @@ pub fn emit(
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}{}", why_label()),
+                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}{}", why_label()),
                 }
             }
         };
@@ -346,7 +367,7 @@ pub fn emit(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}{}", why_label());
                 }
                 false
             }
@@ -458,6 +479,36 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all: an LDS write and read in one lane branch's region with no meeting of
+        // the host waves between them ([`lower::with_loose_lds`]). A refused pipeline draws
+        // nothing; this is right for programs that keep to HLSL's barrier rules.
+        // (`VICTORY_WAVE_LOOSE_LDS=0` turns it off.)
+        let loose_on = std::env::var_os("VICTORY_WAVE_LOOSE_LDS").is_none_or(|v| v != "0");
+        if loose_on && !strict {
+            let all: Vec<(&str, &ir::Program, &structure::Structured, &io::Io, &resource::Resources)> = forms
+                .iter()
+                .filter_map(|(name, f)| f.as_ref().map(|(p, st, io, res)| (*name, p, st, io, res)))
+                .chain(std::iter::once(("as is", p, st, io, res)))
+                .collect();
+            // the lane code exact first, then each host wave on its own, then any mask per half
+            for step in 0..3 {
+                if step > 0 && (!local_on || exact_only) {
+                    break;
+                }
+                for &(name, p, st, io, res) in &all {
+                    let again = lower::with_loose_lds(|| match step {
+                        0 => emit_program(c, native, p, st, io, res),
+                        1 => lower::with_local_waves(|| emit_program(c, native, p, st, io, res)),
+                        _ => lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)),
+                    });
+                    let how = ["exact lanes", "local waves", "local waves, any mask"][step];
+                    report(&format!("loose LDS (APPROXIMATE), {how}, {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
                 }
             }
         }

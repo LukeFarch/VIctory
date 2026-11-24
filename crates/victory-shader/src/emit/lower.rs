@@ -834,7 +834,8 @@ fn meeting_mode() -> u32 {
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them): refused, unless
+/// [`with_loose_lds`].
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
@@ -882,7 +883,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    if !LOOSE_LDS.get() && (0..n).any(|r| reads[r] && writes[r]) {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -949,6 +950,8 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_loose_lds`].
+    static LOOSE_LDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -962,6 +965,22 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
     let was = LOCAL_ANY.replace(true);
     let r = with_local_waves(f);
     LOCAL_ANY.set(was);
+    r
+}
+
+/// Runs `f` with an LDS write and read inside one lane branch's region taken
+/// to need no meeting of the two host waves between them ([`lds_meetings`]):
+/// the host waves still meet on the way into and out of the region.
+/// Approximate: HLSL orders a thread's LDS accesses against other threads'
+/// only at a group barrier, which cannot stand in a lane branch, so a
+/// program written to HLSL's rules shares nothing across threads inside such
+/// a region but through atomics. A program that relies on the console's
+/// 64 lanes running in step there sees the other half's accesses late. Used
+/// only for programs a 32-lane host would refuse otherwise (`WaveSize(64)`).
+pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
+    let was = LOOSE_LDS.replace(true);
+    let r = f();
+    LOOSE_LDS.set(was);
     r
 }
 
@@ -1371,7 +1390,12 @@ impl<'a> Lower<'a> {
                         }
                     }
                     why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                    eprintln!(
+                        "WAVE64-WHY group={group} lds={} [{}]{}",
+                        s.lds_dwords > 0,
+                        why.join(", "),
+                        super::why_label()
+                    );
                 }
             }
             if wave == 32 && x.native.wave64 {
