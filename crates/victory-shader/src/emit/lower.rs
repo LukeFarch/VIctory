@@ -986,6 +986,9 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// a region but through atomics. A program that relies on the console's
 /// 64 lanes running in step there sees the other half's accesses late. Used
 /// only for programs a 32-lane host would refuse otherwise (`WaveSize(64)`).
+/// Lane masks read as numbers, first-lane reads and wave reductions where not every lane
+/// runs (where the halves cannot exchange) take this host wave's lanes alone too, as a
+/// console of 32-lane waves would.
 pub(super) fn with_loose_lds<R>(f: impl FnOnce() -> R) -> R {
     let was = LOOSE_LDS.replace(true);
     let r = f();
@@ -1943,6 +1946,10 @@ impl<'a> Lower<'a> {
         } else if own && prefix.is_none() && op == Op::Or && !self.all_lanes(self.cur_ir) {
             // each thread walks the bits of this value and works only at its own, which the
             // host wave's OR holds: the same run as with the console wave's OR
+            r
+        } else if self.exchange.is_some() && !self.all_lanes(self.cur_ir) && LOOSE_LDS.get() {
+            // Approximate ([`with_loose_lds`]): where the halves cannot exchange, each gets
+            // its own half's result, as a console wave of 32 would.
             r
         } else if self.exchange.is_some() {
             if !self.all_lanes(self.cur_ir) {
@@ -3217,6 +3224,7 @@ impl<'a> Lower<'a> {
                 if self.exchange.is_some() {
                     // a host wave's ballot is its half's 32 bits: the halves exchange them
                     let b = self.def_block.get(&lo).copied();
+                    let mut exchange = true;
                     if self.local {
                         if !self.local_ok && !self.local_any {
                             return Err("a lane mask read as data in a half-wave");
@@ -3224,9 +3232,18 @@ impl<'a> Lower<'a> {
                     } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
                         // (a group of 32 or fewer has no other half to exchange with)
                         need(b.unwrap_or(0));
-                        return Err("a lane mask exchanged where not every lane runs");
+                        if !LOOSE_LDS.get() {
+                            return Err("a lane mask exchanged where not every lane runs");
+                        }
+                        // Approximate ([`with_loose_lds`]): this half's lanes alone, as a
+                        // console wave of 32 would have them. Exact for the usual reader, a
+                        // test for no lane (`s_and_b64 vcc, exec, m` / `s_cbranch_vccz`) of
+                        // a condition every lane here shares; a count gets the half's.
+                        exchange = false;
                     }
-                    xy = self.exchange_halves(at, xy.0);
+                    if exchange {
+                        xy = self.exchange_halves(at, xy.0);
+                    }
                 }
                 self.ballots.insert(lo, xy);
                 xy
@@ -7616,7 +7633,12 @@ impl<'a> Lower<'a> {
                     _ => true,
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
-                let r = if halves && !alike {
+                // Approximate ([`with_loose_lds`]): where the halves cannot exchange, each
+                // takes its own first lane, as a console wave of 32 would. Exact for the
+                // usual reader, a loop over the lanes' distinct values (first lane's value,
+                // the lanes that hold it, until no lane is left), which visits each half's.
+                let loose = halves && !alike && !self.all_lanes(self.cur_ir) && LOOSE_LDS.get();
+                let r = if halves && !alike && !loose {
                     if !self.all_lanes(self.cur_ir) {
                         need(self.cur_ir);
                         return Err("a first-lane read where not every lane runs");
