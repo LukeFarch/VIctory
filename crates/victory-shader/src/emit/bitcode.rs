@@ -54,8 +54,11 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
-    /// An internal constant with this initialiser (a constant table).
+    /// An internal global with this initialiser: a constant (a constant
+    /// table) unless `writable`.
     init: Option<u32>,
+    /// Per-thread memory the program writes (a `static` variable).
+    writable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -355,8 +358,27 @@ impl Module {
             ptr,
             space,
             init: None,
+            writable: false,
         });
         V::Global(self.globals.len() as u32 - 1)
+    }
+
+    /// The functions the module declares or defines, by name.
+    #[cfg(test)]
+    pub fn function_names(&self) -> Vec<String> {
+        self.funcs.iter().map(|f| f.name.clone()).collect()
+    }
+
+    /// An internal global of type `ty` that each thread has its own copy
+    /// of (HLSL's `static` variables), starting undefined.
+    pub fn private_global(&mut self, name: &str, ty: Ty) -> V {
+        let init = self.undef(ty);
+        let g = self.global(name, ty, 0);
+        if let (V::Global(n), V::Const(i)) = (g, init) {
+            self.globals[n as usize].init = Some(i);
+            self.globals[n as usize].writable = true;
+        }
+        g
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -614,7 +636,7 @@ impl Module {
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
             // section]
             let (constant, init, linkage) = match g.init {
-                Some(i) => (1, first_const + u64::from(i) + 1, 3),
+                Some(i) => (u64::from(!g.writable), first_const + u64::from(i) + 1, 3),
                 None => (0, 0, 0),
             };
             w.record(

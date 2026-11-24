@@ -11,13 +11,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, flags};
+use super::shader::{GS_INPUT_STRIDE, GS_INPUT_VERTICES, GS_OUTPUT_BASE, Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, DRIVER, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The functions the module calls (`dx.op.*`), by name.
+    #[cfg(test)]
+    pub functions: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -295,6 +298,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Geometry: the count of vertices emitted so far, in private memory.
+    gs_emitted: Option<V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1462,6 +1467,21 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        if let StageIo::Gs(gs) = &x.native.io {
+            s.geometry = Some(super::shader::Geometry {
+                max_vertices: gs.max_vertices,
+            });
+            // One host invocation is console lane 0 of its own wave: its
+            // inputs, then its output vertices, in memory of its own.
+            s.private_lds = true;
+            s.lds_dwords = GS_OUTPUT_BASE / 4 + gs.max_vertices * gs.vertex_dwords;
+            // The primitive id and instance arrive through operations, not
+            // the input signature.
+            s.inputs.retain(|e| e.row.is_some() && e.kind != 10);
+            for e in &mut s.outputs {
+                e.usage = (1 << e.cols) - 1;
+            }
+        }
         Lower {
             s,
             x,
@@ -1526,7 +1546,9 @@ impl<'a> Lower<'a> {
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
-                HwStage::Cs => MaskData::Console,
+                // (A geometry invocation is lane 0 of a wave of its own, and
+                // its masks that lane's bit: the console's, bit for bit.)
+                HwStage::Cs | HwStage::Gs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
             },
@@ -1551,6 +1573,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            gs_emitted: None,
         }
     }
 
@@ -2057,6 +2080,9 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        if self.s.geometry.is_some() {
+            self.gs_prologue().map_err(|w| unsupported(0, w))?;
+        }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -2124,6 +2150,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            functions: self.s.m.function_names(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2180,6 +2208,9 @@ impl<'a> Lower<'a> {
     }
 
     fn input(&mut self, input: Input) -> Val {
+        if self.s.geometry.is_some() {
+            return self.geometry_input(input);
+        }
         let (kind, col) = match input {
             Input::VertexId => (1, 0),
             Input::InstanceId => (2, 0),
@@ -2259,6 +2290,158 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// A geometry program's system input, as one lane of a wave of its own
+    /// sees it (see [`GS_OUTPUT_BASE`] for where its vertices are).
+    fn geometry_input(&mut self, input: Input) -> Val {
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        Val::I32(match input {
+            Input::GsVertexPair(k) => {
+                let first = 2 * u32::from(k) * GS_INPUT_STRIDE;
+                self.s.m.i32(first | (first + GS_INPUT_STRIDE) << 16)
+            }
+            Input::PrimitiveId => self
+                .s
+                .op(e, "primitiveID.i32", Attr::ReadNone, i32t, 108, &[]),
+            Input::GsInstance => self
+                .s
+                .op(e, "gsInstanceID.i32", Attr::ReadNone, i32t, 100, &[]),
+            // The first GS wave of its group.
+            Input::GsOutputOffset => self.s.m.i32(0),
+            // One ES lane and one GS lane (bits 0-7, 8-15), wave 0.
+            Input::MergedWaveInfo => self.s.m.i32(1 | 1 << 8),
+            _ => return Val::Missing("a system input of a geometry program"),
+        })
+    }
+
+    /// Geometry: before the program, its input vertices go where the
+    /// offsets it is given point (input register r of vertex i at dwords
+    /// `GS_INPUT_STRIDE * i + 4 r`), and its count of emitted vertices
+    /// starts at 0.
+    fn gs_prologue(&mut self) -> Result<(), Why> {
+        let e = self.s.entry;
+        let counter_ty = self.s.m.array(1, self.s.t.i32);
+        let counter = self.s.m.private_global("emitted", counter_ty);
+        let zero = self.s.m.i32(0);
+        let ptr = self.s.m.element(e, counter, zero);
+        self.s.m.store(e, ptr, zero);
+        self.gs_emitted = Some(counter);
+        for id in 0..self.s.inputs.len() {
+            let el = &self.s.inputs[id];
+            if el.half {
+                return Err("a 16-bit input of a geometry program");
+            }
+            let (row, col0, cols, comp) =
+                (el.row.expect("kept with a row"), el.col, el.cols, el.comp);
+            let (name, ty) = match comp {
+                9 => ("loadInput.f32", self.s.t.f32),
+                1 => ("loadInput.i1", self.s.t.i1),
+                _ => ("loadInput.i32", self.s.t.i32),
+            };
+            self.s.inputs[id].usage = (1 << cols) - 1;
+            for vertex in 0..GS_INPUT_VERTICES {
+                for k in 0..cols {
+                    let args = [
+                        self.s.m.i32(id as u32),
+                        self.s.m.i32(0),
+                        self.s.m.i8(k),
+                        self.s.m.i32(vertex),
+                    ];
+                    let x = self.s.op(e, name, Attr::ReadNone, ty, 4, &args);
+                    let x = match comp {
+                        9 => self.s.m.cast(e, Cast::Bitcast, x, self.s.t.i32),
+                        1 => self.s.m.cast(e, Cast::ZExt, x, self.s.t.i32),
+                        _ => x,
+                    };
+                    let dword = GS_INPUT_STRIDE * vertex + 4 * row + u32::from(col0 + k);
+                    let lds = self.s.lds();
+                    let at = self.s.m.i32(dword);
+                    let ptr = self.s.m.element(e, lds, at);
+                    self.s.m.store(e, ptr, x);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Geometry: `s_sendmsg` with the GS or GS_DONE message. An emit sends
+    /// the next output vertex from where the program wrote it, slot by
+    /// slot ([`crate::native::GeometryIo`]); a cut ends the strip.
+    fn gs_message(&mut self, imm: u16) -> Result<(), Why> {
+        let (msg, op, stream) = (imm & 0xF, imm >> 4 & 3, imm >> 8 & 3);
+        match msg {
+            // GS_DONE, and the allocation request an NGG stage might send.
+            3 | GS_ALLOC_REQ => return Ok(()),
+            2 => {}
+            _ => return Err("a message a geometry program sends"),
+        }
+        if stream != 0 {
+            return Err("a geometry stream other than 0");
+        }
+        let StageIo::Gs(gs) = &self.x.native.io else {
+            unreachable!("a geometry shader is a geometry program")
+        };
+        let (cut, emit) = (op & 1 != 0, op & 2 != 0);
+        let void = self.s.t.void;
+        let stream = self.s.m.i8(0);
+        if emit {
+            let counter = self.gs_emitted.expect("made by the prologue");
+            let zero = self.s.m.i32(0);
+            let c = self.cur;
+            let cp = self.s.m.element(c, counter, zero);
+            let n = self.s.m.load(c, cp);
+            let stride = self.s.m.i32(gs.vertex_dwords);
+            let at = self.s.m.bin(c, Bin::Mul, n, stride);
+            let base = self.s.m.i32(GS_OUTPUT_BASE / 4);
+            let at = self.s.m.bin(c, Bin::Add, at, base);
+            // Slot 0 the position, slot 1 + p parameter p (its row).
+            let mut slots: Vec<(u32, Option<u32>)> = vec![(0, None)];
+            for o in &gs.outputs {
+                if o.fp16 || o.pack2 {
+                    return Err("a 16-bit output of a geometry program");
+                }
+                slots.push((1 + u32::from(o.param), Some(u32::from(o.row))));
+            }
+            let lds = self.s.lds();
+            for id in 0..self.s.outputs.len() {
+                let el = self.s.outputs[id].clone();
+                let slot = slots.iter().find(|(_, row)| match row {
+                    None => el.kind == 3,
+                    Some(r) => el.kind != 3 && el.row == Some(*r),
+                });
+                let Some(&(slot, _)) = slot else {
+                    continue;
+                };
+                for k in 0..el.cols {
+                    let dword = self.s.m.i32(4 * slot + u32::from(el.col + k));
+                    let i = self.s.m.bin(c, Bin::Add, at, dword);
+                    let ptr = self.s.m.element(c, lds, i);
+                    let x = self.s.m.load(c, ptr);
+                    let (name, x) = match el.comp {
+                        9 => (
+                            "storeOutput.f32",
+                            self.s.m.cast(c, Cast::Bitcast, x, self.s.t.f32),
+                        ),
+                        1 => ("storeOutput.i1", self.s.m.cmp(c, pred::NE, x, zero)),
+                        _ => ("storeOutput.i32", x),
+                    };
+                    let args = [self.s.m.i32(id as u32), zero, self.s.m.i8(k), x];
+                    self.s.op(c, name, Attr::NoUnwind, void, 5, &args);
+                }
+            }
+            self.s
+                .op(c, "emitStream", Attr::NoUnwind, void, 97, &[stream]);
+            let one = self.s.m.i32(1);
+            let next = self.s.m.bin(c, Bin::Add, n, one);
+            self.s.m.store(c, cp, next);
+        }
+        if cut {
+            self.s
+                .op(self.cur, "cutStream", Attr::NoUnwind, void, 98, &[stream]);
+        }
+        Ok(())
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -2953,7 +3136,9 @@ impl<'a> Lower<'a> {
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        // (A geometry invocation is the only lane there is: no lane is elsewhere.)
+        let whole = self.s.geometry.is_some()
+            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
@@ -2975,6 +3160,13 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                if self.s.geometry.is_some() {
+                    // The wave is this one lane: the mask is its bit.
+                    let x = self.s.m.cast(at, Cast::ZExt, bit, self.s.t.i32);
+                    let xy = (x, self.s.m.i32(0));
+                    self.ballots.insert(lo, xy);
+                    return Ok(if high { xy.1 } else { xy.0 });
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -3451,8 +3643,8 @@ impl<'a> Lower<'a> {
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
-            // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
+            // the lane tests its own bit (a geometry invocation is lane 0).
+            Atom::Opaque(v) if self.console_lanes || self.s.geometry.is_some() => {
                 let hi = match self.pair_high(v) {
                     Some(h) => Some(self.get(h)?),
                     None => None,
@@ -3466,7 +3658,7 @@ impl<'a> Lower<'a> {
                 let hi = hi.map(word).transpose()?;
                 Ok(self.lane_bit(at, lo, hi))
             }
-            Atom::Constant(k) if self.console_lanes => {
+            Atom::Constant(k) if self.console_lanes || self.s.geometry.is_some() => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
@@ -3697,10 +3889,13 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        self.s.flags |= flags::WAVE_OPS;
-        let lane = if self.exchange.is_some() {
+        let lane = if self.s.geometry.is_some() {
+            self.lane_index()
+        } else if self.exchange.is_some() {
+            self.s.flags |= flags::WAVE_OPS;
             self.console_lane()
         } else {
+            self.s.flags |= flags::WAVE_OPS;
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
         };
         let (k31, k32, one, z) = (
@@ -4087,6 +4282,10 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
+        if self.s.geometry.is_some() {
+            // A geometry invocation is console lane 0 of a wave of its own.
+            return self.s.m.i32(0);
+        }
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
@@ -4442,6 +4641,9 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
+        if self.s.private_lds {
+            return Err("an LDS atomic in a geometry program");
+        }
         // Atomics: the old value returns with `_rtn`.
         let op = name
             .strip_prefix("ds_")
@@ -4631,6 +4833,16 @@ impl<'a> Lower<'a> {
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
+            // Geometry: the messages that complete vertices and strips, and
+            // no group to wait for (one lane an invocation).
+            Fields::Sopp { imm } if name == "s_sendmsg" && self.s.geometry.is_some() => {
+                return self
+                    .gs_message(*imm)
+                    .map_err(|why| unsupported(offset, why));
+            }
+            Fields::Sopp { .. } if name == "s_barrier" && self.s.geometry.is_some() => {
+                return Err(unsupported(offset, "a barrier in a geometry program"));
+            }
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
@@ -4798,7 +5010,9 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        // (A geometry invocation is lane 0 of a wave of its own: a mask it
+        // computes is a number, of which only bit 0 means anything.)
+        if (inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo)) && self.s.geometry.is_none() {
             return Err(LANE_MASK);
         }
         if matches!(
@@ -5038,6 +5252,29 @@ impl<'a> Lower<'a> {
                         };
                         self.set(v, val);
                     }
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // ((1 << count) - 1) << shift, both 6-bit: a geometry
+                    // program's EXEC from its lane count.
+                    let (n, at) = (src32(self, 0)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.i32(63);
+                    let n = self.s.m.bin(c, Bin::And, n, k63);
+                    let at = self.s.m.bin(c, Bin::And, at, k63);
+                    let n = self.s.m.cast(c, Cast::ZExt, n, i64t);
+                    let at = self.s.m.cast(c, Cast::ZExt, at, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, n);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let r = self.s.m.bin(c, Bin::Shl, m, at);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
                     Ok(())
                 }
                 "s_cselect_b64" => {
@@ -5300,6 +5537,14 @@ impl<'a> Lower<'a> {
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
         }
+        if let Some(a) = self
+            .scalar
+            .get(&site)
+            .copied()
+            .filter(|a| a.param == DRIVER)
+        {
+            return self.driver_smem(inst, a);
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -5460,6 +5705,46 @@ impl<'a> Lower<'a> {
                 }
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// Geometry: a load from the driver's table (`resource::DRIVER`). The
+    /// one dword known is at 0xb8: where the output vertices start in LDS,
+    /// in 256-byte units ([`GS_OUTPUT_BASE`]).
+    fn driver_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        const OUTPUT_BASE: u32 = 0xb8;
+        let Fields::Smem {
+            data,
+            offset,
+            soffset,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let count = match inst.name() {
+            "s_load_dword" => 1,
+            "s_load_dwordx2" => 2,
+            "s_load_dwordx4" => 4,
+            _ => return Err("a driver table read"),
+        };
+        if a.dynamic.is_some() || !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            return Err("a computed driver table offset");
+        }
+        let Some(Operand::Scalar { code, .. }) = *data else {
+            return Err("a driver table read");
+        };
+        // (The tracked offset holds the instruction's own as well.)
+        let _ = offset;
+        for k in 0..count {
+            let x = match a.offset.wrapping_add(4 * k) {
+                OUTPUT_BASE => Val::I32(self.s.m.i32(GS_OUTPUT_BASE >> 8)),
+                _ => Val::Missing("a driver table dword not known"),
+            };
+            if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                self.vals.insert(v, x);
+            }
         }
         Ok(())
     }
@@ -7188,6 +7473,11 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            // A geometry invocation is the only lane of its wave.
+            "v_readlane_b32" | "v_readfirstlane_b32" if self.s.geometry.is_some() => {
+                let a = s(self, 0)?;
+                int(self, a)
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -8314,7 +8604,7 @@ impl<'a> Lower<'a> {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
                     self.s.flags |= flags::WAVE_OPS;
-                } else if self.s.mesh.is_none() {
+                } else if self.s.mesh.is_none() && self.s.geometry.is_none() {
                     self.cross_lane(false)?;
                 }
                 let lane = self.console_lane();

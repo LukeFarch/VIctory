@@ -112,6 +112,16 @@ pub(crate) struct Geometry {
     pub max_vertices: u32,
 }
 
+/// A translated geometry program's LDS: input vertex `i` at dword
+/// `GS_INPUT_STRIDE * i` (the offsets its vertex inputs give), its output
+/// vertices from [`GS_OUTPUT_BASE`] (bytes) on.
+pub(crate) const GS_INPUT_STRIDE: u32 = 128;
+/// Triangles: three input vertices.
+pub(crate) const GS_INPUT_VERTICES: u32 = 3;
+/// Past the input vertices, in the 256-byte units the driver table gives.
+pub(crate) const GS_OUTPUT_BASE: u32 =
+    (GS_INPUT_STRIDE * GS_INPUT_VERTICES * 4).next_multiple_of(256);
+
 /// The null slot a host view heap keeps at its end when the title's heap did not fit in it
 /// (0: no limit). Shaders translated while it is set read that slot for any view index at or
 /// past it: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
@@ -157,6 +167,9 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// LDS is each thread's own (a geometry program, one console lane an
+    /// invocation): a `static` array, not group-shared memory.
+    pub private_lds: bool,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -210,6 +223,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            private_lds: false,
             lds: None,
             main,
             entry,
@@ -217,13 +231,17 @@ impl Shader {
     }
 
     /// The thread-group shared memory: `[lds_dwords x i32]` in address
-    /// space 3.
+    /// space 3 (with [`Shader::private_lds`], the thread's own in space 0).
     pub fn lds(&mut self) -> V {
         if let Some(g) = self.lds {
             return g;
         }
         let arr = self.m.array(self.lds_dwords, self.t.i32);
-        let g = self.m.global("lds", arr, 3);
+        let g = if self.private_lds {
+            self.m.private_global("lds", arr)
+        } else {
+            self.m.global("lds", arr, 3)
+        };
         self.lds = Some(g);
         g
     }
