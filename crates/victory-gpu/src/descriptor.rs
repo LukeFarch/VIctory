@@ -413,12 +413,10 @@ pub(crate) enum RecordKind {
 }
 
 /// Whether structured buffer views are made raw on the host, with their
-/// stride in the slot record for shaders to address them by
-/// (`VICTORY_RAW_BUFFER_VIEWS=0` turns it off: structured views as the
-/// title made them, records of kind 0).
+/// stride in the slot record for shaders to address them by. Always: the
+/// translation addresses every structured access raw.
 pub(crate) fn raw_buffer_views() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RAW_BUFFER_VIEWS").map_or(true, |v| v != "0"))
+    true
 }
 
 /// A buffer view's layout in bytes: first byte from the resource's start,

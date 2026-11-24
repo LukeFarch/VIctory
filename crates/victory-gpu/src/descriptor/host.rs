@@ -624,6 +624,11 @@ fn buffer_srv(
             &mut desc.Format,
         ) {
             buffer.Flags |= D3D12_BUFFER_SRV_FLAG_RAW;
+        } else if buffer.StructureByteStride > 0 {
+            // Shaders address structured views raw; one off dwords would be
+            // read at the wrong bytes. Null instead (reads zero).
+            once!("structured buffer view not on dwords: left null");
+            return None;
         }
     }
     let element = element_size(&desc);
@@ -675,6 +680,9 @@ fn buffer_uav(
         &mut desc.Format,
     ) {
         buffer.Flags |= D3D12_BUFFER_UAV_FLAG_RAW;
+    } else if buffer.StructureByteStride > 0 {
+        once!("structured unordered buffer view not on dwords: left null");
+        return None;
     }
     let element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
