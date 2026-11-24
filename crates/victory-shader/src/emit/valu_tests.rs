@@ -937,3 +937,46 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// SOPC `op src0, src1`.
+const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
+    0xBF00_0000 | (op as u32) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// `v_cndmask_b32` on a uniform select (`s_cselect_b32 s20, -1, 0` after a
+/// scalar compare): every lane takes the compare's result.
+#[test]
+fn a_select_on_a_uniform_mask_takes_the_scalar_compare() {
+    // s_cmp_eq_u32 s1, s2; s_cselect_b32 s20, -1, 0; v_cndmask_b32_e64 v0, 0, 1, s20
+    let mut body = vec![sopc(0x06, 1, 2), sop2(0x0A, 20, 0xC1, 0x80)];
+    body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+    let shader = build_valu_cs(&body);
+    let cases = [
+        [0, 5, 5, 0],
+        [0, 5, 6, 0],
+        [0, 0, 0, 0],
+        [0, u32::MAX, 1, 0],
+    ];
+    run_cases(&shader, &cases, |backend, i, inp, got| {
+        let want = u32::from(inp[1] == inp[2]);
+        assert_eq!(got, want, "{backend}: case {i} {inp:?}");
+    });
+}
+
+/// `v_cndmask_b32` on a mask passed as a number (a root constant): the lane
+/// tests its own bit, lane 0 here.
+#[test]
+fn a_select_on_a_mask_held_as_a_number_tests_the_lanes_bit() {
+    // v_cndmask_b32_e64 v0, 0, 1, s1
+    let body = vop3(0x101, 0, 0x80, 0x81, sgpr(1));
+    let shader = build_valu_cs(&body);
+    let cases = [
+        [0, 1, 0, 0],
+        [0, 2, 0, 0],
+        [0, 0xFFFF_FFFF, 0, 0],
+        [0, 0, 0, 0],
+    ];
+    run_cases(&shader, &cases, |backend, i, inp, got| {
+        assert_eq!(got, inp[1] & 1, "{backend}: case {i} {inp:?}");
+    });
+}

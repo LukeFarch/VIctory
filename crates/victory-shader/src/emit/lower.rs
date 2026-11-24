@@ -284,6 +284,28 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// A select or carry in reading a mask held as a number or a constant lane
+/// set: each lane tests its own bit, by its console lane.
+fn selects_by_lane_number(st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    if i.name() != "v_cndmask_b32" && !i.name().contains("_co_ci_") {
+        return false;
+    }
+    let Some(&Operand::Scalar { code, .. }) = v.src.get(2) else {
+        return false;
+    };
+    i.read(Reg::S(code))
+        .and_then(|m| st.lane_mask(m))
+        .is_some_and(|m| {
+            st.bools
+                .support(m)
+                .iter()
+                .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+        })
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
 /// channel of `elements`, none for padding. Channel c of `a` is half c;
@@ -374,6 +396,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    || selects_by_lane_number(x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -4157,7 +4180,7 @@ impl<'a> Lower<'a> {
                     _ => None,
                 };
                 let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
+                    .and_then(|m| self.x.st.lane_mask(m))
                     .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
@@ -4182,7 +4205,7 @@ impl<'a> Lower<'a> {
                         _ => None,
                     };
                     let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
+                        .and_then(|m| self.x.st.lane_mask(m))
                         .ok_or("a carry-in from an untracked mask")?;
                     Some(self.boolean(m, c)?)
                 } else {
@@ -7099,9 +7122,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7139,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7161,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }

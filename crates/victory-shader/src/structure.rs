@@ -349,6 +349,10 @@ pub struct Structured {
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
+    /// The lane's bit of other values read as masks (by a select or a
+    /// carry in): uniform selects (`s_cselect` of -1 and 0), constants and
+    /// masks the pass cannot see into, by their low dword's value.
+    pub other: HashMap<Value, Bool>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
@@ -356,6 +360,12 @@ pub struct Structured {
 }
 
 impl Structured {
+    /// The lane's bit of the mask whose low dword is `low`, as a select or
+    /// a carry in reads it.
+    pub(crate) fn lane_mask(&self, low: Value) -> Option<Bool> {
+        self.masks.get(&low).or(self.other.get(&low)).copied()
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -632,7 +642,12 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
             bools: self.b,
             exits,
@@ -973,9 +988,11 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
+                // A select (or a carry in) reads a mask nothing else may: a
+                // join of compare results is resolved here, as for EXEC, and
+                // a mask from elsewhere (a uniform select, a constant, a
+                // number) is recorded with the others.
+                if (name == "v_cndmask_b32" || name.contains("_co_ci_"))
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
