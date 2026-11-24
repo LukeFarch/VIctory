@@ -66,6 +66,7 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     ORIGIN.set(None);
+    MISSING.with(|m| m.borrow_mut().clear());
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -223,8 +224,6 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
-    /// For diagnosis: where each reason first left a value missing.
-    missing_at: HashMap<Why, usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -370,6 +369,10 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
 std::thread_local! {
     /// See [`failure_origin`].
     static ORIGIN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Where each reason first left a value missing, over all the
+    /// attempts at one program (a retry starts with the join missing).
+    static MISSING: std::cell::RefCell<HashMap<Why, usize>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// For diagnosis: where the last program this thread failed to lower first
@@ -557,7 +560,6 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
-            missing_at: HashMap::new(),
         }
     }
 
@@ -2348,11 +2350,13 @@ impl<'a> Lower<'a> {
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => {
-                ORIGIN.set(self.missing_at.get(why).copied());
+                ORIGIN.set(MISSING.with(|m| m.borrow().get(why).copied()));
                 Err(unsupported(offset, why))
             }
             Err(why) => {
-                self.missing_at.entry(why).or_insert(offset);
+                MISSING.with(|m| {
+                    m.borrow_mut().entry(why).or_insert(offset);
+                });
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -3075,6 +3079,24 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
+            }
+            // Read by `s_buffer_load`: a constant buffer (no size query on
+            // the host) unless the program declares a raw buffer there.
+            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+                ((11, 0), None)
+            }
+            Fields::Smem { .. } => {
+                // The dwords hold nothing the host has; only a read of them
+                // stops the program, not their passing through joins.
+                for k in 0..count {
+                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        self.vals.insert(
+                            v,
+                            Val::Missing("a constant buffer's descriptor read as data"),
+                        );
+                    }
+                }
+                return Ok(());
             }
             _ => return Err("a scalar memory read as data"),
         };
