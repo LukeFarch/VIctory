@@ -60,10 +60,17 @@ fn build() -> &'static [u8; 32] {
                 // without them here a run with `VICTORY_WAVE_WIDE=0` was
                 // served the translations an earlier run of the same
                 // executable had cached with the switch unset.
+                // The host's widest wave too: a wave64 program translated for no particular
+                // host keeps `WaveSize(64)`, which a host of 32-lane waves refuses. A cache
+                // filled by `translate --warm` without `VICTORY_HOST_WAVE=32` served exactly
+                // those to a run on NVIDIA (run 9: 122 compute pipelines refused).
+                bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
                 for name in [
                     "VICTORY_WAVE_WIDE",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
+                    "VICTORY_WAVE_LOCAL",
+                    "VICTORY_WAVE_LOOSE_LDS",
                     "VICTORY_F16_NEAREST",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());

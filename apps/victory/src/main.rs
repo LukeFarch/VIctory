@@ -164,10 +164,18 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            // (`VICTORY_HOST_MAX_WAVE`, the older name, too)
+            let host_wave = |name| std::env::var(name).ok().and_then(|v| v.parse().ok());
+            if let Some(n) = host_wave("VICTORY_HOST_WAVE").or_else(|| host_wave("VICTORY_HOST_MAX_WAVE")) {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if warm {
+                // The run sets the host's widest wave from the GPU before it translates; the
+                // cache is keyed by it, so a warm without it fills entries no run finds.
+                anyhow::ensure!(
+                    victory_shader::emit::host_max_wave() != 0,
+                    "--warm needs the host's widest wave: VICTORY_HOST_WAVE=32 on NVIDIA (and Intel), 64 on AMD"
+                );
                 let cfg = victory_core::Config::load()?;
                 victory_gpu::shader_cache::use_shader_cache(cfg.cache_subdir("shaders")?);
             }
