@@ -84,7 +84,7 @@ fn usual_layout() -> (Vec<RootParam>, Vec<UsedResource>, u8) {
 /// v1..v4; `body` leaves its result in v0, which is stored.
 fn lower_cs(body: &[u32]) -> Result<(), ShaderError> {
     let (layout, used, sgprs) = usual_layout();
-    lower_cs_with(layout, used, sgprs, body)
+    lower_cs_with(layout, used, sgprs, body).map(drop)
 }
 
 fn lower_cs_with(
@@ -92,7 +92,7 @@ fn lower_cs_with(
     mut used: Vec<UsedResource>,
     user_sgprs: u8,
     body: &[u32],
-) -> Result<(), ShaderError> {
+) -> Result<lower::Lowered, ShaderError> {
     let (l, u, _) = usual_layout();
     for (k, p) in l.into_iter().enumerate() {
         if layout.len() <= k {
@@ -136,8 +136,7 @@ fn lower_cs_with(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })?;
-    Ok(())
+    })
 }
 
 #[test]
@@ -353,4 +352,27 @@ fn image_tables() -> (Vec<RootParam>, Vec<UsedResource>, u8) {
 fn a_gather_at_a_level_loads_the_footprint() {
     let (l, u, n) = image_tables();
     lower_cs_with(l, u, n, &gather_l_program(1)).unwrap();
+}
+
+/// A structured load through a descriptor from the resource heap, which no
+/// resource list entry describes: the stride comes from the host's record
+/// of the slot.
+#[test]
+fn a_bindless_structured_load_reads_its_stride_from_the_heap_records() {
+    let (mut layout, used, _) = usual_layout();
+    layout.push(RootParam {
+        root: RootType::ResourceHeap,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 6,
+        slot: 0,
+    });
+    let mut body = vec![s_mov_b32(26, 6), s_mov_b32(27, 0x80)];
+    // s_load_dwordx4 s[12:15], s[26:27], 0x40
+    body.extend_from_slice(&[0x3D << 26 | 0x02 << 18 | 12 << 6 | 13, 125 << 25 | 0x40]);
+    // buffer_load_dword v0, v1, s[12:15], 0 idxen
+    body.extend_from_slice(&[0xE030_2000, 0x8003_0001]);
+    let l = lower_cs_with(layout, used, 7, &body).unwrap();
+    assert!(l.heap_words);
 }

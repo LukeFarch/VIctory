@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, flags};
+use super::shader::{HEAP_WORD_STRIDE, HEAP_WORDS_RECORD, Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -35,6 +35,8 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    /// Reads the host's heap slot records.
+    pub heap_words: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -951,6 +953,7 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            heap_words: self.s.heap_words.is_some(),
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -3052,6 +3055,7 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
+        let mut structured = None;
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
@@ -3070,9 +3074,12 @@ impl<'a> Lower<'a> {
                     || un.starts_with("buffer_store_format")
                 {
                     (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
                 } else {
+                    // Structured views are raw on the host (see
+                    // `structured_byte`); the record count is in strides.
+                    if *idxen && format.is_none() {
+                        structured = Some(stride);
+                    }
                     (11 | u, 0)
                 };
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
@@ -3150,7 +3157,27 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let bytes = field(self, 0);
+                let records = match structured {
+                    Some(stride) => {
+                        let stride = if stride >= 4 && stride.is_multiple_of(4) {
+                            self.s.m.i32(stride)
+                        } else {
+                            self.heap_stride(&src)?
+                        };
+                        // A raw view or an empty record (stride 0) counts
+                        // bytes, as the console does with stride 0.
+                        let one = self.s.m.i32(1);
+                        let z = self.s.m.i32(0);
+                        let none = self.s.m.cmp(c, pred::EQ, stride, z);
+                        let by = self.s.m.select(c, none, one, stride);
+                        self.s.m.bin(c, Bin::UDiv, bytes, by)
+                    }
+                    None => bytes,
+                };
+                vec![(2, records)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -6423,6 +6450,72 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// The byte a structured access (`idxen`, no format) reads: the
+    /// console adds index times the descriptor's stride to the offset.
+    /// Host buffer views are raw (decision: raw heap views), so the stride
+    /// comes from the program's resource list where it names one, else
+    /// from the heap's slot records (`HEAP_WORDS_SPACE`): bindless buffers.
+    fn structured_byte(
+        &mut self,
+        src: &Source,
+        used: Option<&UsedResource>,
+        index: V,
+        off: V,
+    ) -> Result<V, Why> {
+        let c = self.cur;
+        let stride = used.map_or(0, |u| u.stride);
+        let stride = if stride >= 4 && stride.is_multiple_of(4) {
+            self.s.m.i32(stride)
+        } else {
+            self.heap_stride(src)?
+        };
+        let at = self.s.m.bin(c, Bin::Mul, index, stride);
+        Ok(self.s.m.bin(c, Bin::Add, at, off))
+    }
+
+    /// The heap slot a buffer descriptor is read from.
+    fn heap_slot(&mut self, src: &Source) -> Result<V, Why> {
+        match *src {
+            Source::Loaded { load, first } => self.heap_index(load, first, false),
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
+                self.lane_heap_index(src, false)
+            }
+            _ => Err("a structured buffer of unknown stride"),
+        }
+    }
+
+    /// The stride in bytes of the buffer view in the heap slot `src` is read
+    /// from, from the host's record of that slot.
+    fn heap_stride(&mut self, src: &Source) -> Result<V, Why> {
+        let slot = self.heap_slot(src)?;
+        Ok(self.heap_word(slot, HEAP_WORD_STRIDE))
+    }
+
+    /// Dword `word` of the host's record of heap slot `slot`.
+    fn heap_word(&mut self, slot: V, word: u32) -> V {
+        let c = self.cur;
+        let h = self.s.heap_words_handle();
+        let size = self.s.m.i32(HEAP_WORDS_RECORD);
+        let at = self.s.m.bin(c, Bin::Mul, slot, size);
+        let k = self.s.m.i32(4 * word);
+        let at = self.s.m.bin(c, Bin::Add, at, k);
+        let (mask, u, al) = (
+            self.s.m.i8(1),
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i32(4),
+        );
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, u, mask, al],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -6551,12 +6644,9 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let byte = self.structured_byte(src, used, index, off)?;
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    (h, [byte, iu, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -6634,12 +6724,9 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
+                        let byte = self.structured_byte(src, used, index, off)?;
+                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        args.extend([byte, iu]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -6695,18 +6782,15 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let byte = self.structured_byte(src, used, index, off)?;
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, index, off, mask, align],
+                        &[h, byte, iu, mask, align],
                     )
                 }
                 None => {

@@ -82,6 +82,8 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// The heap slot records' handle, once read ([`HEAP_WORDS_SPACE`]).
+    pub heap_words: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -137,6 +139,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            heap_words: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -253,6 +256,31 @@ impl Shader {
         h
     }
 
+    /// The handle of the host's heap slot records (a raw buffer, `t0` in
+    /// [`HEAP_WORDS_SPACE`]), made in the entry block.
+    pub fn heap_words_handle(&mut self) -> V {
+        if let Some(h) = self.heap_words {
+            return h;
+        }
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(HEAP_WORDS_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.heap_words = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -335,6 +363,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || self.heap_words.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -389,7 +418,7 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            if !self.root_srvs.is_empty() || self.heap_words.is_some() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
@@ -413,6 +442,27 @@ impl Shader {
                         kind: 4,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
+                        dxil_kind: 11,
+                    });
+                }
+                if self.heap_words.is_some() {
+                    let n = self.root_srvs.len() as u32;
+                    let ops = vec![
+                        Some(i32c(&mut self, n)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, HEAP_WORDS_SPACE)),
+                        Some(i32c(&mut self, 0)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, 0)),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 4,
+                        space: HEAP_WORDS_SPACE,
+                        register: 0,
                         dxil_kind: 11,
                     });
                 }

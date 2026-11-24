@@ -317,7 +317,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
-        heap_words: false,
+        heap_words: l.heap_words,
     })
 }
 
@@ -586,7 +586,6 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
-                heap_words: false,
                 heap_words: false,
             })
         };
