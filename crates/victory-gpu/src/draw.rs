@@ -1711,6 +1711,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.probe(p, [x, y, z]);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1780,6 +1782,81 @@ impl State {
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         text
+    }
+
+    /// `VICTORY_PROBE=<hash>[,<hash>...]` (diagnostics builds): at a
+    /// dispatch of a pipeline with a shader of one of those hashes (the
+    /// `#` hash of `translate --list`), log what it runs on: the views of
+    /// its tables (formats, sizes, title addresses), its user data and
+    /// root constants, and the first 64 dwords behind each root view.
+    /// Logged for the first 3 dispatches of each hash, then every 600th.
+    /// To find the inputs of the title's passes that a host feature would
+    /// take over: the temporal upscale (`TAA2U:CS_TAA2_Resolve`) for
+    /// DLSS, the ray-traced shadow and reflection passes.
+    #[cfg(feature = "diagnostics")]
+    fn probe(&self, p: &HostPipeline, groups: [u32; 3]) {
+        use std::collections::HashMap;
+        use std::fmt::Write;
+        use std::sync::{Mutex, OnceLock};
+        static WANTED: OnceLock<Vec<String>> = OnceLock::new();
+        static SEEN: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        let wanted = WANTED.get_or_init(|| {
+            std::env::var("VICTORY_PROBE")
+                .map(|v| {
+                    v.split(',')
+                        .map(|h| h.trim().trim_start_matches('#').to_ascii_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        if wanted.is_empty() {
+            return;
+        }
+        let Some(hash) = p
+            .stages
+            .iter()
+            .map(|s| s.shader.hash.to_ascii_lowercase())
+            .find(|h| wanted.iter().any(|w| h.starts_with(w.as_str())))
+        else {
+            return;
+        };
+        let n = {
+            let mut seen = SEEN
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let n = seen.entry(hash.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if n > 3 && n % 600 != 0 {
+            return;
+        }
+        let [x, y, z] = groups;
+        let mut text = self.op_text(format!("dispatch {x}x{y}x{z}"), true);
+        for (slot, root) in self.roots_ref(true).iter().enumerate() {
+            match root {
+                Root::Constants(words) => {
+                    let _ = write!(text, " || constants{slot} {words:#x?}");
+                }
+                Root::View(address) if *address != 0 => {
+                    let mut bytes = [0u8; 256];
+                    if crate::host::read_into(*address as *const u8, &mut bytes) {
+                        let words: Vec<String> = bytes
+                            .chunks_exact(4)
+                            .map(|w| {
+                                let w = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                                format!("{w:08x}/{}", f32::from_bits(w))
+                            })
+                            .collect();
+                        let _ = write!(text, " || view{slot} {address:#x} [{}]", words.join(" "));
+                    }
+                }
+                _ => {}
+            }
+        }
+        tracing::info!(hash, n, "probe: {text}");
     }
 
     /// A mesh draw under `VICTORY_MESH_TEST=scissor` rasterises one pixel:
