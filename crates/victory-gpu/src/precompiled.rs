@@ -20,12 +20,39 @@ pub const HEAD: usize = 24;
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Whether the precompiled pipeline methods make pipelines (on unless
-/// `VICTORY_PRECOMPILED=0`, which leaves the title without them, as before:
-/// the A/B switch for anything they draw wrong).
-pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PRECOMPILED").is_none_or(|v| v != "0"))
+/// Whether the precompiled pipeline method `slot` (0x1c8 graphics, 0x218
+/// compute) makes pipelines: `VICTORY_PRECOMPILED=0` neither, `graphics`
+/// only 0x1c8, `compute` only 0x218, else both. The A/B switch for
+/// anything they draw wrong.
+pub(crate) fn on(slot: usize) -> bool {
+    static MODE: OnceLock<String> = OnceLock::new();
+    match MODE.get_or_init(|| std::env::var("VICTORY_PRECOMPILED").unwrap_or_default()).as_str() {
+        "0" => false,
+        "graphics" => slot == 0x1c8,
+        "compute" => slot == 0x218,
+        _ => true,
+    }
+}
+
+/// Whether a precompiled pipeline with these shader hashes is left out:
+/// `VICTORY_PRECOMPILED_SKIP=<hash prefix>,...` names shaders whose
+/// pipelines are not made, `VICTORY_PRECOMPILED_ONLY=<hash prefix>,...`
+/// the only ones that are (to bisect a pipeline that draws wrong).
+pub(crate) fn skipped(hashes: &[&str]) -> bool {
+    fn list(name: &str) -> Vec<String> {
+        std::env::var(name)
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    }
+    static SKIP: OnceLock<Vec<String>> = OnceLock::new();
+    static ONLY: OnceLock<Vec<String>> = OnceLock::new();
+    let named = |list: &[String]| hashes.iter().any(|h| list.iter().any(|p| h.starts_with(p.as_str())));
+    let skip = SKIP.get_or_init(|| list("VICTORY_PRECOMPILED_SKIP"));
+    let only = ONLY.get_or_init(|| list("VICTORY_PRECOMPILED_ONLY"));
+    named(skip) || (!only.is_empty() && !named(only))
 }
 
 /// Looks programs up in (or, when warming, writes them to) `dir`.

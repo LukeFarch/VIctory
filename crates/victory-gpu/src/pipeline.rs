@@ -722,6 +722,31 @@ fn missed(slot: usize, why: &str) {
     }
 }
 
+/// Logs a precompiled pipeline made (the first 64, then at powers of two
+/// of the count): its shaders and the register words it is made from, so
+/// that one that draws wrong can be named and its state read.
+fn note_precompiled(slot: usize, shaders: &[&Arc<Shader>], regs: Option<&[u8]>) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let n = MADE[usize::from(slot == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 64 && !n.is_power_of_two() {
+        return;
+    }
+    let names: Vec<String> = shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    let word = |at: usize| regs.and_then(|r| r.get(at..at + 4)).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    tracing::info!(
+        slot = format_args!("{slot:#x}"),
+        made = n,
+        shaders = ?names,
+        blend0 = format_args!("{:#x}", word(0xd0)),
+        target_mask = format_args!("{:#x}", word(0x78)),
+        col_format = format_args!("{:#x}", word(0x70)),
+        depth = format_args!("{:#x}", word(0xb8)),
+        mode = format_args!("{:#x}", word(0x84)),
+        "precompiled pipeline"
+    );
+}
+
 /// Device method 0x218: a compute pipeline from precompiled console code,
 /// `(desc, iid, out)`. The description (0x60 bytes): the root signature,
 /// then (address, size) pairs: 28 bytes of state, 20 bytes, the code, its
@@ -740,8 +765,8 @@ pub(crate) extern "system" fn create_precompiled_compute(
     }
     #[cfg(windows)]
     {
-        if !crate::precompiled::on() {
-            missed(0x218, "VICTORY_PRECOMPILED=0");
+        if !crate::precompiled::on(0x218) {
+            missed(0x218, "VICTORY_PRECOMPILED");
             return E_NOTIMPL;
         }
         let Some(w) = words::<12>(desc) else {
@@ -750,7 +775,13 @@ pub(crate) extern "system" fn create_precompiled_compute(
         };
         match precompiled(&w, 5) {
             Some((stage, container)) if stage == "Cs" => {
-                return hand_out(vec![shader("compute", &container)], None, iid, out);
+                let cs = shader("compute", &container);
+                if crate::precompiled::skipped(&[&cs.hash]) {
+                    missed(0x218, "VICTORY_PRECOMPILED_SKIP/ONLY");
+                    return E_NOTIMPL;
+                }
+                note_precompiled(0x218, &[&cs], None);
+                return hand_out(vec![cs], None, iid, out);
             }
             Some(_) => missed(0x218, "code found in a container of another stage"),
             None => missed(0x218, "code not in the precompiled index"),
@@ -782,8 +813,8 @@ pub(crate) extern "system" fn create_precompiled_graphics(
     }
     #[cfg(windows)]
     {
-        if !crate::precompiled::on() {
-            missed(0x1c8, "VICTORY_PRECOMPILED=0");
+        if !crate::precompiled::on(0x1c8) {
+            missed(0x1c8, "VICTORY_PRECOMPILED");
             return E_NOTIMPL;
         }
         let Some(w) = words::<13>(desc) else {
@@ -827,6 +858,12 @@ pub(crate) extern "system" fn create_precompiled_graphics(
         };
         let mut shaders = vec![shader("vertex", &vertex)];
         shaders.extend(pixel.map(|p| shader("pixel", &p)));
+        let hashes: Vec<&str> = shaders.iter().map(|s| s.hash.as_str()).collect();
+        if crate::precompiled::skipped(&hashes) {
+            missed(0x1c8, "VICTORY_PRECOMPILED_SKIP/ONLY");
+            return E_NOTIMPL;
+        }
+        note_precompiled(0x1c8, &shaders.iter().collect::<Vec<_>>(), Some(&regs));
         let variants = Variants { regs, layout, made: Mutex::new(HashMap::new()) };
         return hand_out_with(shaders, None, Some(Box::new(variants)), iid, out);
     }
