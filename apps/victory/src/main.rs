@@ -178,6 +178,7 @@ fn main() -> Result<()> {
                 );
                 let cfg = victory_core::Config::load()?;
                 victory_gpu::shader_cache::use_shader_cache(cfg.cache_subdir("shaders")?);
+                victory_gpu::precompiled::use_precompiled(cfg.cache_subdir("precompiled")?);
             }
             translate::run(paths, validate, pipelines, list, jobs, warm)
         }

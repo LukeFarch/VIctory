@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -583,6 +583,74 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// The console code a precompiled pipeline method hands over at word `at`
+/// (address) and `at + 1` (size) of its description: its first bytes, and
+/// the container they are found in (`precompiled`).
+#[cfg(windows)]
+fn precompiled(words: &[u64], at: usize) -> Option<(String, Vec<u8>)> {
+    let (address, size) = (*words.get(at)?, *words.get(at + 1)?);
+    if address < 0x10000 || (size as usize) < crate::precompiled::HEAD {
+        return None;
+    }
+    let mut head = [0u8; crate::precompiled::HEAD];
+    crate::host::read_into(address as *const u8, &mut head).then_some(())?;
+    crate::precompiled::container(&head)
+}
+
+/// The description's first `N` words, read through the kernel.
+#[cfg(windows)]
+fn words<const N: usize>(desc: *const u8) -> Option<[u64; N]> {
+    let mut bytes = vec![0u8; N * 8];
+    (!desc.is_null() && crate::host::read_into(desc, &mut bytes)).then_some(())?;
+    Some(std::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap_or_default())))
+}
+
+/// Counts a precompiled pipeline that could not be made, logging the
+/// first ones and then at powers of two.
+fn missed(slot: usize, why: &str) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let calls = CALLS[usize::from(slot == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    if calls <= 4 || calls.is_power_of_two() {
+        tracing::warn!(slot = format_args!("{slot:#x}"), calls, why, "a precompiled pipeline is not made: the title goes without it");
+    }
+}
+
+/// Device method 0x218: a compute pipeline from precompiled console code,
+/// `(desc, iid, out)`. The description (0x60 bytes): the root signature,
+/// then (address, size) pairs: 28 bytes of state, 20 bytes, the code, its
+/// metadata; two more addresses and the program's 64-bit hash. The code
+/// is looked up among the title's containers and the pipeline made from
+/// that container, as `CreateComputePipelineState` would.
+pub(crate) extern "system" fn create_precompiled_compute(
+    _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    #[cfg(windows)]
+    {
+        let Some(w) = words::<12>(desc) else {
+            missed(0x218, "description unreadable");
+            return E_INVALIDARG;
+        };
+        match precompiled(&w, 5) {
+            Some((stage, container)) if stage == "Cs" => {
+                return hand_out(vec![shader("compute", &container)], None, iid, out);
+            }
+            Some(_) => missed(0x218, "code found in a container of another stage"),
+            None => missed(0x218, "code not in the precompiled index"),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (desc, iid);
+    E_NOTIMPL
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a

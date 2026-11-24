@@ -344,10 +344,21 @@ fn translate(
     if WARM.load(Ordering::Relaxed) {
         if !lock(seen).insert(blake3::hash(&bytes)) {
             t.duplicates += 1;
-        } else if victory_gpu::shader_cache::warm(&bytes) {
-            t.translated += 1;
         } else {
-            t.fail("does not translate".into(), example);
+            // The programs' code heads, for the precompiled pipeline methods.
+            if let Ok(c) = Container::parse(&bytes)
+                && let Some(dxil) = c.part(FourCC::DXIL)
+                && let Ok(programs) = native_programs(dxil.data)
+            {
+                for p in &programs {
+                    victory_gpu::precompiled::record(&p.code, &format!("{:?}", p.stage), &bytes);
+                }
+            }
+            if victory_gpu::shader_cache::warm(&bytes) {
+                t.translated += 1;
+            } else {
+                t.fail("does not translate".into(), example);
+            }
         }
         return;
     }

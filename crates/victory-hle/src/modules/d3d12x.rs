@@ -43,6 +43,7 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
         victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
+        victory_gpu::precompiled::use_precompiled(dir.with_file_name("precompiled"));
         victory_gpu::shader_cache::use_shader_cache(dir);
     }
     #[cfg(not(windows))]
