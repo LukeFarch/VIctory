@@ -343,6 +343,7 @@ fn translate(
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
+                        dump_failure(&format!("resources: {what}"), &example(), &p, offset);
                         t.fail(format!("resources: {what}"), || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
                         });
@@ -395,10 +396,12 @@ fn translate(
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            dump_failure(&format!("emit: {what}"), &label(), &p, offset);
+                            t.fail(format!("emit: {what}"), || {
                                 format!("{} at {offset:#x}", label())
-                            }),
+                            });
+                        }
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }
@@ -412,6 +415,55 @@ fn translate(
             }
         }
     }
+}
+
+/// Programs written so far per failure reason by [`dump_failure`].
+static DUMPED: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+/// `VICTORY_FAIL_DUMP=<dir>`: the first few programs stopped by each reason,
+/// as text (root layout, used resources, the decoded code with the failing
+/// instruction marked), for diagnosis on the user's machine. Up to
+/// `VICTORY_FAIL_DUMP_MAX` (default 4) per reason. The files hold the
+/// title's code: they stay outside the repository (asset policy).
+fn dump_failure(reason: &str, label: &str, p: &NativeProgram, offset: usize) {
+    let Ok(dir) = std::env::var("VICTORY_FAIL_DUMP") else {
+        return;
+    };
+    let max = std::env::var("VICTORY_FAIL_DUMP_MAX")
+        .ok()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(4usize);
+    let n = {
+        let mut d = lock(&DUMPED);
+        let n = d.entry(reason.to_owned()).or_default();
+        if *n >= max {
+            return;
+        }
+        *n += 1;
+        *n - 1
+    };
+    let Ok(insts) = victory_shader::gfx10::decode(&p.patched_code()) else {
+        return;
+    };
+    let mut text = format!(
+        "{label}\n{reason}\nfailing offset {offset:#x}\nstage {:?} wave64 {} vgprs {}\n",
+        p.stage, p.wave64, p.vgprs
+    );
+    text.extend(p.layout.iter().map(|l| format!("    {l:?}\n")));
+    text.extend(p.used.iter().map(|u| format!("    {u:?}\n")));
+    for i in &insts {
+        let mark = if i.offset == offset { "==>" } else { "   " };
+        text.push_str(mark);
+        text.push_str(&crate::shader::format_instruction(i, p.wave64));
+        text.push('\n');
+    }
+    let slug: String = reason
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .take(60)
+        .collect();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(format!("{dir}/{slug}_{n}.txt"), text);
 }
 
 /// Validates an emitted shader if asked to.
