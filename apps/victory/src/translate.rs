@@ -308,10 +308,15 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        return t.fail("corrupt record".into(), || {
+            format!("{}{}", path.display(), source.label())
+        });
     };
+    // The game's log names a shader by this hash (the first 16 digits of
+    // the container's BLAKE3), so a runtime warning can be matched here.
+    let hash = blake3::hash(&bytes).to_hex();
+    let example = || format!("{}{} [{}]", path.display(), source.label(), &hash[..16]);
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
