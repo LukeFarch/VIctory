@@ -43,23 +43,11 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
-/// Lowers a 32-thread compute program: 4 root constants in s0..s3, a table
-/// in s4 whose first descriptor (a raw UAV) is in s[8:11]; `body` leaves
-/// its result in v0, which is stored.
-fn lower_cs(body: &[u32]) -> Result<(), ShaderError> {
-    let mut words = vec![s_mov_b32(5, 0x80)];
-    words.extend_from_slice(&s_load_dwordx4(8, 4));
-    for i in 0..4u8 {
-        words.push(vop1(0x001, i + 1, i as u16));
-    }
-    words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
-    words.push(S_ENDPGM);
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 8,
-        layout: vec![
+/// The usual layout: 4 root constants in s0..s3, a table in s4 whose
+/// first descriptor is a raw UAV.
+fn usual_layout() -> (Vec<RootParam>, Vec<UsedResource>, u8) {
+    (
+        vec![
             RootParam {
                 root: RootType::Constants,
                 table_offset_dwords: 0,
@@ -77,7 +65,7 @@ fn lower_cs(body: &[u32]) -> Result<(), ShaderError> {
                 slot: 1,
             },
         ],
-        used: vec![UsedResource {
+        vec![UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -87,8 +75,49 @@ fn lower_cs(body: &[u32]) -> Result<(), ShaderError> {
             user_data: 4,
             slot: 1,
         }],
+        5,
+    )
+}
+
+/// Lowers a 32-thread compute program with the usual layout: the UAV's
+/// descriptor is loaded into s[8:11] and the root constants copied to
+/// v1..v4; `body` leaves its result in v0, which is stored.
+fn lower_cs(body: &[u32]) -> Result<(), ShaderError> {
+    let (layout, used, sgprs) = usual_layout();
+    lower_cs_with(layout, used, sgprs, body)
+}
+
+fn lower_cs_with(
+    mut layout: Vec<RootParam>,
+    mut used: Vec<UsedResource>,
+    user_sgprs: u8,
+    body: &[u32],
+) -> Result<(), ShaderError> {
+    let (l, u, _) = usual_layout();
+    for (k, p) in l.into_iter().enumerate() {
+        if layout.len() <= k {
+            layout.push(p);
+        }
+    }
+    if !used.iter().any(|x| x.kind == ResourceType::Uav) {
+        used.extend(u);
+    }
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, u16::from(i)));
+    }
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout,
+        used,
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
+            rsrc2: u32::from(user_sgprs) << 1,
             threads: [32, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -131,5 +160,65 @@ fn a_select_on_a_constant_mask_lowers() {
 fn a_select_on_a_mask_held_as_a_number_lowers() {
     // v_cndmask_b32_e64 v0, 0, 1, s2 (a mask passed in user data)
     let body = vop3(0x101, 0, 0x80, 0x81, 2);
+    lower_cs(&body).unwrap();
+}
+
+/// SMEM `s_load_dword sdst, s[base:base+1], offset` (soffset = null).
+const fn s_load_dword(dst: u8, base: u8, offset: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (offset & 0x1F_FFFF),
+    ]
+}
+
+/// A root CBV in s[6:7] (after the usual parameters).
+fn root_cbv(kind: ResourceType) -> (Vec<RootParam>, Vec<UsedResource>, u8) {
+    let (mut layout, mut used, _) = usual_layout();
+    layout.push(RootParam {
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        sgprs: 2,
+        base_register: 0,
+        user_data: 6,
+        slot: 2,
+    });
+    used.push(UsedResource {
+        kind,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 2,
+        user_data: 6,
+        slot: 2,
+    });
+    (layout, used, 8)
+}
+
+#[test]
+fn a_scalar_load_from_a_root_cbv_reads_the_constants() {
+    // s_load_dword s12, s[6:7], 0x14; v_mov_b32 v0, s12
+    let mut body = s_load_dword(12, 6, 0x14).to_vec();
+    body.push(vop1(0x001, 0, 12));
+    let (l, u, n) = root_cbv(ResourceType::Cbv);
+    lower_cs_with(l, u, n, &body).unwrap();
+}
+
+#[test]
+fn a_scalar_load_from_a_root_srv_reads_the_buffer() {
+    // s_load_dword s12, s[6:7], 0x14; v_mov_b32 v0, s12
+    let mut body = s_load_dword(12, 6, 0x14).to_vec();
+    body.push(vop1(0x001, 0, 12));
+    let (l, u, n) = root_cbv(ResourceType::Srv);
+    lower_cs_with(l, u, n, &body).unwrap();
+}
+
+/// A descriptor loaded a second time only to test a field (dword 2, the
+/// record count): the view comes from the load that accesses it.
+#[test]
+fn a_descriptor_reloaded_for_its_record_count_reads_the_views_size() {
+    // s_load_dwordx4 s[12:15], s[4:5], 0; v_mov_b32 v0, s14
+    let mut body = s_load_dwordx4(12, 4).to_vec();
+    body.push(vop1(0x001, 0, 14));
     lower_cs(&body).unwrap();
 }

@@ -65,6 +65,7 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    ORIGIN.set(None);
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -222,6 +223,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// For diagnosis: where each reason first left a value missing.
+    missing_at: HashMap<Why, usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -362,6 +365,18 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
             (o.row, (o.pack2, b.map(|i| free.remove(i))))
         })
         .collect()
+}
+
+std::thread_local! {
+    /// See [`failure_origin`].
+    static ORIGIN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// For diagnosis: where the last program this thread failed to lower first
+/// left a value missing for the reason it stopped with (the instruction
+/// whose result the failing one reads, perhaps through others), if known.
+pub fn failure_origin() -> Option<usize> {
+    ORIGIN.get()
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -542,6 +557,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            missing_at: HashMap::new(),
         }
     }
 
@@ -2331,8 +2347,12 @@ impl<'a> Lower<'a> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Err(why) if effect => {
+                ORIGIN.set(self.missing_at.get(why).copied());
+                Err(unsupported(offset, why))
+            }
             Err(why) => {
+                self.missing_at.entry(why).or_insert(offset);
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -2836,6 +2856,18 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if let Some(a) = self.scalar.get(&site).copied()
+            && name.starts_with("s_load_dword")
+            && self
+                .x
+                .native
+                .layout
+                .get(a.param)
+                .is_some_and(|rp| rp.root == RootType::Descriptor)
+            && !self.read_as_descriptor(site)
+        {
+            return self.root_data(inst, a);
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -2983,6 +3015,28 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
+        // The compiler often loads a descriptor twice: once early for a
+        // field it tests (a buffer's record count: is anything bound?), and
+        // again where it accesses the view. The early load then has no
+        // access of its own; one reading the same address tells the view.
+        let use_at = use_at.or_else(|| {
+            let here = self.scalar.get(&site).copied()?;
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first }
+                            if load != site && self.scalar.get(&load) == Some(&here) =>
+                        {
+                            Some((d.site, first))
+                        }
+                        _ => None,
+                    })
+                })
+        });
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -3086,6 +3140,88 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Some descriptor (resource or sampler) is read from what the scalar
+    /// load at `site` reads.
+    fn read_as_descriptor(&self, site: Site) -> bool {
+        self.x.res.descriptors.iter().any(|d| {
+            d.source.leaves().into_iter().any(|l| {
+                matches!(*l, Source::Loaded { load, .. } | Source::Fetched { load, .. } if load == site)
+            })
+        })
+    }
+
+    /// `s_load_dword*` through a root descriptor's address: the console
+    /// reads a root constant buffer (or a root raw buffer) with plain
+    /// scalar loads instead of `s_buffer_load`. The dwords come from the
+    /// host's root view at the same byte offsets.
+    fn root_data(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar load through a root descriptor"),
+        };
+        let rp = self.x.native.layout[a.param];
+        let kind = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data)
+            .map(|u| u.kind);
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        match kind {
+            Some(ResourceType::Srv) => {
+                let h = self.s.root_srv_handle(rp.slot);
+                for k in 0..count {
+                    let off = self.s.m.i32(4 * k);
+                    let at = self.s.m.bin(c, Bin::Add, addr, off);
+                    let (mask, u, al) = (
+                        self.s.m.i8(1),
+                        self.s.m.undef(self.s.t.i32),
+                        self.s.m.i32(4),
+                    );
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, at, u, mask, al],
+                    );
+                    let x = self.s.m.extract(c, r, 0);
+                    let x = self.as_int(x);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+            }
+            Some(ResourceType::Cbv) | None => {
+                let h = self.s.root_cbv_handle(rp.slot);
+                for k in 0..count {
+                    let off = self.s.m.i32(4 * k);
+                    let at = self.s.m.bin(c, Bin::Add, addr, off);
+                    let x = self.cbuffer_dword(h, at);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+            }
+            _ => return Err("a scalar load through a root UAV"),
         }
         Ok(())
     }
