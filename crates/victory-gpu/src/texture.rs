@@ -71,8 +71,11 @@ struct Last {
     /// The guard saw no write, yet the hash found the texture changed: it
     /// is written where the guard cannot see (the intro video's planes,
     /// run 19: shown up to a few frames late, the zoom jumping back and
-    /// forth). Such a texture is hashed at every check from then on.
+    /// forth). Such a texture is hashed at every check until it stays
+    /// unchanged for `STILL` checks in a row (`still` counts them): a
+    /// streamed texture written once that way goes back to the guard.
     blind: bool,
+    still: u32,
 }
 
 /// Retry and hash periods are wall-clock time, not frames: counted in
@@ -680,6 +683,17 @@ impl Staging {
                 return 0;
             }
             last.hashed = Some(std::time::Instant::now());
+            if last.blind {
+                const STILL: u32 = 120;
+                let before = last.hash;
+                let read = self.refresh_read(last, size);
+                last.still = if last.hash == before { last.still + 1 } else { 0 };
+                if last.still >= STILL {
+                    last.blind = false;
+                    last.still = 0;
+                }
+                return read;
+            }
             if unwritten && !last.blind {
                 let before = last.hash;
                 let read = self.refresh_read(last, size);
