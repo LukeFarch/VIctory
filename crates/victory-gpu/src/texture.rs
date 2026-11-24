@@ -683,6 +683,12 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
+            // `VICTORY_TEXTURE_PARTIAL=0` passes partly mapped textures
+            // over, as before this fork: what was uploaded stays.
+            static PARTIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !*PARTIAL.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PARTIAL").is_none_or(|v| v != "0")) {
+                return 0;
+            }
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
