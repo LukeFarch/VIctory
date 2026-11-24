@@ -183,6 +183,12 @@ fn legal_dual_source(mut blend: D3D12_BLEND_DESC) -> D3D12_BLEND_DESC {
             D3D12_BLEND_SRC1_COLOR | D3D12_BLEND_INV_SRC1_COLOR | D3D12_BLEND_SRC1_ALPHA | D3D12_BLEND_INV_SRC1_ALPHA
         )
     };
+    // `VICTORY_DUAL_SOURCE=0`: left as the title set it, which D3D12
+    // refuses (the pipeline's draws are dropped, as before the fix).
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DUAL_SOURCE").is_none_or(|v| v != "0")) {
+        return blend;
+    }
     let t = &blend.RenderTarget[0];
     if !(t.BlendEnable.as_bool()
         && [t.SrcBlend, t.DestBlend, t.SrcBlendAlpha, t.DestBlendAlpha].into_iter().any(src1))
