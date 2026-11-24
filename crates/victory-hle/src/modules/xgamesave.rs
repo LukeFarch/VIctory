@@ -607,6 +607,18 @@ fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callba
     }
 }
 
+/// Logs one save call and its result, and passes the result on. Saves are
+/// rare, so every call is logged at info, and a failure at warn.
+fn traced(call: &str, what: std::fmt::Arguments<'_>, hr: HRESULT) -> HRESULT {
+    if hr < 0 {
+        let hr = format_args!("{:#010x}", hr as u32);
+        tracing::warn!(%hr, %what, "game save: {call} failed");
+    } else {
+        tracing::info!(%what, "game save: {call}");
+    }
+    hr
+}
+
 fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
 }
@@ -630,6 +642,9 @@ extern "system" fn initialize_async(
     } else {
         Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
     };
+    let hr = result.as_ref().map_or_else(|&e| e, |_| S_OK);
+    let what = format_args!("config={:?} saves={}", text(config), saves.display());
+    traced("initialize", what, hr);
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
 extern "system" fn initialize_result(
@@ -637,7 +652,12 @@ extern "system" fn initialize_result(
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
-    xasync::result(block, (&raw const INIT).cast(), out)
+    let hr = xasync::result(block, (&raw const INIT).cast(), out);
+    if hr < 0 {
+        // Documented: the handle is null on failure.
+        put(out, std::ptr::null_mut());
+    }
+    hr
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
     take(provider);
@@ -668,6 +688,7 @@ extern "system" fn delete_async(
         (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
         _ => E_INVALIDARG,
     };
+    traced("delete", format_args!("container={:?}", text(name)), hr);
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
@@ -688,10 +709,17 @@ extern "system" fn container_info(
         return E_INVALIDARG;
     };
     if !valid_container(&name) {
-        return INVALID_CONTAINER_NAME;
+        let what = format_args!("container={name:?}");
+        return traced("container info", what, INVALID_CONTAINER_NAME);
     }
-    report(&p.root, |n| n == name, context, callback);
-    S_OK
+    let found = std::cell::Cell::new(false);
+    let keep = |n: &str| {
+        found.set(found.get() || n == name);
+        n == name
+    };
+    report(&p.root, keep, context, callback);
+    let what = format_args!("container={name:?} found={}", found.get());
+    traced("container info", what, S_OK)
 }
 
 extern "system" fn enumerate_containers(
@@ -703,8 +731,13 @@ extern "system" fn enumerate_containers(
     let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
-    report(&p.root, |_| true, context, callback);
-    S_OK
+    let seen = std::cell::RefCell::new(Vec::new());
+    let keep = |n: &str| {
+        seen.borrow_mut().push(n.to_owned());
+        true
+    };
+    report(&p.root, keep, context, callback);
+    traced("enumerate containers", format_args!("{:?}", seen.borrow()), S_OK)
 }
 
 /// The container exists once an update to it is submitted.
@@ -715,12 +748,15 @@ extern "system" fn create_container(
     out: *mut *mut Container,
 ) -> HRESULT {
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
+        put(out, std::ptr::null_mut());
         return E_INVALIDARG;
     };
+    let what = format_args!("container={name:?}");
     if !valid_container(&name) {
-        return INVALID_CONTAINER_NAME;
+        put(out, std::ptr::null_mut());
+        return traced("create container", what, INVALID_CONTAINER_NAME);
     }
-    put(out, give(p.container(&name)))
+    traced("create container", what, put(out, give(p.container(&name))))
 }
 extern "system" fn close_container(_: This, container: *mut Container) {
     take(container);
@@ -742,6 +778,8 @@ extern "system" fn enumerate_blobs(
         let version = current_named(&c.dir, &c.name).ok().flatten();
         version.map(|v| v.sizes()).unwrap_or_default()
     };
+    let what = format_args!("container={:?} prefix={prefix:?} blobs={blobs:?}", c.name);
+    traced("enumerate blobs", what, S_OK);
     for (name, size) in blobs.into_iter().filter(|(n, _)| n.starts_with(&prefix)) {
         let name = cstring(&name);
         let info = BlobInfo {
@@ -768,14 +806,20 @@ extern "system" fn read_blobs(
     };
     // SAFETY: the title passes its count.
     let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
-    let blobs = match read(c, names(blob_names, wanted)) {
+    let asked = names(blob_names, wanted);
+    let what = |needed: usize| {
+        format!("container={:?} names={asked:?} buffer={size} needed={needed}", c.name)
+    };
+    let blobs = match read(c, asked.clone()) {
         Ok(blobs) => blobs,
-        Err(hr) => return hr,
+        Err(hr) => return traced("read", format_args!("{}", what(0)), hr),
     };
     let bytes = layout(&blobs, out as usize);
+    let what = what(bytes.len());
     if out.is_null() || size < bytes.len() {
-        return BUFFER_TOO_SMALL;
+        return traced("read", format_args!("{what}"), BUFFER_TOO_SMALL);
     }
+    traced("read", format_args!("{what}"), S_OK);
     // SAFETY: the buffer holds `size` bytes, checked above.
     unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
     put(count, blobs.len() as u32)
@@ -790,10 +834,15 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let asked = names(blob_names, count);
     let result = match get(container) {
-        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
+        Some(c) => read(c, asked.clone()).map(|blobs| layout(&blobs, 0)),
         None => Err(E_INVALIDARG),
     };
+    let (hr, len) = result.as_ref().map_or_else(|&e| (e, 0), |b| (S_OK, b.len()));
+    let name = get(container).map(|c| c.name.as_str());
+    let what = format_args!("container={name:?} names={asked:?} result={len}");
+    traced("read async", what, hr);
     xasync::finished_with(block, (&raw const READ).cast(), result)
 }
 extern "system" fn read_result(
@@ -808,10 +857,10 @@ extern "system" fn read_result(
     // The documented error for a small buffer; the result stays for a
     // retry with a larger one.
     if hr == xasync::E_NOT_SUFFICIENT_BUFFER {
-        return BUFFER_TOO_SMALL;
+        return traced("read result", format_args!("buffer={size}"), BUFFER_TOO_SMALL);
     }
     if hr < 0 {
-        return hr;
+        return traced("read result", format_args!("buffer={size}"), hr);
     }
     // The first name follows the blob array, so its offset gives the count.
     let blobs = if used == 0 {
@@ -839,6 +888,7 @@ extern "system" fn create_update(
     out: *mut *mut Update,
 ) -> HRESULT {
     let Some(c) = get(container) else {
+        put(out, std::ptr::null_mut());
         return E_INVALIDARG;
     };
     put(
@@ -895,6 +945,11 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
 
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
+    let changes = get(update).map(|u| {
+        let blobs = u.changes.iter().map(|(n, d)| (n.as_str(), d.as_ref().map(Vec::len)));
+        (u.name.as_str(), blobs.collect::<Vec<_>>())
+    });
+    traced("submit", format_args!("{changes:?}"), hr);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
