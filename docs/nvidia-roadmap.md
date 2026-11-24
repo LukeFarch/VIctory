@@ -40,6 +40,20 @@ world loads and the game runs (audio plays, no hang with 578), but the picture i
   logs every wave64 mesh pipeline it lets through. If a hang names one of them, `VICTORY_MESH_WAVE64=strict` takes it out.
 - **For 100:** hour-long soak runs with DRED on, and watch descriptor heap use and committed memory over time.
 
+### 70 critical path: the GPU culling passes (found in round 5, 467aef6)
+The world is black because the title's GPU-driven culling never runs. Its compute passes decide what to draw and write
+the indirect draw lists. With them dropped, those lists stay empty, which is where the ~4,400 dropped indirect draws come from.
+Fix these first, in this order:
+
+| Pass | Fails on | Fix | Owner |
+|---|---|---|---|
+| InstanceCulling, BatchCull | structured buffer of unknown stride (bindless heap buffers) | stride table per heap slot: host writes each buffer view's stride and size into its heap slot record and binds the records as `t0, space 3`; shaders address the buffer raw with that stride | host side: this thread (`host/heap-words`); shader side: translation thread |
+| meshlet_culling | `image_gather4_l` not translated | lower to `TextureGatherLevel`-style sampling (SM 6.7 has no gather with LOD on all drivers; emulate with 4 `SampleLevel` / `Load` taps) | translation thread |
+| ped skinning | scalar memory reads as data | same descriptor-data work as B, plus the heap records above where it reads sizes | translation thread |
+
+Once these run, re-measure: indirect drops should fall sharply and the scene should start to draw. Items A to C below
+then fill in what is still missing.
+
 ### A. Get the refused wave64 programs running (70)
 - Mesh: lane-independent wave64 mesh programs now run on `nvidia` (no wave ops; LDS absent, shared by several waves, or ordered by barriers).
 - Compute (`cedbff472d562f54`, `13dfdd3b1136e407`, plus others hidden because refusals are logged once): PR 233's split and
