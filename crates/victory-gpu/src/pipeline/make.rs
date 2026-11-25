@@ -335,12 +335,18 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
+    FRAME_WAIT_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
 }
+
+/// Microseconds the title's threads waited for pipelines since the last
+/// present (all threads together): the frame pacing line takes it at each
+/// present, to name the share of a long frame that was this wait.
+pub(crate) static FRAME_WAIT_US: AtomicU64 = AtomicU64::new(0);
 
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
@@ -421,21 +427,55 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// How many workers make pipelines: half the logical processors, 2 to 8,
+/// unless `VICTORY_PIPELINE_WORKERS=<n>` (1 to 32) says otherwise.
+fn worker_count() -> usize {
+    let default = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+    parse_workers(std::env::var("VICTORY_PIPELINE_WORKERS").ok().as_deref()).unwrap_or(default)
+}
+
+/// `VICTORY_PIPELINE_WORKERS`'s value, if it is a count from 1 to 32. Pure,
+/// for testing.
+fn parse_workers(value: Option<&str>) -> Option<usize> {
+    value?.trim().parse::<usize>().ok().filter(|n| (1..=32).contains(n))
+}
+
+/// Whether the workers run at the title's own priority
+/// (`VICTORY_PIPELINE_PRIORITY=normal`) rather than below it, as before.
+/// A frame that waits for a pipeline waits for a worker; below normal, on a
+/// processor the title's recording and submitting threads keep busy, the
+/// worker gets what is left, and the wait (and the frame) is longer.
+fn normal_priority() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_PRIORITY").is_ok_and(|v| v.trim().eq_ignore_ascii_case("normal"))
+    })
+}
+
+/// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
+        let normal = normal_priority();
+        tracing::info!(
+            workers,
+            priority = if normal { "normal (VICTORY_PIPELINE_PRIORITY)" } else { "below normal" },
+            "pipeline workers"
+        );
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                .spawn(move || {
+                    // Below the title's own threads (loading, recording),
+                    // unless asked for otherwise.
+                    if !normal {
+                        // SAFETY: a plain call on our own thread.
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
                     }
                     loop {
                         next().make();
@@ -490,6 +530,16 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn worker_count_switch_takes_counts_from_1_to_32() {
+        assert_eq!(parse_workers(None), None);
+        assert_eq!(parse_workers(Some(" 12 ")), Some(12));
+        assert_eq!(parse_workers(Some("1")), Some(1));
+        assert_eq!(parse_workers(Some("0")), None);
+        assert_eq!(parse_workers(Some("33")), None);
+        assert_eq!(parse_workers(Some("many")), None);
     }
 
     #[test]

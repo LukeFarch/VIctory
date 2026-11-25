@@ -1146,6 +1146,13 @@ mod library;
 #[cfg(windows)]
 mod make;
 
+/// Microseconds waited for pipelines since the last present
+/// (`make::FRAME_WAIT_US`), taken by the frame pacing line.
+#[cfg(windows)]
+pub(crate) fn take_frame_wait_us() -> u64 {
+    make::FRAME_WAIT_US.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
 #[cfg(windows)]

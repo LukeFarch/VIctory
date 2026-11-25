@@ -5984,6 +5984,61 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Frame pacing since the last log ([`Pacing`]).
+    pacing: Pacing,
+}
+
+/// Frame pacing over the frames since the last log: averages hide the hard
+/// spikes (a 5 s line of 2 fps says nothing of one frame of 3 s), so the
+/// longest frame, how many were long, and how much of the longest was
+/// waiting for pipelines are kept apart.
+#[derive(Default)]
+struct Pacing {
+    last: Option<std::time::Instant>,
+    frames: u32,
+    /// The longest frame, and the pipeline waits within it, microseconds.
+    longest: (u64, u64),
+    /// Frames of at least 50, 100, 250 and 1000 ms.
+    over: [u32; 4],
+    /// Pipeline waits over all the frames, microseconds.
+    waited: u64,
+}
+
+impl Pacing {
+    /// Bounds of [`Pacing::over`], in microseconds.
+    const OVER: [u64; 4] = [50_000, 100_000, 250_000, 1_000_000];
+
+    /// A present at `now` after `waited` microseconds of pipeline waits.
+    fn present(&mut self, now: std::time::Instant, waited: u64) {
+        let Some(last) = self.last.replace(now) else { return };
+        let us = now.duration_since(last).as_micros() as u64;
+        self.frames += 1;
+        self.waited += waited;
+        if us > self.longest.0 {
+            self.longest = (us, waited);
+        }
+        for (n, bound) in self.over.iter_mut().zip(Self::OVER) {
+            *n += u32::from(us >= bound);
+        }
+    }
+
+    /// The line for the frames since the last one, and a fresh count.
+    fn take(&mut self) -> Option<String> {
+        let p = std::mem::replace(self, Pacing { last: self.last, ..Pacing::default() });
+        (p.frames > 0).then(|| {
+            format!(
+                "frame pacing over {} frames: the longest {:.1} ms ({:.1} ms of it waiting for pipelines);                  {} frames of 50 ms or more, {} of 100 ms, {} of 250 ms, {} of 1 s; {:.1} ms a frame waiting for pipelines",
+                p.frames,
+                p.longest.0 as f64 / 1e3,
+                p.longest.1 as f64 / 1e3,
+                p.over[0],
+                p.over[1],
+                p.over[2],
+                p.over[3],
+                p.waited as f64 / 1e3 / f64::from(p.frames)
+            )
+        })
+    }
 }
 
 impl Meter {
@@ -5997,6 +6052,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            pacing: Pacing::default(),
         }
     }
 
@@ -6011,6 +6067,10 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        self.pacing.present(
+            std::time::Instant::now(),
+            crate::pipeline::take_frame_wait_us(),
+        );
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -6100,6 +6160,9 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             crate::budget::line();
+            if let Some(line) = self.pacing.take() {
+                tracing::info!("{line}");
+            }
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
