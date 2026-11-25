@@ -1205,6 +1205,8 @@ impl State {
             s.refresh(list, a, len);
             if writes {
                 s.gpu_writes(list, a, len);
+            } else if crate::pipeline::quarantined(self.pipeline as This) {
+                s.gpu_owned(a, len);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -2922,7 +2924,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if !QUARANTINED.get() && (STORES.get() || !write_skip()) {
+            if QUARANTINED.get() {
+                shadow.gpu_owned(address, len);
+            } else if STORES.get() || !write_skip() {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
