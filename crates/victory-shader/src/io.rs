@@ -86,6 +86,12 @@ pub enum Input {
     GsInstance,
     /// Geometry: s2, which the program adds to its output area's base.
     GsOutputOffset,
+    /// Pixel: the POPS collision wave id, the SGPR after the user data and
+    /// the primitive mask in a program that orders its overlapping waves
+    /// ([`Io::pops`]): bit 31 says an earlier wave overlaps this one, bits
+    /// 0-9 and 16-25 name the newest such wave and this one, bits 28-29 the
+    /// packer.
+    PopsCollision,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +212,50 @@ pub struct Io {
     /// Compute: how many SGPRs the hardware initializes
     /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
+    /// Pixel: the program orders the memory accesses of overlapping waves
+    /// (POPS: it sets `HW_REG_POPS_PACKER`, waits on
+    /// `src_pops_exiting_wave_id` while an earlier wave overlapping it runs,
+    /// and sends `MSG_ORDERED_PS_DONE`).
+    pub pops: bool,
+}
+
+/// `hwreg` id of `HW_REG_POPS_PACKER`.
+const HW_REG_POPS_PACKER: u16 = 25;
+
+/// Whether `p` sets `HW_REG_POPS_PACKER` (see [`Io::pops`]).
+fn sets_pops_packer(p: &Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(i.name(), "s_setreg_b32" | "s_setreg_imm32_b32")
+            && matches!(i.fields, Fields::Sop { imm: Some(imm), .. } if imm & 0x3F == HW_REG_POPS_PACKER)
+    })
+}
+
+/// The SGPR holding the POPS collision wave id of pixel program `p`, which
+/// orders its overlapping waves: the hardware loads the user data, the
+/// primitive mask, then it. Only when the program reads that SGPR on entry
+/// and takes nothing but bit fields of it (as the wait does), so that a user
+/// SGPR the layout does not list cannot pass for it.
+fn pops_collision_sgpr(p: &Program, native: &NativeProgram) -> Option<u8> {
+    let user = native
+        .layout
+        .iter()
+        .map(|l| u32::from(l.user_data) + l.sgprs)
+        .max()?;
+    let sgpr = u8::try_from(user + 1).ok().filter(|&s| s < 106)?;
+    let &(_, v) = p.inputs.iter().find(|i| i.0 == Reg::S(sgpr))?;
+    let fields = |i: &Inst| {
+        i.name().starts_with("s_bfe_u32")
+            || i.name().starts_with("s_lshr_b32")
+            || i.name().starts_with("s_bitcmp")
+            || i.name() == "s_and_b32"
+    };
+    let mut readers = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| i.reads.iter().any(|r| r.1 == v))
+        .peekable();
+    (readers.peek().is_some() && readers.all(fields)).then_some(sgpr)
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -220,10 +270,15 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             HwStage::Ps,
         ) => {
             // A pixel shader exports no parameters; `[]` never reaches `Unread`.
-            let loaded = ps_vgprs(*input_addr)
+            let mut loaded: Vec<(Reg, Input)> = ps_vgprs(*input_addr)
                 .into_iter()
                 .map(|(r, i)| (Reg::V(r), i))
                 .collect();
+            if sets_pops_packer(p)
+                && let Some(s) = pops_collision_sgpr(p, native)
+            {
+                loaded.push((Reg::S(s), Input::PopsCollision));
+            }
             (loaded, &inputs[..], &[][..])
         }
         (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
@@ -367,6 +422,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
             _ => None,
         },
+        pops: inputs.iter().any(|i| i.1 == Input::PopsCollision),
         ..Io::default()
     };
     let defs: std::collections::HashMap<Value, Site> = p

@@ -85,6 +85,7 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
+    pub const ROVS: u64 = 1 << 18;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
@@ -174,6 +175,12 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// A pixel shader whose UAVs are rasterizer ordered: the console
+    /// program orders its overlapping waves' accesses (POPS, `Io::pops`).
+    pub rov: bool,
+    /// UAV handles annotated rasterizer ordered.
+    #[cfg(test)]
+    pub rov_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -234,6 +241,9 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            rov: false,
+            #[cfg(test)]
+            rov_handles: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -435,6 +445,18 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        // A UAV (bit 12) is rasterizer ordered (bit 13) in a pixel shader
+        // that orders its overlapping pixels (as DXC annotates a heap
+        // `RasterizerOrderedTexture2D`).
+        let props0 = if self.rov && props0 & 0x1000 != 0 {
+            #[cfg(test)]
+            {
+                self.rov_handles += 1;
+            }
+            props0 | 0x2000
+        } else {
+            props0
+        };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -628,6 +650,13 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let rov = if self.rov {
+                    self.flags |= flags::ROVS;
+                    let yes = self.m.bool(true);
+                    self.m.md_value(yes)
+                } else {
+                    no
+                };
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -643,7 +672,7 @@ impl Shader {
                         Some(i32c(&mut self, 11)),
                         Some(no),
                         Some(no),
-                        Some(no),
+                        Some(rov),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
@@ -753,6 +782,11 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -857,6 +891,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
