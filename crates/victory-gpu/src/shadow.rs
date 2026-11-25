@@ -3372,7 +3372,13 @@ pub(crate) fn holders() -> [u64; 6] {
     let (windows, window_bytes) = {
         let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         let mut seen = std::collections::HashSet::new();
-        let bytes: u64 = loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)).map(|s| s.len).sum();
+        // In place (`crate::inplace`) a window is the title's own memory, no
+        // copy: counted there, not here.
+        let bytes: u64 = loose
+            .values()
+            .filter(|s| s.place.is_none() && seen.insert(Arc::as_ptr(s) as usize))
+            .map(|s| s.len)
+            .sum();
         (seen.len() as u64, bytes)
     };
     [

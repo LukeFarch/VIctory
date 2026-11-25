@@ -60,6 +60,7 @@ pub(crate) fn line() {
     let trimmed = [0, 1].map(|i| crate::resource::TRIMMED[i].load(Relaxed));
     let twins_and_targets = textures[1].saturating_sub(filled[1]);
     let copies = crate::shadow::holders();
+    let in_place = crate::inplace::in_place();
     let staged = crate::texture::staging_alive();
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let lists_never_reset = crate::host::LISTS[3].load(Relaxed);
@@ -72,7 +73,8 @@ pub(crate) fn line() {
          let go as idle since the start: {} copies {} MB. \
          PC: {} MB private ({} MB in memory) of {} MB, {} MB free, {} MB left to commit; \
          host copies of title memory {} MB in {} (of them windows outside buffers {} MB in {}), \
-         in the card's memory {} MB and their \"before\" twins {} MB; texture staging {} MB in {}; \
+         in the card's memory {} MB and their \"before\" twins {} MB; \
+         title memory the card reads in place, no copy (VICTORY_INPLACE={}): windows {} MB in {}, buffers {} MB in {}; texture staging {} MB in {}; \
          host lists {} ({} never reset), their scratch {} MB and other upload buffers {} MB; \
          shader containers {} MB, translations {} MB, the pipeline library's file {} MB",
         mb(card[1]),
@@ -103,6 +105,11 @@ pub(crate) fn line() {
         copies[2],
         mb(copies[4]),
         mb(copies[5]),
+        crate::inplace::level(),
+        mb(in_place[1]),
+        in_place[0],
+        mb(in_place[3]),
+        in_place[2],
         mb(staged[1]),
         staged[0],
         alive[0],

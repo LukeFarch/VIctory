@@ -168,6 +168,12 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// In place now, for the memory line (`crate::budget`): windows and their
+/// bytes, title buffers and their bytes.
+pub(crate) fn in_place() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| STATS[i].load(Ordering::Relaxed))
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
