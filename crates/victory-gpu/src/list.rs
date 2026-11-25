@@ -1793,7 +1793,9 @@ impl ValueWait {
         met
     }
 
-    fn holds(&self) -> bool {
+    /// [`ValueWait::met`] without counting the look (the held-wait watch
+    /// looks thousands of times a second).
+    pub(crate) fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
             return true;

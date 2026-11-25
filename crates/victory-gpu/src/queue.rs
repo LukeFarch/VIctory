@@ -305,6 +305,11 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// where a fence may have moved: after a signal and after a submission (a
 /// list's bottom-of-pipe write may be into a fence), never from inside
 /// one.
+///
+/// With `all` (a present, [`forces`]) a queue is forced on only once what
+/// it stands at has stood for [`force_after`]; a younger wait stays held
+/// across the present, and the thread that watches held waits
+/// ([`held_watch`]) looks at it again until it is met or old enough.
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
@@ -312,6 +317,7 @@ pub(crate) fn release_held(all: bool) {
     if lock(&WAITING).is_empty() {
         return;
     }
+    held_watch_start();
     let _one = lock(&RELEASING);
     loop {
         let queues = lock(&WAITING).clone();
@@ -320,6 +326,8 @@ pub(crate) fn release_held(all: bool) {
             // SAFETY: a live queue: one released is taken off the list.
             let held = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(held);
+            // Forced only once its first wait is old enough.
+            let all = all && stood_long(q);
             loop {
                 match held.first() {
                     None => break,
@@ -331,6 +339,8 @@ pub(crate) fn release_held(all: bool) {
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
                     Some(_) => {}
                 }
+                // What it stood at moves: a new first wait starts its clock.
+                stood_clear(q);
                 match held.remove(0) {
                     Held::Wait(..) => {}
                     Held::Value(wait) => {
@@ -415,10 +425,166 @@ pub(crate) fn release_held(all: bool) {
             }
             if held.is_empty() {
                 lock(&WAITING).retain(|&w| w != q);
+                stood_clear(q);
+            } else {
+                stood_mark(q);
             }
         }
         if !moved {
             break;
+        }
+    }
+}
+
+/// How long a queue may stand at a wait before a present runs it on
+/// anyway (`VICTORY_WAIT_FORCE_MS`, 1000; 0 forces at every present, as
+/// before).
+///
+/// Every present used to run whatever a queue still held, met or not. The
+/// title's lists wait for values its own threads write when a job is done
+/// (a loader job, a build of the world's buffers): run on at the present,
+/// the lists behind such a wait read buffers the job had not filled yet.
+/// A pass that runs once, at load, then keeps what it made from empty
+/// input for good. Whether the job finished before the present was a
+/// matter of timing: the prison walls were there in the slower builds
+/// (diagnostics, the submission thread on) and missing in the fast ones.
+/// On the console the card polls the value and goes on the moment it is
+/// there; [`held_watch`] does that here.
+#[cfg(windows)]
+fn force_after() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(
+        *MS.get_or_init(|| std::env::var("VICTORY_WAIT_FORCE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000)),
+    )
+}
+
+/// Per waiting queue (its address): since when it stands at what it
+/// holds first.
+#[cfg(windows)]
+static STOOD: std::sync::Mutex<Vec<(usize, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn stood_mark(q: usize) {
+    let mut stood = lock(&STOOD);
+    if !stood.iter().any(|&(w, _)| w == q) {
+        stood.push((q, std::time::Instant::now()));
+    }
+}
+
+#[cfg(windows)]
+fn stood_clear(q: usize) {
+    lock(&STOOD).retain(|&(w, _)| w != q);
+}
+
+/// Whether queue `q` has stood at its first wait for [`force_after`] (or
+/// is not known to stand: it is forced as before).
+#[cfg(windows)]
+fn stood_long(q: usize) -> bool {
+    let limit = force_after();
+    if limit.is_zero() {
+        return true;
+    }
+    match lock(&STOOD).iter().find(|&&(w, _)| w == q) {
+        Some(&(_, since)) => {
+            let long = since.elapsed() >= limit;
+            if !long {
+                HELD_STATS[0].fetch_add(1, Ordering::Relaxed);
+            }
+            long
+        }
+        None => true,
+    }
+}
+
+/// Since the start: presents at which a queue's wait was kept held (it
+/// was younger than [`force_after`]), and held parts the watch let go
+/// because their value had arrived ([`held_watch`]).
+#[cfg(windows)]
+static HELD_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// How often [`held_watch`] looks at held waits
+/// (`VICTORY_HELD_POLL_US`, 500; 0: no watch, waits are looked at only
+/// after signals, submissions and presents, as before).
+#[cfg(windows)]
+fn held_poll() -> Option<std::time::Duration> {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let us = *US.get_or_init(|| std::env::var("VICTORY_HELD_POLL_US").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(500));
+    (us > 0).then(|| std::time::Duration::from_micros(us))
+}
+
+#[cfg(windows)]
+fn held_watch_start() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(poll) = held_poll() else {
+        return;
+    };
+    ONCE.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("victory-held-watch".into())
+            .spawn(move || held_watch(poll));
+        match spawned {
+            Ok(_) => tracing::info!(
+                poll_us = poll.as_micros() as u64,
+                force_ms = force_after().as_millis() as u64,
+                "held waits are looked at by a thread of their own, and a present runs a wait on only once it is old"
+            ),
+            Err(e) => tracing::warn!(error = %e, "no thread to watch held waits: a present forces them as before"),
+        }
+    });
+}
+
+/// Whether what some waiting queue stands at is there in memory now (a
+/// fence reached, a memory value met), without asking about flights.
+#[cfg(windows)]
+fn any_head_ready() -> bool {
+    let queues = lock(&WAITING).clone();
+    queues.into_iter().any(|q| {
+        // SAFETY: a live queue: one released is taken off the list.
+        let held = unsafe { &(*(q as *const Queue)).held };
+        match lock(held).first() {
+            None => false,
+            Some(&Held::Wait(fence, value)) => crate::fence::completed(fence as This) >= value,
+            Some(Held::Value(wait)) => wait.holds(),
+            Some(_) => true,
+        }
+    })
+}
+
+/// The card's side of a wait for a memory value: while a queue holds
+/// something, look whether memory (or a fence) has got there, and run
+/// what it frees at once; a wait that stood for [`force_after`] runs on,
+/// as a present did before, so a value nothing writes cannot stop the
+/// title for good.
+#[cfg(windows)]
+fn held_watch(poll: std::time::Duration) {
+    let mut said = 0u64;
+    loop {
+        std::thread::sleep(poll);
+        if lock(&WAITING).is_empty() {
+            continue;
+        }
+        // Memory alone, never the flights' writes (`crate::host::late_met`
+        // may settle them, which is the submitting threads' business).
+        if any_head_ready() {
+            HELD_STATS[1].fetch_add(1, Ordering::Relaxed);
+            release_held(false);
+        }
+        let limit = force_after();
+        if limit.is_zero() {
+            continue;
+        }
+        let old = lock(&STOOD).iter().any(|&(_, since)| since.elapsed() >= limit);
+        if old {
+            if said < 16 {
+                said += 1;
+                tracing::warn!(
+                    ms = limit.as_millis() as u64,
+                    kept = HELD_STATS[0].load(Ordering::Relaxed),
+                    let_go = HELD_STATS[1].load(Ordering::Relaxed),
+                    "a queue stood at a wait for its whole limit: it runs on (VICTORY_WAIT_FORCE_MS)"
+                );
+            }
+            release_held(true);
         }
     }
 }
