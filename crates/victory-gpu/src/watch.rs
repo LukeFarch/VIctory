@@ -596,11 +596,11 @@ fn guard_twins(g: &mut Guards, from: usize, to: usize) {
 /// at the other addresses of their bytes are no longer clean. They stay
 /// read-only, so no call to the system is made for them.
 fn stale_twins(g: &mut Guards, from: usize, to: usize) {
-    if !view_twins() {
-        return;
-    }
+    let on = view_twins();
     crate::inplace::twins(from * BLOCK, to * BLOCK, |_, twin| {
-        if g.clean.remove(&(twin / BLOCK)) {
+        // Switched off, the write that would have been missed is still
+        // counted, so that a run without the guard says how many were.
+        if if on { g.clean.remove(&(twin / BLOCK)) } else { g.clean.contains(&(twin / BLOCK)) } {
             TWINS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     });
