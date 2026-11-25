@@ -1224,11 +1224,15 @@ fn dred_part(part: &str) -> bool {
 }
 
 /// `VICTORY_FRAME_SLEEP_MS`: the frame thread sleeps this long before each
-/// present, to tell what time alone changes from what a switch changes.
-pub(crate) fn frame_sleep() {
-    static MS: OnceLock<u64> = OnceLock::new();
-    let ms = *MS.get_or_init(|| std::env::var("VICTORY_FRAME_SLEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
-    if ms > 0 {
+/// present from frame `VICTORY_FRAME_SLEEP_FROM` on (0), to tell what time
+/// alone changes from what a switch changes.
+pub(crate) fn frame_sleep(frame: u64) {
+    static MS: OnceLock<(u64, u64)> = OnceLock::new();
+    let (ms, from) = *MS.get_or_init(|| {
+        let n = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        (n("VICTORY_FRAME_SLEEP_MS"), n("VICTORY_FRAME_SLEEP_FROM"))
+    });
+    if ms > 0 && frame >= from {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 }
@@ -6374,7 +6378,7 @@ impl Host {
         frame: u64,
         rect: Option<[u32; 4]>,
     ) -> Option<bool> {
-        frame_sleep();
+        frame_sleep(frame);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
