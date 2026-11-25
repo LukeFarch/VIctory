@@ -221,20 +221,20 @@ const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// Series X on a 1080p set lists a 1080p mode), else the render size
+/// asked for (`console::render_size`), else 3840x2160. The title does not
+/// size itself by this alone (run 10): see `console::render_size`.
 /// shortcut: not yet the host display's own size by default; make it so
 /// once a title is seen to render for the mode it is given.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
+        let asked = std::env::var("VICTORY_DISPLAY_MODE")
+            .ok()
+            .and_then(|v| crate::console::parse_size(&v));
+        let size = asked
+            .or_else(crate::console::render_size)
+            .unwrap_or((3840, 2160));
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
