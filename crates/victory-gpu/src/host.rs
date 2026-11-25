@@ -199,6 +199,11 @@ fn sweep_parts() {
         let _z = crate::trace::zone("sweep: idle host textures");
         crate::resource::let_go_idle();
     }
+    // Once a second: how much of the card copies' CPU sides no merge needs.
+    let (n, bytes) = crate::shadow::card_never_written();
+    crate::trace::count("sweeps", 1);
+    crate::trace::count("card copies never written by shaders (summed over sweeps)", n);
+    crate::trace::count("card copies never written by shaders: bytes (summed over sweeps)", bytes);
 }
 
 /// Drops `object` once every submission running now has finished: at once

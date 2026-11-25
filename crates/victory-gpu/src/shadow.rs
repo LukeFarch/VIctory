@@ -473,6 +473,25 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     out
 }
 
+/// For sizing a commit cut: the copies in the card's memory whose shaders
+/// never declared a write (no "before" hashes made), and their bytes. Their
+/// CPU side (`Card::staging`, the size of the copy) takes part in no merge,
+/// settle or compare: only refreshes write it and sends read it, so a
+/// shared upload ring could stand in for it.
+pub(crate) fn card_never_written() -> (u64, u64) {
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut n, mut bytes) = (0, 0);
+    for shadow in carded.iter().filter_map(|w| w.upgrade()) {
+        if let Some(card) = &shadow.card
+            && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        {
+            n += 1;
+            bytes += card.size;
+        }
+    }
+    (n, bytes)
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
