@@ -194,6 +194,42 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// The LLVM fast-math flags put on every 32-bit float add, subtract,
+/// multiply, divide and remainder the translation writes (decision 0003
+/// follow-up, "shader speed on NVIDIA"). Without flags, DXIL marks an
+/// operation `precise`: the driver's compiler keeps each one as written,
+/// does not join a multiply and an add into one fused operation, and
+/// divides exactly where the console's `v_rcp_f32` is an approximation
+/// (1 ULP). HLSL compiled by DXC has all of them on unless `precise`.
+/// `VICTORY_SHADER_FAST` (decimal or `0x` hex), the sum of:
+/// - 1: unsafe algebra (reassociation, contraction; in LLVM 3.7 it also
+///   turns on every flag below),
+/// - 2: no NaNs, 4: no infinities (the title's code compares with NaN and
+///   relies on max/min with NaN: wrong pictures are possible),
+/// - 8: no signed zeros, 16: reciprocal allowed (`a / b` as `a * (1 / b)`,
+///   an approximate reciprocal).
+///
+/// Unset or 0: none, as before. `24` (signed zeros, reciprocal) is the
+/// cautious setting; `31` is what DXC writes by default. Values are
+/// clamped to those bits. Part of the translation: the shader cache keys
+/// on it (`victory-gpu`'s does).
+pub fn fast_math() -> u8 {
+    static FLAGS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *FLAGS.get_or_init(|| parse_fast_math(std::env::var("VICTORY_SHADER_FAST").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_FAST`'s value; 0 when it is unset or unreadable. Pure,
+/// for testing.
+fn parse_fast_math(value: Option<&str>) -> u8 {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .map_or(0, |n: u32| (n & 0x1f) as u8)
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
@@ -820,6 +856,16 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn fast_math_switch_parses_flag_bits() {
+        assert_eq!(parse_fast_math(None), 0);
+        assert_eq!(parse_fast_math(Some("0")), 0);
+        assert_eq!(parse_fast_math(Some(" 24 ")), 24);
+        assert_eq!(parse_fast_math(Some("0x1f")), 31);
+        assert_eq!(parse_fast_math(Some("255")), 31);
+        assert_eq!(parse_fast_math(Some("on")), 0);
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {

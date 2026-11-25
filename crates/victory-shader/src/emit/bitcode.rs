@@ -228,6 +228,10 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Fast-math flags for float arithmetic in place of `emit::fast_math()`'s
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fast_math: Option<u8>,
 }
 
 impl Module {
@@ -844,6 +848,10 @@ impl Module {
 
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
+        #[cfg(test)]
+        let fast = u64::from(self.fast_math.unwrap_or_else(super::fast_math));
+        #[cfg(not(test))]
+        let fast = u64::from(super::fast_math());
         let mut inst_id = base;
         // The operands of variable-length records, reused across them.
         let mut r: Vec<u64> = Vec::new();
@@ -856,6 +864,11 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
+                    // Fast-math flags on 32-bit float arithmetic (`emit::fast_math`): the
+                    // record's optional last operand, as LLVM 3.7 writes it.
+                    Op::Bin(op, a, b) if fast != 0 && self.types[inst.ty.0 as usize] == TypeDef::Float => {
+                        w.record(2, &[rel(*a), rel(*b), *op as u64, fast])
+                    }
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),
@@ -1080,6 +1093,32 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// Fast-math flags go on float arithmetic only, as the record's last
+    /// operand, and change nothing when none are asked for.
+    #[test]
+    fn fast_math_flags_on_float_arithmetic_only() {
+        let module = |fast: u8| {
+            let mut m = Module::default();
+            m.fast_math = Some(fast);
+            let void = m.void();
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let b = m.new_block();
+            let (x, y) = (m.f32(2.0f32.to_bits()), m.f32(3.0f32.to_bits()));
+            let _ = m.bin(b, Bin::Mul, x, y);
+            let (i, j) = (m.i32(2), m.i32(3));
+            let _ = m.bin(b, Bin::Add, i, j);
+            m.terminate(b, Term::Ret);
+            m.write()
+        };
+        let (plain, fast) = (module(0), module(24));
+        assert_ne!(plain, fast);
+        // One more operand of 6 bits (a VBR6 of 24) and nothing else.
+        let bits = |v: &[u8]| v.len() * 8;
+        assert!(bits(&fast) >= bits(&plain));
+        assert!(bits(&fast) - bits(&plain) <= 32);
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each
