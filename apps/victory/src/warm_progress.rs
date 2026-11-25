@@ -66,6 +66,7 @@ static P: Progress = Progress {
 /// Shows the progress until [`Shown::finish`].
 pub(crate) struct Shown {
     console: Option<std::thread::JoinHandle<()>>,
+    terminal: bool,
     #[cfg(windows)]
     window: Option<std::thread::JoinHandle<()>>,
     stats: Option<PathBuf>,
@@ -101,23 +102,33 @@ pub(crate) fn start(paths: &[PathBuf], threads: usize) -> Shown {
             P.files_total.store(files, Ordering::Relaxed);
             P.bytes_total.store(bytes, Ordering::Relaxed);
         });
-    let console = std::io::stderr().is_terminal().then(|| {
-        std::thread::spawn(|| {
+    // On a terminal, a line redrawn in place; into a file (a script's log),
+    // a plain line every half minute, so a warm with no window still tells.
+    let terminal = std::io::stderr().is_terminal();
+    let console = std::thread::Builder::new()
+        .name("warm-console".into())
+        .spawn(move || {
+            let mut ticks = 0u32;
             while !P.finished.load(Ordering::Relaxed) {
-                let mut err = std::io::stderr().lock();
-                let _ = write!(err, "\r{}\x1b[K", console_line());
-                let _ = err.flush();
-                drop(err);
+                ticks += 1;
+                if terminal {
+                    let mut err = std::io::stderr().lock();
+                    let _ = write!(err, "\r{}\x1b[K", console_line());
+                    let _ = err.flush();
+                } else if ticks.is_multiple_of(60) {
+                    eprintln!("{}", console_line());
+                }
                 std::thread::sleep(Duration::from_millis(500));
             }
         })
-    });
+        .ok();
     #[cfg(windows)]
     let window = (std::env::var("VICTORY_WARM_WINDOW").as_deref() != Ok("0"))
         .then(window::spawn)
         .flatten();
     Shown {
         console,
+        terminal,
         #[cfg(windows)]
         window,
         stats,
@@ -136,8 +147,10 @@ impl Shown {
         }
         if let Some(c) = self.console {
             let _ = c.join();
-            let mut err = std::io::stderr().lock();
-            let _ = writeln!(err, "\r{}\x1b[K", console_line());
+            if self.terminal {
+                let mut err = std::io::stderr().lock();
+                let _ = writeln!(err, "\r{}\x1b[K", console_line());
+            }
         }
         let secs = elapsed().as_secs();
         let done = P.done.load(Ordering::Relaxed);
@@ -367,7 +380,7 @@ fn window_lines() -> Vec<(&'static str, String)> {
 mod window {
     //! A plain Win32 window drawn with GDI on its own thread.
 
-    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::*;
@@ -473,8 +486,37 @@ mod window {
         }
     }
 
+    /// The window's code panicked once: it is gone, and nothing of ours
+    /// runs for its last messages.
+    static BROKEN: AtomicBool = AtomicBool::new(false);
+
     unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-        // SAFETY: called by the system with this thread's window.
+        // A panic must not leave this function: unwinding out of a system
+        // callback ends the process (0xC000041D), and the warm with it.
+        if !BROKEN.load(Ordering::Relaxed) {
+            // SAFETY: called by the system with this thread's window.
+            match std::panic::catch_unwind(|| unsafe { handle(hwnd, msg, w, l) }) {
+                Ok(r) => return r,
+                Err(_) => {
+                    BROKEN.store(true, Ordering::Relaxed);
+                    eprintln!("warm: the progress window failed and was closed; the warm goes on");
+                    HWND_.store(0, Ordering::Release);
+                    // SAFETY: this thread's window; its messages now go to
+                    // the system's handler below.
+                    unsafe {
+                        DestroyWindow(hwnd);
+                        PostQuitMessage(0);
+                    }
+                    return 0;
+                }
+            }
+        }
+        // SAFETY: the system's own handler, with the system's arguments.
+        unsafe { DefWindowProcW(hwnd, msg, w, l) }
+    }
+
+    unsafe fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        // SAFETY: the caller's: the system's call, with this thread's window.
         unsafe {
             match msg {
                 WM_TIMER => {
@@ -534,14 +576,19 @@ mod window {
     }
 
     unsafe fn text(dc: HDC, s: &str, mut r: RECT, color: u32, format: u32) {
-        let s: Vec<u16> = s.encode_utf16().collect();
-        // SAFETY: `s` and `r` live across the call.
+        // Nothing to draw: an empty `Vec`'s pointer is not one to hand the
+        // system (the "Current" line is empty until the first shader starts).
+        if s.is_empty() {
+            return;
+        }
+        let s = wide(s);
+        // SAFETY: `s` (terminated) and `r` live across the call.
         unsafe {
             SetTextColor(dc, color);
             DrawTextW(
                 dc,
                 s.as_ptr(),
-                s.len() as i32,
+                s.len() as i32 - 1,
                 &mut r,
                 format | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS,
             );
