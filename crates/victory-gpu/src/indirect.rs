@@ -715,6 +715,9 @@ void main() {
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        // Bound as the compare's root signature names it; nothing is
+        // copied out here (no slots).
+        let (_capture, _, capture_gpu) = warp.shared_buffer(1 << 20);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
@@ -729,11 +732,12 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode, 0, 0, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, capture_gpu);
                 warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
             }
             warp.submit_and_wait();
@@ -762,6 +766,79 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// With slots given (the relay), the compare copies each piece it
+    /// finds differing into the next slot, names the piece's dword in the
+    /// slot's table entry and counts it; a piece past the slots is counted
+    /// and not copied (the landing fetches it).
+    #[test]
+    fn warp_card_compare_copies_out_what_differs() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        // As `crate::host`'s CAPTURE_TABLE, CAPTURE_DATA and CAPTURE_SLOT.
+        const TABLE: usize = 16384;
+        const DATA: usize = 1 << 20;
+        const SLOT: usize = 65792;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, _, differs_gpu) = warp.shared_buffer(64);
+        let (_capture, capture_ptr, capture_gpu) = warp.shared_buffer((DATA + 4 * SLOT) as u64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 509) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        // Counter 5, slots from 2, `n` of them; the results' dwords from 40.
+        let run = |warp: &mut WarpHarness, mode: u32, n: u32| {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                capture_ptr.cast::<u32>().add(5).write_volatile(0);
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES, 40 * 4, mode, 5, 2, n];
+                warp.list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, capture_gpu);
+                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+            }
+            warp.submit_and_wait();
+        };
+        // SAFETY (each): inside the mappings.
+        let counter = || unsafe { capture_ptr.cast::<u32>().add(5).read_volatile() };
+        let entry = |slot: usize| unsafe { capture_ptr.add(TABLE).cast::<u32>().add(slot).read_volatile() };
+        let slot = |slot: usize| unsafe { std::slice::from_raw_parts(capture_ptr.add(DATA + slot * SLOT), PIECE) };
+        run(&mut warp, 0, 0);
+        // Nothing changed: nothing copied out.
+        run(&mut warp, 2, 2);
+        assert_eq!(counter(), 0);
+        // The third piece changes: copied into slot 2, named as dword 42.
+        let at = 2 * PIECE + 77;
+        // SAFETY: inside the mapping.
+        unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5a) };
+        run(&mut warp, 2, 2);
+        assert_eq!(counter(), 1);
+        assert_eq!(entry(2), 42);
+        // SAFETY: inside the mapping.
+        let now = unsafe { std::slice::from_raw_parts(now_ptr.add(2 * PIECE), PIECE) };
+        assert_eq!(slot(2), now);
+        // All three change, with one slot: three counted, one copied.
+        for piece in 0..PIECES as usize {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(piece * PIECE + 5).write_volatile(0xee) };
+        }
+        run(&mut warp, 2, 1);
+        assert_eq!(counter(), 3);
+        let named = entry(2) as usize - 40;
+        // SAFETY: inside the mapping.
+        let now = unsafe { std::slice::from_raw_parts(now_ptr.add(named * PIECE), PIECE) };
+        assert_eq!(slot(2), now);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
