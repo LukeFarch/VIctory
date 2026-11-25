@@ -119,6 +119,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
+    DIRTY_DWORDS, DIRTY_LIST, DIRTY_LIST_AT, DIRTY_MASK_AT, DIRTY_PAGES, SLOT_DIRTY,
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_VIEW_ADDRESSES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
@@ -237,6 +238,34 @@ pub fn fast_math() -> u8 {
 pub fn uav_coherent() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| parse_uav_coherent(std::env::var("VICTORY_UAV_COHERENT").ok().as_deref()))
+}
+
+/// Whether translated shaders mark the 4 KiB pages of title memory their
+/// buffer stores write (`VICTORY_DIRTY_MASK`, see [`SLOT_DIRTY`]):
+/// - unset or `0`: no, as before.
+/// - `count`: they do; the host only checks the marks against what its
+///   compare finds (1).
+/// - `1`: they do; the host relies on them (2).
+///
+/// Part of the translation: the shader cache keys on it. Pure parse in
+/// [`parse_dirty_mask`].
+pub fn dirty_mask() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_dirty_mask(std::env::var("VICTORY_DIRTY_MASK").ok().as_deref()))
+}
+
+/// Store sites translated with [`dirty_mask`] on since the start: placed in
+/// title memory (marked), and not placed (they set the "not all marked"
+/// dword when they run).
+pub static DIRTY_SITES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `VICTORY_DIRTY_MASK`'s value: 0 off, 1 `count`, 2 `1`.
+pub fn parse_dirty_mask(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("count") => 1,
+        Some("1") => 2,
+        _ => 0,
+    }
 }
 
 /// `VICTORY_UAV_COHERENT`'s value; 0 unless it is `1` or `2`. Pure, for
