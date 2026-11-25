@@ -64,6 +64,30 @@ impl SigElement {
     }
 }
 
+/// Gives the elements of a row whose interpolation mode nothing decided
+/// (float elements, unless `read` and read) the mode the row's other
+/// elements agree on: DXIL wants one mode per row, and the console's
+/// signature, packed by the source's modes, had one (an int or a system
+/// value beside a float means the float was `nointerpolation`).
+pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
+    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
+        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
+        let Some(mode) = modes.next() else { continue };
+        if modes.any(|m| m != mode) {
+            continue;
+        }
+        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
+        for e in elements.iter_mut().filter(undecided) {
+            e.interp = mode;
+        }
+    }
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -72,7 +96,8 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), stably: elements
+    // sharing a row keep their element order, whatever their channels.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -90,7 +115,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -401,6 +426,115 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn el(name: &str, kind: u8, comp: u8, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    /// The (index, first channel) of each row of a signature part, in order.
+    fn part_rows(part: &[u8]) -> Vec<(u32, u8)> {
+        let u = |o: usize| u32::from_le_bytes(part[o..o + 4].try_into().unwrap());
+        (0..u(0) as usize)
+            .map(|i| {
+                let mask = part[8 + 32 * i + 24];
+                (u(8 + 32 * i + 8), mask.trailing_zeros() as u8)
+            })
+            .collect()
+    }
+
+    /// Console signatures list a row's elements by register, not channel
+    /// (TEXCOORD3 at w before NORMAL0 at x-z): the part keeps that order
+    /// within the row, as the validator's stable sort by register does, so
+    /// the part matches the one it builds from the module.
+    #[test]
+    fn elements_sharing_a_row_keep_their_element_order() {
+        let mut texcoord = el("TEXCOORD", 0, 9, 5, 3, 1);
+        texcoord.index = 3;
+        let elements = [
+            el("SV_Position", 3, 9, 0, 0, 4),
+            texcoord,
+            el("NORMAL", 0, 9, 5, 0, 3),
+            el("TEXCOORD", 0, 9, 1, 0, 4),
+        ];
+        for input in [true, false] {
+            let rows = part_rows(&signature(&elements, input));
+            // By register; row 5's two in element order.
+            assert_eq!(rows, [(0, 0), (0, 0), (3, 3), (0, 0)]);
+        }
+        let part = signature(&elements, true);
+        let name = |i: usize| {
+            let at = u32::from_le_bytes(part[8 + 32 * i + 4..][..4].try_into().unwrap()) as usize;
+            let end = part[at..].iter().position(|&b| b == 0).unwrap();
+            std::str::from_utf8(&part[at..at + end]).unwrap().to_owned()
+        };
+        let names: Vec<String> = (0..4).map(name).collect();
+        assert_eq!(names, ["SV_Position", "TEXCOORD", "TEXCOORD", "NORMAL"]);
+    }
+
+    /// Vertex outputs: a float beside an integer in one row was
+    /// `nointerpolation` in the source and takes the integer's constant
+    /// mode; rows of floats alone keep theirs.
+    #[test]
+    fn an_output_row_takes_its_integer_elements_mode() {
+        let mut outputs = [
+            el("TEXCOORD", 0, 9, 7, 0, 2),
+            el("TEXCOORD", 0, 5, 7, 2, 2),
+            el("TEXCOORD", 0, 9, 8, 0, 2),
+            el("NORMAL", 0, 9, 8, 2, 2),
+        ];
+        let modes = [2, 1, 2, 2];
+        for (e, m) in outputs.iter_mut().zip(modes) {
+            e.interp = m;
+            e.usage = (1 << e.cols) - 1;
+        }
+        same_mode_per_row(&mut outputs, false);
+        let modes: Vec<u8> = outputs.iter().map(|e| e.interp).collect();
+        assert_eq!(modes, [1, 1, 2, 2]);
+    }
+
+    /// Pixel inputs: an unread float beside the front face takes its
+    /// constant mode; a read float's mode is the interpolation's and stays,
+    /// and a row whose decided modes disagree is left as it is.
+    #[test]
+    fn an_input_row_takes_the_mode_its_read_elements_decided() {
+        let mut inputs = [
+            el("TEXCOORD", 0, 9, 1, 0, 1),
+            el("SV_IsFrontFace", 13, 5, 1, 1, 1),
+            el("TEXCOORD", 0, 9, 2, 0, 3),
+            el("TEXCOORD", 0, 9, 2, 3, 1),
+            el("TEXCOORD", 0, 9, 3, 0, 2),
+            el("TEXCOORD", 0, 5, 3, 2, 1),
+            el("TEXCOORD", 0, 9, 3, 3, 1),
+        ];
+        // (mode, read)
+        let set = [
+            (2, false),
+            (1, true),
+            (4, true),
+            (2, false),
+            (2, true),
+            (1, true),
+            (2, false),
+        ];
+        for (e, (m, read)) in inputs.iter_mut().zip(set) {
+            e.interp = m;
+            e.usage = if read { 1 } else { 0 };
+        }
+        same_mode_per_row(&mut inputs, true);
+        let modes: Vec<u8> = inputs.iter().map(|e| e.interp).collect();
+        assert_eq!(modes, [1, 1, 4, 4, 2, 1, 2]);
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

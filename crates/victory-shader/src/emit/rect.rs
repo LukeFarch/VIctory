@@ -87,6 +87,8 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         };
         e.usage = (1 << e.cols) - 1;
     }
+    // One mode per row, as the vertex shader's outputs get it.
+    super::container::same_mode_per_row(&mut outputs, false);
     let mut s = Shader::new(false);
     s.geometry = Some(Geometry {
         max_vertices: VERTICES,
