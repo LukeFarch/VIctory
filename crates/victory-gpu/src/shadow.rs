@@ -101,11 +101,24 @@ struct Owned {
     asked: u64,
     frame: u64,
     primed: bool,
+    /// With [`merge_unlocked`]: `title` is out for a merge with the lock
+    /// let go; another refresh of the page leaves the page's write to it.
+    merging: bool,
     /// Title memory's bytes of `[lo, hi)` as last taken into the copy, once
     /// the title has written the page: a later title write is merged byte
     /// by byte ([`Shadow::merge_title`]) instead of copying the whole page
     /// over what the card made in it.
     title: Option<Box<[u8]>>,
+}
+
+/// Whether a refresh merges the title's writes into quarantined pages
+/// with the copy's quarantine lock let go (`VICTORY_MERGE_UNLOCKED=1`;
+/// off by default), so that the pieces of one copy cut across threads
+/// (`VICTORY_WIDE_SPLIT_MB`) merge side by side: in run 16 one 90 MiB
+/// copy's merges were 67 of its 70 ms a frame, all under that one lock.
+fn merge_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_UNLOCKED").is_some_and(|v| v == "1"))
 }
 
 /// Since the last memory line: bytes of quarantined pages a refresh left
@@ -2037,7 +2050,7 @@ impl Shadow {
                     o.hi = o.hi.max(hi);
                     o.frame = frame;
                 })
-                .or_insert(Owned { lo, hi, asked, frame, primed: false, title: None });
+                .or_insert(Owned { lo, hi, asked, frame, primed: false, merging: false, title: None });
         }
     }
 
@@ -2065,10 +2078,21 @@ impl Shadow {
         };
         let mut gone = Vec::new();
         let mut kept: Vec<(usize, usize)> = Vec::new();
+        let unlocked = merge_unlocked();
+        // With `merge_unlocked`: (page, lo, since, the title's bytes), merged
+        // once the lock is let go.
+        let mut merges: Vec<(usize, usize, u64, Box<[u8]>)> = Vec::new();
         for (&page, o) in owned.range_mut(range) {
-            if written.get(&page).is_some_and(|&w| w > o.asked) {
+            if o.merging {
+                // Another refresh is merging this page's write: it stays the
+                // card's here, and a later write is merged after that one.
+            } else if written.get(&page).is_some_and(|&w| w > o.asked) {
                 let since = o.asked;
                 o.asked = now;
+                if unlocked && merge() && let Some(before) = o.title.take() {
+                    o.merging = true;
+                    merges.push((page, o.lo, since, before));
+                } else {
                 if !merge() {
                     OWNED[1].fetch_add(1, Ordering::Relaxed);
                     gone.push(page);
@@ -2111,6 +2135,7 @@ impl Shadow {
                         continue;
                     }
                 }
+                }
             }
             if frame.saturating_sub(o.frame) > own_frames() {
                 OWNED[2].fetch_add(1, Ordering::Relaxed);
@@ -2139,7 +2164,58 @@ impl Shadow {
         for page in gone {
             owned.remove(&page);
         }
+        if merges.is_empty() {
+            return kept;
+        }
+        drop(owned);
+        // Each page's bytes are this refresh's alone while `merging` is set:
+        // pages are disjoint, and the card's merges were never under this
+        // lock (they write other bytes of the copy, or wait for the copy's
+        // own locks).
+        let mut done = Vec::with_capacity(merges.len());
+        for (page, lo, since, mut before) in merges {
+            let merged = self.merge_owned(page, lo, since, &mut before);
+            OWNED[4].fetch_add(merged as u64, Ordering::Relaxed);
+            done.push((page, before));
+        }
+        let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        for (page, before) in done {
+            // A page given back meanwhile (and maybe quarantined again, as
+            // new) drops the bytes.
+            if let Some(o) = owned.get_mut(&page)
+                && o.merging
+            {
+                o.merging = false;
+                o.title = Some(before);
+            }
+        }
         kept
+    }
+
+    /// A title write into quarantined page `page` (bytes from `lo`, as kept
+    /// in `before`), merged: the pieces written since asking `since` with
+    /// `VICTORY_MERGE_4K=1`, else all of it.
+    fn merge_owned(&self, page: usize, lo: usize, since: u64, before: &mut [u8]) -> usize {
+        let _m = crate::trace::zone("refresh: merge a title write into a quarantined page");
+        OWNED[1].fetch_add(1, Ordering::Relaxed);
+        let mask = if crate::watch::merge_4k() { crate::watch::pieces_since(page, since) } else { u16::MAX };
+        if mask == u16::MAX {
+            return self.merge_title(lo, before);
+        }
+        let hi = lo + before.len();
+        let mut merged = 0;
+        for k in 0..16 {
+            if mask & (1 << k) == 0 {
+                continue;
+            }
+            let (a, b) = ((page * PAGE + k * 4096).max(lo), (page * PAGE + (k + 1) * 4096).min(hi));
+            if a < b {
+                merged += self.merge_title(a, &mut before[a - lo..b - lo]);
+            }
+        }
+        MERGE_4K[0].fetch_add(1, Ordering::Relaxed);
+        MERGE_4K[1].fetch_add(u64::from(mask.count_ones()), Ordering::Relaxed);
+        merged
     }
 
     /// Title memory from `lo` on (`before.len()` bytes, inside the copy)
