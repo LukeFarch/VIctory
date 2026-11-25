@@ -127,6 +127,18 @@ fn merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUARANTINE_MERGE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a refresh around ranges left to the card (shader writes in the
+/// air, quarantined pages) asks the write watch once for the whole range
+/// and cuts the answer for each gap (`VICTORY_GAPS_ASK_ONCE=1`; off by
+/// default). Each gap asked on its own: with quarantined pages scattered
+/// through a copy that was an asking (and, for view memory, a walk of its
+/// guards) per gap, 105,000 write-watch askings and 76,000 guard walks in
+/// the diner load's 28 s profile (run 2026-11-25_02-15-34).
+fn gaps_ask_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GAPS_ASK_ONCE").is_some_and(|v| v == "1"))
+}
+
 /// Frames a quarantined page stays the card's with no pass marking it
 /// (`VICTORY_QUARANTINE_OWN_FRAMES`, 600). Two gave pages back as the
 /// camera moved and the passes wrote other tiles (lighting test 4: about
@@ -1909,18 +1921,22 @@ impl Shadow {
     /// The ranges of `[from, to)` (title addresses) a refresh leaves to
     /// the card ([`Shadow::gpu_owned`]); gives back the pages the title
     /// wrote or no pass marked lately.
-    fn owned_in(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+    fn owned_in(&self, from: usize, to: usize, asked: &mut Option<(u64, Vec<(usize, u64)>)>) -> Vec<(usize, usize)> {
         let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
         let range = from / PAGE..to.div_ceil(PAGE);
         if owned.range(range.clone()).next().is_none() {
             return Vec::new();
         }
+        let _z = crate::trace::zone("refresh: quarantined pages");
         let frame = crate::frame::current();
-        // The title's writes there, by page, from the write watch.
+        // The title's writes there, by page, from the write watch (kept in
+        // `asked` for the refresh of the gaps, `gaps_ask_once`).
         let (now, written): (u64, BTreeMap<usize, u64>) = if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            crate::watch::writes(from, to, true)
-                .map(|(now, w)| (now, w.into_iter().collect()))
-                .unwrap_or_default()
+            let answer = crate::watch::writes(from, to, true);
+            if gaps_ask_once() {
+                asked.clone_from(&answer);
+            }
+            answer.map(|(now, w)| (now, w.into_iter().collect())).unwrap_or_default()
         } else {
             (0, BTreeMap::new())
         };
@@ -2672,21 +2688,37 @@ impl Shadow {
             .filter(|&(a, e)| a < to && e > from)
             .collect();
         // What quarantined passes made stays as the card has it.
-        busy.extend(self.owned_in(from, to));
+        let mut asked = None;
+        busy.extend(self.owned_in(from, to, &mut asked));
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
+            // With `gaps_ask_once`: one asking for the whole range, its
+            // answer cut for each gap.
+            if gaps_ask_once() && asked.is_none() && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+                asked = crate::watch::writes(from, to, true);
+            }
+            let gap = |a: usize, e: usize| -> usize {
+                match &asked {
+                    Some((now, written)) => {
+                        self.watched.store(1, Ordering::Relaxed);
+                        let lo = written.partition_point(|&(p, _)| p < a / PAGE);
+                        self.copy_stale(a, e, *now, &written[lo..])
+                    }
+                    None => self.update_free(a, e),
+                }
+            };
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += gap(at, a);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += gap(at, to);
             }
             return bytes;
         }
