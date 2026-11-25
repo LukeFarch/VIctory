@@ -66,6 +66,11 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked: the stage is one of the structure
+    /// builder's and the builder is quarantined
+    /// (`crate::pipeline::builder_quarantined`), so what it stores through
+    /// its views is not copied back either.
+    static QUARANTINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether a buffer range a shader names through an unordered access view
@@ -956,8 +961,18 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            // Run L1: the quarantine held back only what a builder stage
+            // stores by address; 205 MB a frame of its stores through views
+            // went into title memory all the same, and the title read a
+            // wild pointer within a minute.
+            let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
+            if quarantined {
+                once!("VICTORY_BVH_QUARANTINE=1: what the structure builder's stages store is not copied back into title memory, by address or through views");
+            }
+            QUARANTINED.set(quarantined);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            QUARANTINED.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 crate::pipeline::note_fault("a draw whose descriptor table found no free slots is dropped");
@@ -2850,7 +2865,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if !QUARANTINED.get() && (STORES.get() || !write_skip()) {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
