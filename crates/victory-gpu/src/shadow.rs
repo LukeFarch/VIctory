@@ -77,6 +77,35 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Ranges (title addresses) a quarantined pass writes
+    /// ([`Shadow::gpu_owned`]): what is there is the card's, and a refresh
+    /// does not copy title memory over it. Each with the write-watch
+    /// asking when it was first marked, the frame it was last marked, and
+    /// whether title memory was copied in once since.
+    owned: Mutex<Vec<Owned>>,
+}
+
+/// See [`Shadow::owned`].
+#[derive(Clone, Copy)]
+struct Owned {
+    from: usize,
+    to: usize,
+    asked: u64,
+    frame: u64,
+    primed: bool,
+}
+
+/// Bytes of quarantined ranges a refresh left as the card had them; such
+/// ranges given back because the title wrote them or no quarantined pass
+/// marked them for two frames; and, with `VICTORY_QUARANTINE_OWN=0`, bytes
+/// of them copied over from title memory all the same. Since the start.
+pub(crate) static OWNED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether ranges quarantined passes write are left to the card
+/// (`VICTORY_QUARANTINE_OWN=0`: not, as before, only counted).
+fn own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUARANTINE_OWN").is_none_or(|v| v != "0"))
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1780,6 +1809,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            owned: Mutex::default(),
         }
     }
 
@@ -1810,6 +1840,71 @@ impl Shadow {
         }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// A quarantined pass (`crate::pipeline::quarantined`) writes
+    /// `[address, address + len)` of the copy, and nothing of it is copied
+    /// back: until the title writes it (or no such pass marks it for two
+    /// frames), a refresh does not copy title memory over what the card
+    /// made there. Before, a refresh in the same or the next frame put the
+    /// title's older bytes back (whole, for a copy not write-watched), and
+    /// the next pass read them: lit, then dark for a frame.
+    pub(crate) fn gpu_owned(&self, address: u64, len: u64) {
+        if self.place.is_some() || len == 0 {
+            return;
+        }
+        let len = len.min(self.left(address));
+        let (from, to) = (address as usize, (address + len) as usize);
+        let frame = crate::frame::current();
+        let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(o) = owned.iter_mut().find(|o| o.from == from && o.to == to) {
+            o.frame = frame;
+            return;
+        }
+        owned.push(Owned { from, to, asked: crate::watch::asking(), frame, primed: false });
+    }
+
+    /// The ranges of `[from, to)` (title addresses) a refresh leaves to
+    /// the card ([`Shadow::gpu_owned`]); gives back those the title wrote
+    /// or no pass marked lately.
+    fn owned_in(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        if owned.is_empty() {
+            return Vec::new();
+        }
+        let frame = crate::frame::current();
+        let watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
+        let mut kept = Vec::new();
+        owned.retain_mut(|o| {
+            if frame.saturating_sub(o.frame) > 2 {
+                OWNED[1].fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            if o.from >= to || o.to <= from {
+                return true;
+            }
+            if !o.primed {
+                // Title memory is copied in once, for the pass's first run.
+                o.primed = true;
+                return true;
+            }
+            if watched
+                && let Some((_, written)) = crate::watch::writes(o.from, o.to, true)
+                && written.iter().any(|&(_, w)| w > o.asked)
+            {
+                OWNED[1].fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            let (a, e) = (o.from.max(from), o.to.min(to));
+            if own() {
+                OWNED[0].fetch_add((e - a) as u64, Ordering::Relaxed);
+                kept.push((a, e));
+            } else {
+                OWNED[2].fetch_add((e - a) as u64, Ordering::Relaxed);
+            }
+            true
+        });
+        kept
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -2453,6 +2548,8 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        // What quarantined passes made stays as the card has it.
+        busy.extend(self.owned_in(from, to));
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the

@@ -6187,6 +6187,16 @@ impl Meter {
             self.logged = std::time::Instant::now();
             crate::budget::line();
             {
+                let [kept, given, over] = crate::shadow::OWNED.each_ref().map(|c| c.load(Ordering::Relaxed));
+                if kept + given + over > 0 {
+                    tracing::info!(
+                        "quarantined ranges, since the start: {} MB left as the card made them at a refresh; {given} given back (the title wrote them, or no pass for two frames); {} MB re-uploaded from title memory over them (VICTORY_QUARANTINE_OWN=0)",
+                        kept >> 20,
+                        over >> 20
+                    );
+                }
+            }
+            {
                 let [guarded, stale] = crate::watch::TWINS.each_ref().map(|c| c.load(Ordering::Relaxed));
                 if guarded + stale > 0 {
                     tracing::info!(

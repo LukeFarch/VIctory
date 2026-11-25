@@ -291,6 +291,12 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     true
 }
 
+/// The number of the latest asking: a page the journal notes written
+/// under a higher one was written after this call.
+pub(crate) fn asking() -> u64 {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked
+}
+
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
 /// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
 /// pages written since tracking began and the asking that last found each
