@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -371,7 +371,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         // SAFETY: the clock's fence and this thread's event.
         unsafe {
             if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+                crate::trace::wait(event);
             }
         }
         seen = target;
@@ -579,6 +579,45 @@ fn create() -> windows::core::Result<Host> {
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+        }
+        // What the card can do toward the console's one memory: the GPU
+        // upload heap (the card's memory, mapped for the CPU: needs Resizable
+        // BAR and the runtime's support), whether the card and the PC share
+        // memory, the opening of existing memory as a heap, and the
+        // adapter's memory. For the unified-memory design; read only.
+        {
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            let gpu_upload = device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32)
+                .is_ok()
+                .then_some(o16.GPUUploadHeapSupported.as_bool());
+            let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+            let uma = device
+                .CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, (&raw mut arch).cast(), size_of_val(&arch) as u32)
+                .is_ok()
+                .then_some((arch.UMA.as_bool(), arch.CacheCoherentUMA.as_bool()));
+            let mut o3 = D3D12_FEATURE_DATA_EXISTING_HEAPS::default();
+            let existing = device
+                .CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, (&raw mut o3).cast(), size_of_val(&o3) as u32)
+                .is_ok()
+                .then_some(o3.Supported.as_bool());
+            let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+                .and_then(|adapter| adapter.GetDesc1());
+            if let Ok(desc) = adapter {
+                let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned();
+                tracing::info!(
+                    adapter = %name,
+                    vram_mb = desc.DedicatedVideoMemory >> 20,
+                    shared_mb = desc.SharedSystemMemory >> 20,
+                    ?gpu_upload,
+                    ?uma,
+                    ?existing,
+                    "host card: what it offers toward one memory (gpu_upload: CPU-visible card memory; uma: (shared, coherent); existing: heaps opened on existing memory)"
+                );
+            } else {
+                tracing::info!(?gpu_upload, ?uma, ?existing, "host card: what it offers toward one memory");
+            }
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -2260,7 +2299,7 @@ pub(crate) fn settle_now(why: usize) {
     let Some(host) = host() else {
         return;
     };
-    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let mut submitted = crate::trace::lock("lock wait: submission", &host.submitted);
     host.settle(&mut submitted, why);
 }
 
@@ -2320,11 +2359,11 @@ fn late_helper() {
         // SAFETY: our fence and event.
         unsafe {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+                crate::trace::wait(event);
             }
         }
         {
-            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut submitted = crate::trace::lock("lock wait: submission", &host.submitted);
             // Something newer went up meanwhile: the card is waited for
             // again, the submitting thread is not held up for it.
             if line().target != target {
@@ -2723,7 +2762,7 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
+                        crate::trace::wait(event);
                     })
                 };
                 if waited.is_err() {
@@ -3306,6 +3345,7 @@ impl Host {
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
     fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+        let _z = crate::trace::zone("card copies: send changed ranges, record compare");
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -3600,6 +3640,7 @@ impl Host {
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
     fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+        let _z = crate::trace::zone("relay: card pieces back (fetch and merge)");
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3686,7 +3727,7 @@ impl Host {
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     fence.SetEventOnCompletion(sent, event)?;
-                    WaitForSingleObject(event, INFINITE);
+                    crate::trace::wait(event);
                     return Ok(landed_as);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -3698,7 +3739,7 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                crate::trace::wait(event);
                 Ok(after)
             })()
         };
@@ -3740,6 +3781,8 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        let mut _z = crate::trace::zone("relay: land flights (copy-back)");
+        _z.arg(items.len() as u64);
         let landing = std::time::Instant::now();
         {
             let flights: Vec<&Flight> = items
@@ -3917,7 +3960,7 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    crate::trace::wait(self.event);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -4093,6 +4136,8 @@ impl Host {
         if !late() {
             return;
         }
+        let mut _z = crate::trace::zone("settle (wait for flights to land)");
+        _z.arg(why as u64);
         if relay() {
             // Nothing is settled here: the thread that lands flights does
             // it, in order, and this waits until nothing is in the air and
@@ -4132,7 +4177,7 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
-                            WaitForSingleObject(self.event, INFINITE);
+                            crate::trace::wait(self.event);
                             stood(waiting);
                             working(true);
                         }
@@ -4234,6 +4279,8 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let mut _z = crate::trace::zone("submit (prepare and send)");
+        _z.arg(runs.len() as u64);
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4243,7 +4290,7 @@ impl Host {
         drain_ahead();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = crate::trace::lock("lock wait: submission", &self.submitted);
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -4417,7 +4464,7 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
-                        WaitForSingleObject(self.event, INFINITE);
+                        crate::trace::wait(self.event);
                         stood(started);
                         working(true);
                     }
@@ -5608,6 +5655,8 @@ impl Batch {
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let mut _z = crate::trace::zone("refresh: one copy");
+        _z.arg((to - from) as u64);
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
@@ -5631,6 +5680,8 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let mut _z = crate::trace::zone("refresh: flush copies");
+        _z.arg(self.refreshes.len() as u64);
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -5713,7 +5764,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = {
+        let mut _z = crate::trace::zone("kernel read of title memory");
+        _z.arg(len as u64);
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6413,6 +6468,8 @@ impl Host {
         frame: u64,
         rect: Option<[u32; 4]>,
     ) -> Option<bool> {
+        crate::trace::present();
+        let _z = crate::trace::zone("present");
         frame_sleep(frame);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };

@@ -91,7 +91,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -145,7 +145,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     if !j.kept {
         j.ahead.clear();
     }
@@ -184,7 +184,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -211,7 +211,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -222,7 +222,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     if !j.kept || len == 0 {
         return;
     }
@@ -262,6 +262,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let mut _z = crate::trace::zone("GetWriteWatch");
+    _z.arg(((last - first) * PAGE) as u64);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -294,7 +296,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// The number of the latest asking: a page the journal notes written
 /// under a higher one was written after this call.
 pub(crate) fn asking() -> u64 {
-    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).asked
+    crate::trace::lock("lock wait: write-watch journal", &JOURNAL).asked
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -304,7 +306,7 @@ pub(crate) fn asking() -> u64 {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -320,7 +322,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     let j = &mut *j;
     // `VICTORY_FULL_REFRESH=1`: every page asked about counts as written,
     // so every host copy is brought up to date whole each time it is used
@@ -348,6 +350,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let mut _z = crate::trace::zone("GetWriteWatch");
+    _z.arg(((last - first) * PAGE) as u64);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -420,13 +424,15 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    crate::trace::lock("lock wait: guards", &GUARDS)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    let mut _z = crate::trace::zone("guard: view memory check");
+    _z.arg((end - start) as u64);
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -544,6 +550,8 @@ fn is_view(start: usize, end: usize) -> bool {
 /// block by block if they span views, leaving out any that fail, and
 /// noting those not committed (unmapped) absent.
 fn protect(g: &mut Guards, from: usize, to: usize) {
+    let mut _z = crate::trace::zone("VirtualProtect: guard (read-only)");
+    _z.arg((to - from) as u64);
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -719,6 +727,7 @@ pub(crate) struct OwnWrite {
 /// 1,000 blocks a frame, about 70 of the 160 MB the frame line calls
 /// "copies".
 pub(crate) fn own_write_begin(at: usize, len: usize) -> OwnWrite {
+    let _z = crate::trace::zone("copy-back: open guarded blocks");
     let end = at.saturating_add(len);
     let blocks: Vec<usize> = {
         // Not `open`: the other addresses of these bytes are told at the
@@ -743,6 +752,7 @@ pub(crate) fn own_write_begin(at: usize, len: usize) -> OwnWrite {
 /// ([`crate::shadow::Shadow`]'s settling). A title write after this call
 /// faults into the guard, or sets the kernel's bit, as any other.
 pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
+    let _z = crate::trace::zone("copy-back: guard again, note written");
     if w.len == 0 {
         return None;
     }
@@ -773,7 +783,7 @@ pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
             i = j;
         }
     }
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     j.asked += 1;
     let now = j.asked;
     for &block in w.blocks.iter().chain(&twins) {
@@ -879,7 +889,8 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
+        // Not `guards()`: nothing recorded in the exception handler.
+        let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
