@@ -5813,7 +5813,8 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             read_pieces(at, to, remaining);
             break;
         }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+        // A block the read census watches is opened and read, not zeros.
+        if info.State != MEM_COMMIT || (info.Protect == PAGE_NOACCESS && !crate::watch::census_open(at as usize, n)) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -5859,7 +5860,13 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    if unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 } {
+        return true;
+    }
+    // A copied-back block the read census watches: opened, and read again.
+    // SAFETY: as above.
+    crate::watch::census_open(src as usize, len)
+        && unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -6241,6 +6248,7 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             crate::budget::line();
+            crate::watch::census_line();
             {
                 // Whether the lighting was fed: its passes ran, not dropped.
                 let [traced, untraced, built, unbuilt, blocked] = crate::pipeline::take_fed();

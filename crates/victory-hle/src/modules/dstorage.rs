@@ -983,6 +983,9 @@ fn read_bounced(
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
     let (start, end) = (out.as_ptr() as usize, out.as_ptr() as usize + out.len());
+    // Opened first: a block the read census (`VICTORY_READ_CENSUS`) left
+    // with no access since is memory we can write all the same.
+    victory_gpu::kernel_will_write(start, out.len());
     let mut at = start;
     while at < end {
         // SAFETY: plain data filled in by the query.
