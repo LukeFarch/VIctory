@@ -159,7 +159,7 @@ fn submit_cut(this: This, lists: &[This]) {
         // from the title's lists (which it may reset before they have run)
         // and come back, with their tables' slots, when they are settled.
         let (taken, order) = crate::list::detach(&lists[..first]);
-        host.execute_late(taken, order);
+        crate::host::send_late(host, taken, order);
     } else if first > 0 {
         let now: Vec<_> = lists[..first]
             .iter()
@@ -374,7 +374,7 @@ pub(crate) fn release_held(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            host.execute_late(lists, order);
+                            crate::host::send_late(host, lists, order);
                         } else {
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
@@ -803,6 +803,10 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    // What the submission thread still holds goes to the card before the
+    // frame is shown (`crate::host::ahead`).
+    #[cfg(windows)]
+    crate::host::drain_ahead();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -955,6 +959,11 @@ extern "system" fn copy_page_mappings(
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
+    // Submissions given before it are prepared on the pages as they were
+    // mapped then (`crate::host::ahead`: they read title memory when the
+    // submission thread prepares them).
+    #[cfg(windows)]
+    crate::host::drain_ahead();
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }

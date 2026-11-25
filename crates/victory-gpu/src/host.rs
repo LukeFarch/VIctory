@@ -1,9 +1,10 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap
-//! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
-//! overlap them with per-submission fences once more than clears run.
+//! By default CPU and GPU overlap ([`pipelined`]): the title's submissions
+//! are prepared on a thread of their own ([`ahead`]), sent without a wait
+//! ([`late`]) and copied back by another ([`relay`]).
+//! `VICTORY_PIPELINE=0` waits for every submission, as before.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -153,7 +154,9 @@ fn sweep() {
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
+    // Submissions the submission thread holds ([`ahead`]) count as started:
+    // their lists were recorded before the title let go.
+    let started = STARTED.load(Ordering::Acquire) + AHEAD_RUNS.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
@@ -1621,8 +1624,8 @@ impl Drop for Deferred {
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
-/// (`VICTORY_LATE_WAIT=1`; off by default, and off in the timing run, which
-/// waits for every list on its own).
+/// (`VICTORY_LATE_WAIT=1`; on by default at stage 3, [`pipelined`]; off in
+/// the timing run, which waits for every list on its own).
 ///
 /// Every submission was prepared, sent, waited for and copied back before
 /// the next one was looked at, so the card stood idle while we prepared
@@ -1671,7 +1674,26 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// Whether CPU and GPU overlap by default: submissions are sent ahead at
+/// stage 3 ([`late_free_present`]), what shaders wrote is copied back by
+/// the relay at its second stage ([`relay_exact`]), and the title's
+/// submissions are prepared on a thread of their own ([`ahead`]).
+/// `VICTORY_PIPELINE=0` turns all of it off at once: every submission is
+/// prepared, sent, waited for and copied back on the title's thread, as
+/// before. The single switches (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`,
+/// `VICTORY_SUBMIT_THREAD`) still say otherwise when they are set. Off
+/// in the timing run (`VICTORY_GPU_TIMING`), which waits for every list.
+pub(crate) fn pipelined() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_GPU_TIMING").is_none()
+            && std::env::var_os("VICTORY_PIPELINE").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_LATE_WAIT").is_none_or(|v| v != "0")
+    })
+}
+
+/// `VICTORY_LATE_WAIT`: 0 (off), 1, 2 ([`late_exact`]) or 3
+/// ([`late_free_present`]); unset, 3 if [`pipelined`].
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -1684,6 +1706,8 @@ fn late_stage() -> u8 {
             Ok("3") => 3,
             // The relay alone: on top of stage 3.
             Err(_) if crate::shadow::relay() => 3,
+            // Unset: stage 3, the default ([`pipelined`]).
+            Err(_) if pipelined() => 3,
             _ => 0,
         }
     })
@@ -1730,7 +1754,7 @@ pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
 
-/// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
+/// The relay's first stage (`VICTORY_RELAY=1`; by default the second, [`pipelined`]; it turns
 /// [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
 /// and is off with it, in the timing run and with kept snapshots).
 ///
@@ -1775,7 +1799,8 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    // Unset: the second stage, by default ([`pipelined`]).
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -2124,6 +2149,20 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if !late() {
         return false;
     }
+    // Behind what the submission thread still holds ([`ahead`]).
+    if ahead_signal(fence, value) {
+        LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    late_signal_line(fence, value)
+}
+
+/// [`late_signal`] once the line of [`ahead`] is past: behind the flights
+/// in the air, if any.
+fn late_signal_line(fence: usize, value: u64) -> bool {
+    if !late() {
+        return false;
+    }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
         return false;
@@ -2146,6 +2185,9 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
 /// the value in a way not known here (shaders, a timestamp, another
 /// width), they are settled and memory is asked again.
 pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
+    // The writes of submissions still in the line of [`ahead`] are not in
+    // the line of flights yet.
+    drain_ahead();
     let (address, bytes) = wait.place();
     {
         let line = line();
@@ -2186,6 +2228,8 @@ pub(crate) fn settle_now(why: usize) {
     if !late() {
         return;
     }
+    // What the submission thread holds goes to the card first.
+    drain_ahead();
     let Some(host) = host() else {
         return;
     };
@@ -2291,6 +2335,243 @@ fn late_threads() {
             );
         }
     });
+}
+
+/// Whether the title's submissions are prepared on a thread of their own
+/// (`VICTORY_SUBMIT_THREAD`; on with [`late`] unless `0`).
+///
+/// With [`late`] alone the card runs while we prepare, but the preparing
+/// (title memory copied into host copies, textures detiled, snapshots,
+/// sends to copies in the card's memory) is still done on the title's own
+/// thread, inside its call to execute: the title stands while we prepare
+/// frame N and only then goes on to its work for frame N + 1. In run 23
+/// that preparing was 105 to 237 ms of every frame.
+///
+/// With the switch the title's call hands the detached lists to a line
+/// ([`AHEAD`]) and returns; one thread of ours ([`ahead_worker`]) takes
+/// them in the order given and sends them as [`Host::execute_late`] did.
+/// So three things run at once: the title on its threads, our preparing
+/// on this one, and the card on what went before.
+///
+/// What keeps the order: one thread takes the line, in order; a fence
+/// signal given while the line holds something joins the line behind it
+/// ([`late_signal`]), so the title is never told a fence before the work
+/// in front of it was even sent; and every place that can observe what a
+/// submission did, or sends work of its own, first waits until the line
+/// is empty ([`drain_ahead`]): a synchronous submission (read-backs,
+/// maps, clears, uploads, the present's copy), a settle (a present, a
+/// blocking fence wait), and a queue's look at a memory value
+/// ([`late_met`]). Objects the title lets go of wait for the submissions
+/// still in the line as well as those started ([`retire`]).
+///
+/// What it assumes beyond [`late`]: title memory a list reads is read when
+/// we prepare it, a little later than at the title's call; the title is
+/// told nothing (fences, bottom-of-pipe writes) before then, so memory it
+/// may rewrite only after being told is read as it was. That is when the
+/// console's card reads it too.
+pub(crate) fn ahead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| late() && std::env::var_os("VICTORY_SUBMIT_THREAD").is_none_or(|v| v != "0"))
+}
+
+/// The most submissions the line of [`ahead`] holds before the title's
+/// call waits for room (`VICTORY_SUBMIT_AHEAD`, 64): what they hold (host
+/// lists, descriptor slots) is held until they have run.
+fn ahead_most() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SUBMIT_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64).max(1)
+    })
+}
+
+/// One thing in the line of [`ahead`].
+enum Job {
+    /// A queue's submission: the detached host lists and their order.
+    Run(Vec<crate::list::Detached>, Vec<usize>),
+    /// A queue's fence signal (fence, value), due behind what is before it.
+    Signal(usize, u64),
+}
+
+struct Ahead {
+    jobs: std::collections::VecDeque<Job>,
+    /// The thread has taken a job and not finished it.
+    busy: bool,
+}
+// SAFETY: as for [`Line`]: detached host lists (D3D12 objects, which are
+// free-threaded, and what they hold), taken by one thread at a time under
+// the line's lock.
+unsafe impl Send for Ahead {}
+
+/// The line of [`ahead`].
+static AHEAD: Mutex<Ahead> = Mutex::new(Ahead {
+    jobs: std::collections::VecDeque::new(),
+    busy: false,
+});
+/// Told when a job joins [`AHEAD`].
+static AHEAD_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+/// Told when a job has been taken or finished.
+static AHEAD_DONE: std::sync::Condvar = std::sync::Condvar::new();
+/// Submissions in [`AHEAD`] not finished being sent yet: [`retire`] counts
+/// them as started.
+static AHEAD_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Since the last frame-rate line: submissions given to the line, the
+/// microseconds callers waited for it to empty ([`drain_ahead`]), the
+/// times they did, and the microseconds the title waited for room.
+static AHEAD_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+thread_local! {
+    /// This thread is the one that takes the line of [`ahead`].
+    static ON_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn on_ahead() -> bool {
+    ON_AHEAD.with(|on| on.get())
+}
+
+fn ahead_line() -> std::sync::MutexGuard<'static, Ahead> {
+    AHEAD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A queue's submission of detached host lists, sent ahead ([`late`]): to
+/// the line of [`ahead`] if it is on, else at once ([`Host::execute_late`]).
+/// On the line's own thread (a signal it set let a held submission go) it
+/// is sent at once: that is its place in the order.
+pub(crate) fn send_late(host: &Host, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+    if !ahead() || on_ahead() || order.is_empty() {
+        host.execute_late(lists, order);
+        return;
+    }
+    ahead_threads();
+    let mut line = ahead_line();
+    if line.jobs.len() >= ahead_most() {
+        let waiting = std::time::Instant::now();
+        while line.jobs.len() >= ahead_most() {
+            line = AHEAD_DONE.wait(line).unwrap_or_else(|e| e.into_inner());
+        }
+        AHEAD_STATS[3].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    AHEAD_RUNS.fetch_add(1, Ordering::AcqRel);
+    AHEAD_STATS[0].fetch_add(1, Ordering::Relaxed);
+    line.jobs.push_back(Job::Run(lists, order));
+    drop(line);
+    AHEAD_MOVED.notify_one();
+}
+
+/// A fence signal behind what the line of [`ahead`] holds: it joins the
+/// line, and true. False if the line is empty and idle.
+fn ahead_signal(fence: usize, value: u64) -> bool {
+    if !ahead() || on_ahead() {
+        return false;
+    }
+    let mut line = ahead_line();
+    if line.jobs.is_empty() && !line.busy {
+        return false;
+    }
+    line.jobs.push_back(Job::Signal(fence, value));
+    drop(line);
+    AHEAD_MOVED.notify_one();
+    true
+}
+
+/// Waits until the line of [`ahead`] is empty and its thread idle: what
+/// the title gave before now has been sent to the card (not run: that is
+/// what a settle waits for). Nothing on the line's own thread.
+pub(crate) fn drain_ahead() {
+    if !ahead() || on_ahead() {
+        return;
+    }
+    let mut line = ahead_line();
+    if line.jobs.is_empty() && !line.busy {
+        return;
+    }
+    let waiting = std::time::Instant::now();
+    while !line.jobs.is_empty() || line.busy {
+        line = AHEAD_DONE.wait(line).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(line);
+    AHEAD_STATS[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+    AHEAD_STATS[2].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Starts the thread of [`ahead`], once.
+fn ahead_threads() {
+    static STARTED_ONCE: std::sync::Once = std::sync::Once::new();
+    STARTED_ONCE.call_once(|| {
+        late_threads();
+        match std::thread::Builder::new().name("victory-submit".into()).spawn(ahead_worker) {
+            Ok(_) => tracing::info!(
+                most = ahead_most(),
+                "the title's submissions are prepared and sent by a thread of their own (VICTORY_SUBMIT_THREAD=0 turns it off)"
+            ),
+            Err(e) => fail(format_args!("no thread to prepare the title's submissions (VICTORY_SUBMIT_THREAD=0 runs without): {e}")),
+        }
+    });
+}
+
+/// The thread of [`ahead`]: takes the line in order and sends each
+/// submission as the title's call did before it.
+fn ahead_worker() {
+    ON_AHEAD.with(|on| on.set(true));
+    let Some(host) = host() else {
+        return;
+    };
+    loop {
+        let job = {
+            let mut line = ahead_line();
+            loop {
+                if let Some(job) = line.jobs.pop_front() {
+                    line.busy = true;
+                    break job;
+                }
+                if line.busy {
+                    line.busy = false;
+                    AHEAD_DONE.notify_all();
+                }
+                line = AHEAD_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        // Room in the line for a title that waits for it.
+        AHEAD_DONE.notify_all();
+        match job {
+            Job::Run(lists, order) => {
+                host.execute_late(lists, order);
+                // Only now: until it has started, [`retire`] counts it here.
+                AHEAD_RUNS.fetch_sub(1, Ordering::AcqRel);
+            }
+            Job::Signal(fence, value) => {
+                if !late_signal_line(fence, value) {
+                    crate::fence::set(fence as crate::object::This, value);
+                }
+            }
+        }
+        // What it sent or set may be what a queue waits for. The thread
+        // that settles looks (`crate::queue::release_held`), not this one:
+        // whoever releases may be waiting here for this line to empty
+        // ([`drain_ahead`] from [`late_met`]) while holding the release.
+        poke_helper();
+    }
+}
+
+/// Has the thread that settles ([`late_helper`]) look at what queues hold.
+fn poke_helper() {
+    line().poke = true;
+    LINE_MOVED.notify_one();
+}
+
+/// For the frame-rate line: what the line of [`ahead`] did per frame.
+fn ahead_line_stats(frames: f64) {
+    if !ahead() {
+        return;
+    }
+    let a: Vec<f64> = AHEAD_STATS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "the submission thread per frame (VICTORY_SUBMIT_THREAD): {:.1} submissions handed to it; callers waited {:.1} ms          in {:.1} waits for it to send what it held (a present, a synchronous submission, a fence or memory value looked at);          the title waited {:.1} ms for room in its line ({} at most)",
+        a[0],
+        a[1] / 1000.0,
+        a[2],
+        a[3] / 1000.0,
+        ahead_most(),
+    );
 }
 
 /// With [`relay`]: waits until `done` says so of the line, looked at each
@@ -3857,6 +4138,9 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        // Work of ours, or a wait for the card: behind what the title gave
+        // the submission thread ([`ahead`]), never ahead of it.
+        drain_ahead();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -5682,6 +5966,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        ahead_line_stats(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
