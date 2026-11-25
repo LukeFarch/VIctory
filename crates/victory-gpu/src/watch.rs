@@ -89,11 +89,21 @@ pub(crate) fn merge_4k() -> bool {
 
 /// Notes the kernel's answer `at` (a written 4 KiB page) under `now`.
 fn note_piece(j: &mut Journal, at: usize, now: u64) {
+    note_bits(j, at / PAGE, 1u16 << ((at % PAGE) / KERNEL_PAGE), now);
+}
+
+/// A write to page `page` that no kernel answer pins to 4 KiB pieces (the
+/// views' answers, the guards', ours): every piece, so a later or same
+/// asking's narrower answer cannot hide it from `pieces_since`.
+fn note_whole(j: &mut Journal, page: usize, now: u64) {
+    note_bits(j, page, u16::MAX, now);
+}
+
+fn note_bits(j: &mut Journal, page: usize, bit: u16, now: u64) {
     if !merge_4k() {
         return;
     }
-    let bit = 1u16 << ((at % PAGE) / KERNEL_PAGE);
-    let hist = j.pieces.entry(at / PAGE).or_insert([(0, 0); PIECE_HISTORY]);
+    let hist = j.pieces.entry(page).or_insert([(0, 0); PIECE_HISTORY]);
     if hist[0].0 == now {
         hist[0].1 |= bit;
         return;
@@ -334,6 +344,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         if let Some(pages) = pages {
             for page in pages {
                 j.written.insert(page, now);
+                note_whole(j, page, now);
             }
             j.ahead.push((first, last));
         }
@@ -363,6 +374,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     let now = j.asked;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
+        note_whole(&mut j, page, now);
     }
 }
 
@@ -639,16 +651,16 @@ fn writes_unlocked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<
         let j = &mut *j;
         j.asked += 1;
         let now = j.asked;
-        for page in found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
+        for page in found[..count].iter().map(|&at| at / PAGE) {
             j.written.insert(page, now);
         }
         for &at in &found[..count] {
             note_piece(j, at, now);
         }
-        if full {
-            for page in first..last {
-                j.written.insert(page, now);
-            }
+        // The guards' pages and an answer that overflowed: no 4 KiB pieces known.
+        for page in guarded.into_iter().chain(if full { first..last } else { 0..0 }) {
+            j.written.insert(page, now);
+            note_whole(j, page, now);
         }
         from_journal(j, now)
     })
@@ -721,7 +733,7 @@ fn writes_locked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(u
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+    let pages = j.found[..count].iter().map(|&at| at / PAGE);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
@@ -729,10 +741,10 @@ fn writes_locked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(u
         let at = j.found[k];
         note_piece(j, at, now);
     }
-    if full {
-        for page in first..last {
-            j.written.insert(page, now);
-        }
+    // The guards' pages and an answer that overflowed: no 4 KiB pieces known.
+    for page in guarded.into_iter().chain(if full { first..last } else { 0..0 }) {
+        j.written.insert(page, now);
+        note_whole(j, page, now);
     }
     Some((
         now,
@@ -1137,6 +1149,7 @@ pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
     for &block in w.blocks.iter().chain(&twins) {
         for page in block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE {
             j.written.insert(page, now);
+            note_whole(&mut j, page, now);
         }
     }
     Some(now)
@@ -1437,6 +1450,7 @@ pub(crate) fn resident_merge(at: usize, n: usize, merge: impl FnOnce(&mut [u8]) 
     let now = j.asked;
     for page in at / PAGE..(at + n).div_ceil(PAGE) {
         j.written.insert(page, now);
+        note_whole(&mut j, page, now);
     }
     Kept::At(now)
 }
