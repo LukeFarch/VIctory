@@ -16,7 +16,7 @@
 //! logged. Zero misses over a run is the gate for step 2 (the marks
 //! replace the compare).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -57,7 +57,7 @@ struct Dirty {
         ),
     >,
     /// Page → the latest landed submission that marked it.
-    marked: HashMap<u32, u64>,
+    marked: BTreeMap<u32, u64>,
     /// The latest submission landed.
     landed: u64,
     /// Submissions whose marks are not all there (a store the translator
@@ -75,8 +75,10 @@ static DIRTY: Mutex<Option<Dirty>> = Mutex::new(None);
 /// them submissions not all marked (stores not placed), list overflows;
 /// pages' bytes the card changed, checked; of them in pages marked, in
 /// pages not marked (misses), not marked while a recent submission had
-/// unplaced stores; miss runs.
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// unplaced stores; miss runs. Step 2: copy-backs that looked everywhere
+/// (marks not trusted), that looked at marked pages only, the bytes they
+/// were declared over and the bytes they looked at.
+static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Dirty>> {
     DIRTY.lock().unwrap_or_else(|e| e.into_inner())
@@ -106,7 +108,7 @@ pub(crate) fn mask(host: &Host) -> Option<u64> {
             free: Vec::new(),
             lists: Vec::new(),
             out: HashMap::new(),
-            marked: HashMap::new(),
+            marked: BTreeMap::new(),
             landed: 0,
             blind_until: 0,
         });
@@ -220,10 +222,46 @@ pub(crate) fn landed(number: u64) {
     d.free.push(back);
     d.lists.push(list);
     // Old marks go now and then.
-    if d.marked.len() > 1 << 20 {
+    if d.marked.len() > 1 << 18 {
         let keep_from = d.landed.saturating_sub(KEEP);
         d.marked.retain(|_, &mut n| n >= keep_from);
     }
+}
+
+/// Step 2 (`VICTORY_DIRTY_MASK=1`): the runs of 4 KiB pages of title
+/// memory `[from, to)` that submissions landed lately marked, as title
+/// address ranges cut to `[from, to)`; the copy-back looks only there for
+/// what the card changed. `None` (look everywhere, as before) when the
+/// marks are not relied on, or a submission landed lately ran a store the
+/// translator could not place or overflowed its list.
+pub(crate) fn marked_in(from: usize, to: usize) -> Option<Vec<(usize, usize)>> {
+    if mode() != 2 || from >= to {
+        return None;
+    }
+    let g = lock();
+    let d = g.as_ref()?;
+    let since = d.landed.saturating_sub(KEEP);
+    if d.blind_until > 0 && d.blind_until >= since {
+        STATS[9].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let last = victory_shader::emit::DIRTY_PAGES - 1;
+    let (first_page, last_page) = (((from >> 12) as u32).min(last), (((to - 1) >> 12) as u32).min(last));
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (&page, &k) in d.marked.range(first_page..=last_page) {
+        if k < since {
+            continue;
+        }
+        let (a, b) = (((page as usize) << 12).max(from), (((page as usize) + 1) << 12).min(to));
+        match runs.last_mut() {
+            Some(r) if r.1 == a => r.1 = b,
+            _ => runs.push((a, b)),
+        }
+    }
+    STATS[10].fetch_add(1, Ordering::Relaxed);
+    STATS[11].fetch_add((to - from) as u64, Ordering::Relaxed);
+    STATS[12].fetch_add(runs.iter().map(|r| (r.1 - r.0) as u64).sum(), Ordering::Relaxed);
+    Some(runs)
 }
 
 /// Count only: at title address `at` the card's bytes are `now`, the
@@ -292,7 +330,7 @@ pub(crate) fn line() {
     let s: Vec<u64> = STATS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
     let sites = &victory_shader::emit::DIRTY_SITES;
     tracing::info!(
-        "dirty pages since the last such line: {} submissions read, {} pages marked ({:.1} MB); {} not all marked (a store not placed ran), {} list overflows; pages the card changed, checked: {:.2} MB, {:.2} MB of them in marked pages, {:.2} MB in pages not marked (misses, {} runs), {:.2} MB not marked while stores not placed ran; store sites translated: {} placed, {} not",
+        "dirty pages since the last such line: {} submissions read, {} pages marked ({:.1} MB); {} not all marked (a store not placed ran), {} list overflows; pages the card changed, checked: {:.2} MB, {:.2} MB of them in marked pages, {:.2} MB in pages not marked (misses, {} runs), {:.2} MB not marked while stores not placed ran; store sites translated: {} placed, {} not; copy-back by marks (VICTORY_DIRTY_MASK=1): {} ranges looked at marked pages only ({:.1} MB declared, {:.1} MB looked at), {} looked everywhere (marks not all there)",
         s[0],
         s[1],
         s[1] as f64 * 4096.0 / 1e6,
@@ -305,5 +343,9 @@ pub(crate) fn line() {
         s[7] as f64 / 1e6,
         sites[0].load(Ordering::Relaxed),
         sites[1].load(Ordering::Relaxed),
+        s[10],
+        s[11] as f64 / 1e6,
+        s[12] as f64 / 1e6,
+        s[9],
     );
 }
