@@ -188,17 +188,23 @@ const LOADING_FRAME: Duration = Duration::from_secs(4);
 /// floor, ceiling and faces (they never came back).
 const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
 
-/// `VICTORY_PIPELINE_GATE_S`: the bound on all of them in seconds (unset or
-/// 0: none of them; a 10 s wait made frames of 11 to 23 s here, run 11).
-fn loading_left(spent: Duration) -> Duration {
-    static TOTAL: OnceLock<Duration> = OnceLock::new();
-    let total = *TOTAL.get_or_init(|| {
-        let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
+/// `VICTORY_PIPELINE_GATE_S`: the bound on all of them in seconds (0: none
+/// of them). Unset: 120 for compute pipelines, none for the others. A pass
+/// the title dispatches once is lost for the run if its pipeline is still
+/// being made, and the fast build reached those passes before the driver
+/// had made them: its prison cell had no walls where the slower diagnostics
+/// build of the same commit drew them (runs 29b and 29g). A draw comes
+/// again in the next frame, so graphics pipelines are not waited for (a
+/// 10 s wait for all of them made frames of 11 to 23 s here, run 11).
+fn loading_left(spent: Duration, compute: bool) -> Duration {
+    static TOTAL: OnceLock<Option<Duration>> = OnceLock::new();
+    let set = *TOTAL.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_GATE_S")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        Duration::from_secs(seconds)
+            .map(Duration::from_secs)
     });
+    let total = set.unwrap_or(if compute { Duration::from_secs(120) } else { Duration::ZERO });
     total.saturating_sub(spent)
 }
 
@@ -281,7 +287,7 @@ fn wait(p: &Pending, frame: u64) {
     static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let compute = p.computes();
     let past_total = &LOADINGS[usize::from(compute)];
-    let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
+    let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)), compute);
     let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
