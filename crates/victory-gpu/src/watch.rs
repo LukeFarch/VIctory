@@ -1523,7 +1523,10 @@ pub(crate) fn resident_read(at: usize, dst: *mut u8, len: usize) -> bool {
 /// [`resident`]: our kernel read of `[at, at + len)` failed; kept blocks
 /// there are written in (true if any was: the read is worth trying again).
 pub(crate) fn resident_open(at: usize, len: usize) -> bool {
-    if !resident() || RESIDENT_N.load(std::sync::atomic::Ordering::Acquire) == 0 || len == 0 {
+    // Asked of every texture's memory before it is read: the guards' lock
+    // only when a kept block is there (run 13: 2,250 asks a frame took it,
+    // and the guards' lock waited 425 ms a frame behind them).
+    if !resident_holds(at, len) {
         return false;
     }
     let _z = crate::trace::zone("card resident: our read writes kept blocks in");
