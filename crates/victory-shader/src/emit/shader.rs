@@ -549,6 +549,11 @@ impl Shader {
                 }
             }
         }
+        // `globallycoherent` on unordered views (`emit::uav_coherent`).
+        let coherent = match super::uav_coherent() {
+            0 => false,
+            mode => self.m.coherent_uavs(mode == 2),
+        };
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -662,6 +667,13 @@ impl Shader {
                 } else {
                     no
                 };
+                // As the handles are annotated.
+                let globally_coherent = if coherent {
+                    let yes = self.m.bool(true);
+                    self.m.md_value(yes)
+                } else {
+                    no
+                };
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -675,7 +687,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(globally_coherent),
                         Some(no),
                         Some(rov),
                         None,

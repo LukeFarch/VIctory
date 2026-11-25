@@ -84,6 +84,8 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 // And the fast-math flags on float arithmetic (`VICTORY_SHADER_FAST`).
                 bytes.push(victory_shader::emit::fast_math());
+                // And which unordered views are globally coherent (`VICTORY_UAV_COHERENT`).
+                bytes.push(victory_shader::emit::uav_coherent());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

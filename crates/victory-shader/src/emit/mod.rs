@@ -218,6 +218,37 @@ pub fn fast_math() -> u8 {
     *FLAGS.get_or_init(|| parse_fast_math(std::env::var("VICTORY_SHADER_FAST").ok().as_deref()))
 }
 
+/// Which unordered views a translation declares `globallycoherent`
+/// (D3D12: their stores are seen by every thread group of the dispatch
+/// before a later read, not only within the group). The console's caches
+/// are written through to memory that every group reads; a host view
+/// without the flag may keep a group's writes in its own cache, so a
+/// group that reads what another group wrote can read old data.
+/// `VICTORY_UAV_COHERENT`:
+/// - unset or `0`: none, as before.
+/// - `1`: every unordered view of a program that runs an atomic on one,
+///   or both reads and writes unordered views (a group may read what
+///   another group of the dispatch wrote).
+/// - `2`: every unordered view of every program.
+///
+/// Costs: such stores and loads bypass the card's per-group cache, so
+/// programs that write a lot get slower. Part of the translation: the
+/// shader cache keys on it (`victory-gpu`'s does).
+pub fn uav_coherent() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_uav_coherent(std::env::var("VICTORY_UAV_COHERENT").ok().as_deref()))
+}
+
+/// `VICTORY_UAV_COHERENT`'s value; 0 unless it is `1` or `2`. Pure, for
+/// testing.
+fn parse_uav_coherent(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
 /// `VICTORY_SHADER_FAST`'s value; 0 when it is unset or unreadable. Pure,
 /// for testing.
 fn parse_fast_math(value: Option<&str>) -> u8 {
@@ -856,6 +887,15 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn uav_coherent_switch_takes_1_or_2() {
+        assert_eq!(parse_uav_coherent(None), 0);
+        assert_eq!(parse_uav_coherent(Some(" 1 ")), 1);
+        assert_eq!(parse_uav_coherent(Some("2")), 2);
+        assert_eq!(parse_uav_coherent(Some("3")), 0);
+        assert_eq!(parse_uav_coherent(Some("on")), 0);
+    }
 
     #[test]
     fn fast_math_switch_parses_flag_bits() {
