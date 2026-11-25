@@ -1170,12 +1170,24 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    // For the trace: the submission the jobs are for, and when they were
+    // queued (each job's wait for a thread is a span of the thread that
+    // takes it, numbered with the submission).
+    let submission = PREPARED.load(Ordering::Relaxed);
+    let queued = std::time::Instant::now();
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
             queue.push_back(Box::new(move || {
+                {
+                    let mut _w = crate::trace::zone_from("wide: a job's wait for a thread", queued);
+                    _w.arg(submission);
+                }
+                let mut _j = crate::trace::zone("wide: a job");
+                _j.arg(submission);
                 job();
+                drop(_j);
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
@@ -1192,6 +1204,8 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
+    let mut _z = crate::trace::zone("wide: waiting for the other threads' jobs");
+    _z.arg(submission);
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());

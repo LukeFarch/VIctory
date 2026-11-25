@@ -221,6 +221,13 @@ pub(crate) fn zone(name: &'static str) -> Zone {
     Zone { name, start: on().then(Instant::now), arg: 0 }
 }
 
+/// A span named `name` on this thread that began at `start` (a wait that
+/// is only known to have been one once it is over).
+#[inline]
+pub(crate) fn zone_from(name: &'static str, start: Instant) -> Zone {
+    Zone { name, start: on().then_some(start), arg: 0 }
+}
+
 /// Takes `lock`, recording the wait for it as a span named `name` when
 /// the wait was 20 microseconds or more.
 #[inline]

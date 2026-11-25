@@ -2247,6 +2247,25 @@ fn late_writes() -> bool {
 /// (address, end).
 type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 
+/// Submissions that went to the card after a later one ([`Host::submit_send`]):
+/// should stay 0, and the frame line says so when it does not.
+static OUT_OF_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`Host::submit_prepare`] leaves for [`Host::submit_send`].
+struct Prepared {
+    late: bool,
+    lists: Vec<Option<ID3D12CommandList>>,
+    /// Where each run's lists start in `lists`.
+    firsts: Vec<usize>,
+    /// The time settles took inside the preparing.
+    settled: std::time::Duration,
+    this_submission: u64,
+    started: std::time::Instant,
+    was_working: bool,
+    #[cfg(feature = "diagnostics")]
+    lock: u64,
+}
+
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
 struct Sent {
@@ -2710,6 +2729,36 @@ pub(crate) fn ahead() -> bool {
     *ON.get_or_init(|| late() && std::env::var_os("VICTORY_SUBMIT_THREAD").is_some_and(|v| v == "1"))
 }
 
+/// Whether a submission is split between the title's thread and the
+/// submission thread of [`ahead`] (`VICTORY_SUBMIT_SPLIT=1`, with [`late`];
+/// off by default; not with `VICTORY_SUBMIT_THREAD=1`).
+///
+/// `VICTORY_SUBMIT_THREAD=1` gave the whole submission to that thread, and
+/// run 30 drew cloth with vertices of two frames: the title rewrites what a
+/// list reads right after its call returns, and the thread read it later.
+/// With this switch the title's thread does at its call everything that
+/// reads title memory ([`Host::submit_prepare`]: the lists' steps, the
+/// refreshes, the snapshots) and returns; the submission thread sends the
+/// copies in the card's memory and the lists ([`Host::submit_send`]) and
+/// puts the flight in the line, while the title goes on.
+///
+/// Order: the next submission's preparing waits until the thread has sent
+/// this one ([`drain_ahead`], first thing in `submit_prepare`), so host
+/// copies and the card copies' changed ranges are only ever taken by one
+/// submission at a time, in order, as before. Every place that waits for
+/// what was submitted (fence waits, memory value waits, settles, a
+/// present) already empties the line first. What overlaps is the title's
+/// own work between its calls with our sending of the one before.
+pub(crate) fn split() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| late() && !ahead() && std::env::var_os("VICTORY_SUBMIT_SPLIT").is_some_and(|v| v == "1"))
+}
+
+/// The line of [`ahead`] is in use: by [`ahead`] or by [`split`].
+fn line_on() -> bool {
+    ahead() || split()
+}
+
 /// The most submissions the line of [`ahead`] holds before the title's
 /// call waits for room (`VICTORY_SUBMIT_AHEAD`, 64): what they hold (host
 /// lists, descriptor slots) is held until they have run.
@@ -2726,6 +2775,8 @@ enum Job {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A queue's fence signal (fence, value), due behind what is before it.
     Signal(usize, u64),
+    /// With [`split`]: a submission the title's thread prepared, to send.
+    Post(Vec<crate::list::Detached>, Vec<usize>, Prepared),
 }
 
 struct Ahead {
@@ -2773,6 +2824,10 @@ fn ahead_line() -> std::sync::MutexGuard<'static, Ahead> {
 /// On the line's own thread (a signal it set let a held submission go) it
 /// is sent at once: that is its place in the order.
 pub(crate) fn send_late(host: &Host, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+    if split() && !on_ahead() && !order.is_empty() {
+        host.execute_late_split(lists, order);
+        return;
+    }
     if !ahead() || on_ahead() || order.is_empty() {
         host.execute_late(lists, order);
         return;
@@ -2796,7 +2851,7 @@ pub(crate) fn send_late(host: &Host, lists: Vec<crate::list::Detached>, order: V
 /// A fence signal behind what the line of [`ahead`] holds: it joins the
 /// line, and true. False if the line is empty and idle.
 fn ahead_signal(fence: usize, value: u64) -> bool {
-    if !ahead() || on_ahead() {
+    if !line_on() || on_ahead() {
         return false;
     }
     let mut line = ahead_line();
@@ -2813,7 +2868,7 @@ fn ahead_signal(fence: usize, value: u64) -> bool {
 /// the title gave before now has been sent to the card (not run: that is
 /// what a settle waits for). Nothing on the line's own thread.
 pub(crate) fn drain_ahead() {
-    if !ahead() || on_ahead() {
+    if !line_on() || on_ahead() {
         return;
     }
     let mut line = ahead_line();
@@ -2821,10 +2876,12 @@ pub(crate) fn drain_ahead() {
         return;
     }
     let waiting = std::time::Instant::now();
+    let _z = crate::trace::zone("wait: the submission thread to send what it holds");
     while !line.jobs.is_empty() || line.busy {
         line = AHEAD_DONE.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     drop(line);
+    drop(_z);
     AHEAD_STATS[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
     AHEAD_STATS[2].fetch_add(1, Ordering::Relaxed);
 }
@@ -2837,7 +2894,7 @@ fn ahead_threads() {
         match std::thread::Builder::new().name("victory-submit".into()).spawn(ahead_worker) {
             Ok(_) => tracing::info!(
                 most = ahead_most(),
-                "the title's submissions are prepared and sent by a thread of their own (VICTORY_SUBMIT_THREAD=0 turns it off)"
+                "the title's submissions are sent by a thread of their own (VICTORY_SUBMIT_THREAD: prepared there too; VICTORY_SUBMIT_SPLIT: prepared at the title's call)"
             ),
             Err(e) => fail(format_args!("no thread to prepare the title's submissions (VICTORY_SUBMIT_THREAD=0 runs without): {e}")),
         }
@@ -2874,6 +2931,7 @@ fn ahead_worker() {
                 // Only now: until it has started, [`retire`] counts it here.
                 AHEAD_RUNS.fetch_sub(1, Ordering::AcqRel);
             }
+            Job::Post(lists, order, prepared) => host.execute_late_post(lists, order, prepared),
             Job::Signal(fence, value) => {
                 if !late_signal_line(fence, value) {
                     crate::fence::set(fence as crate::object::This, value);
@@ -2896,17 +2954,19 @@ fn poke_helper() {
 
 /// For the frame-rate line: what the line of [`ahead`] did per frame.
 fn ahead_line_stats(frames: f64) {
-    if !ahead() {
+    if !line_on() {
         return;
     }
     let a: Vec<f64> = AHEAD_STATS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "the submission thread per frame (VICTORY_SUBMIT_THREAD): {:.1} submissions handed to it; callers waited {:.1} ms          in {:.1} waits for it to send what it held (a present, a synchronous submission, a fence or memory value looked at);          the title waited {:.1} ms for room in its line ({} at most)",
+        "the submission thread per frame ({}): {:.1} submissions handed to it; callers waited {:.1} ms          in {:.1} waits for it to send what it held (a present, a synchronous submission, a fence or memory value looked at);          the title waited {:.1} ms for room in its line ({} at most); {} submissions sent out of order since the start",
+        if split() { "VICTORY_SUBMIT_SPLIT: prepared at the title's call, sent here" } else { "VICTORY_SUBMIT_THREAD: prepared and sent here" },
         a[0],
         a[1] / 1000.0,
         a[2],
         a[3] / 1000.0,
         ahead_most(),
+        OUT_OF_ORDER.load(Ordering::Relaxed),
     );
 }
 
@@ -4547,6 +4607,52 @@ impl Host {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, true)
         };
+        self.late_tail(lists, order, sent);
+    }
+
+    /// With [`split`], on the title's thread: the submission is prepared
+    /// here ([`Host::submit_prepare`]) and given to the submission thread to
+    /// send ([`Host::execute_late_post`]).
+    fn execute_late_split(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+        late_threads();
+        ahead_threads();
+        let prepared = {
+            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            let (submitted, prepared) = self.submit_prepare(&runs, true);
+            drop(submitted);
+            prepared
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::submission_ends(prepared.lock);
+        let mut line = ahead_line();
+        AHEAD_STATS[0].fetch_add(1, Ordering::Relaxed);
+        crate::trace::count("submission thread: jobs waiting when one is added", line.jobs.len() as u64 + u64::from(line.busy));
+        line.jobs.push_back(Job::Post(lists, order, prepared));
+        drop(line);
+        AHEAD_MOVED.notify_one();
+    }
+
+    /// With [`split`], on the submission thread: sends what the title's
+    /// thread prepared, and puts the flight in the line.
+    fn execute_late_post(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, prepared: Prepared) {
+        let sent = {
+            let mut _z = crate::trace::zone("submit: send (on the submission thread)");
+            _z.arg(prepared.this_submission);
+            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            let submitted = crate::trace::lock("lock wait: submission", &self.submitted);
+            self.submit_send(submitted, prepared, &runs)
+        };
+        self.late_tail(lists, order, sent);
+    }
+
+    /// The end of [`Host::execute_late`]: the sent submission joins the
+    /// line of flights.
+    fn late_tail(
+        &self,
+        lists: Vec<crate::list::Detached>,
+        order: Vec<usize>,
+        sent: Option<(std::sync::MutexGuard<'_, u64>, Sent)>,
+    ) {
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
             crate::list::recycle(lists, &order);
@@ -4780,6 +4886,16 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let (submitted, prepared) = self.submit_prepare(runs, late);
+        self.submit_send(submitted, prepared, runs)
+    }
+
+    /// The first part of [`Host::submit`]: everything that reads title
+    /// memory (the lists' steps, the refreshes, the snapshots), with the
+    /// submission lock taken and handed back. With [`split`] the title's
+    /// thread does this at its call and [`Host::submit_send`] runs on the
+    /// submission thread.
+    fn submit_prepare<'a>(&'a self, runs: &[&HostList], late: bool) -> (std::sync::MutexGuard<'a, u64>, Prepared) {
         let mut _z = crate::trace::zone("submit (prepare and send)");
         _z.arg(runs.len() as u64);
         #[cfg(feature = "diagnostics")]
@@ -4910,6 +5026,60 @@ impl Host {
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
+        (
+            submitted,
+            Prepared {
+                late,
+                lists,
+                firsts,
+                settled,
+                this_submission,
+                started,
+                was_working,
+                #[cfg(feature = "diagnostics")]
+                lock,
+            },
+        )
+    }
+
+    /// The rest of [`Host::submit`]: copies in the card's memory, the lists
+    /// sent to the card, and (not `late`) the wait and copy-back.
+    fn submit_send<'a>(
+        &'a self,
+        mut submitted: std::sync::MutexGuard<'a, u64>,
+        prepared: Prepared,
+        runs: &[&HostList],
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let Prepared {
+            late,
+            mut lists,
+            firsts,
+            mut settled,
+            this_submission,
+            started,
+            was_working,
+            #[cfg(feature = "diagnostics")]
+            lock,
+        } = prepared;
+        // Submissions go to the card in the order they were numbered when
+        // prepared; one sent behind a later one is said aloud (nothing is
+        // reordered here: the line of `split` and the submission lock keep
+        // the order, and this says if they ever did not).
+        {
+            static LAST_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let last = LAST_SENT.fetch_max(this_submission, Ordering::AcqRel);
+            if this_submission <= last {
+                OUT_OF_ORDER.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    submission = this_submission,
+                    after = last,
+                    thread = std::thread::current().name().unwrap_or("title"),
+                    "a submission went to the card after a later one (out of order)"
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::trace::count("submissions: waited between prepared and sent (us)", started.elapsed().as_micros() as u64);
+        }
         let flown = late && relay();
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
@@ -4945,8 +5115,11 @@ impl Host {
             drop(_w);
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
+            // With `split` the title's thread ended its part already.
             #[cfg(feature = "diagnostics")]
-            crate::copystat::submission_ends(lock);
+            if !(split() && on_ahead()) {
+                crate::copystat::submission_ends(lock);
+            }
             let sent = Sent {
                 number: this_submission,
                 card,
