@@ -398,6 +398,73 @@ impl Module {
         g
     }
 
+    /// Marks UAV handles globally coherent (`globallycoherent`): bit 14 of
+    /// the first property word of an `annotateHandle` whose UAV bit (12) is
+    /// set. With `all`, every UAV handle; otherwise only in a module that
+    /// runs an atomic on a UAV, or both reads and writes UAV memory (a
+    /// thread group that may read what another group of the same dispatch
+    /// wrote): then every UAV handle of the module, since the reads and
+    /// writes of one buffer can go through handles made apart. Whether
+    /// any handle was marked.
+    pub(crate) fn coherent_uavs(&mut self, all: bool) -> bool {
+        const UAV: i64 = 0x1000;
+        const COHERENT: i64 = 0x4000;
+        let Some(&annotate) = self.func_ids.get("dx.op.annotateHandle") else {
+            return false;
+        };
+        // The first property word of a constant `{i32, i32}` aggregate.
+        let first = |m: &Module, v: V| -> Option<(u32, u32, i64)> {
+            let V::Const(c) = v else { return None };
+            let Const::Aggregate(ids) = &m.consts[c as usize].1 else { return None };
+            let (&p0, &p1) = (ids.first()?, ids.get(1)?);
+            let Const::Int(word) = m.consts[p0 as usize].1 else { return None };
+            Some((p0, p1, word))
+        };
+        let uavs: Vec<u32> = (0..self.insts.len() as u32)
+            .filter(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if *f == annotate => {
+                    args.get(2).and_then(|&p| first(self, p)).is_some_and(|(_, _, w)| w & UAV != 0)
+                }
+                _ => false,
+            })
+            .collect();
+        if uavs.is_empty() {
+            return false;
+        }
+        if !all {
+            let is_uav = |v: Option<&V>| matches!(v, Some(V::Inst(h)) if uavs.contains(h));
+            let (mut atomic, mut load, mut store) = (false, false, false);
+            for inst in &self.insts {
+                let Op::Call(f, args) = &inst.op else { continue };
+                if !is_uav(args.get(1)) {
+                    continue;
+                }
+                let name = self.funcs[*f as usize].name.as_str();
+                atomic |= name.starts_with("dx.op.atomic");
+                load |= ["dx.op.rawBufferLoad", "dx.op.bufferLoad", "dx.op.textureLoad"].iter().any(|n| name.starts_with(n));
+                store |= ["dx.op.rawBufferStore", "dx.op.bufferStore", "dx.op.textureStore"].iter().any(|n| name.starts_with(n));
+            }
+            if !atomic && !(load && store) {
+                return false;
+            }
+        }
+        for i in uavs {
+            let Op::Call(_, args) = &self.insts[i as usize].op else { continue };
+            let props = args[2];
+            let Some((p0, p1, word)) = first(self, props) else { continue };
+            if word & COHERENT != 0 {
+                continue;
+            }
+            let (agg_ty, word_ty) = (self.type_of(props), self.consts[p0 as usize].0);
+            let V::Const(marked) = self.int_const(word_ty, word | COHERENT) else { continue };
+            let new = self.constant(agg_ty, Const::Aggregate(vec![marked, p1]));
+            if let Op::Call(_, args) = &mut self.insts[i as usize].op {
+                args[2] = new;
+            }
+        }
+        true
+    }
+
     /// Notes what instruction `v` is for (see [`Tag`]); only when modules
     /// are counted.
     pub fn tag(&mut self, v: V, tag: Tag) {
@@ -1119,6 +1186,61 @@ mod tests {
         let bits = |v: &[u8]| v.len() * 8;
         assert!(bits(&fast) >= bits(&plain));
         assert!(bits(&fast) - bits(&plain) <= 32);
+    }
+
+    /// `globallycoherent` goes on UAV handles only, and without `all` only in
+    /// a module with an atomic on a UAV.
+    #[test]
+    fn coherent_uavs_marks_uav_handles_of_modules_with_atomics() {
+        // (props0 of the handle it annotates, whether an atomic runs on it)
+        let module = |props0: u32, atomic: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let handle = m.named_struct("dx.types.Handle", vec![i32t]);
+            let props_ty = m.named_struct("dx.types.ResourceProperties", vec![i32t, i32t]);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let b = m.new_block();
+            let make_ty = m.func_ty(handle, vec![i32t, i32t]);
+            let make = m.function("dx.op.createHandleFromHeap", make_ty, Some(Attr::ReadOnly), false);
+            let ann_ty = m.func_ty(handle, vec![i32t, handle, props_ty]);
+            let ann = m.function("dx.op.annotateHandle", ann_ty, Some(Attr::ReadNone), false);
+            let (op218, zero) = (m.i32(218), m.i32(0));
+            let h = m.call(b, make, vec![op218, zero]);
+            let (w0, w1) = (m.i32(props0), m.i32(0));
+            let props = m.aggregate(props_ty, &[w0, w1]);
+            let op216 = m.i32(216);
+            let h = m.call(b, ann, vec![op216, h, props]);
+            if atomic {
+                let at_ty = m.func_ty(i32t, vec![i32t, handle, i32t]);
+                let at = m.function("dx.op.atomicBinOp.i32", at_ty, None, false);
+                let op78 = m.i32(78);
+                let _ = m.call(b, at, vec![op78, h, zero]);
+            }
+            m.terminate(b, Term::Ret);
+            (m, h)
+        };
+        let word = |m: &Module, h: V| {
+            let V::Inst(i) = h else { unreachable!() };
+            let Op::Call(_, args) = &m.insts[i as usize].op else { unreachable!() };
+            let V::Const(c) = args[2] else { unreachable!() };
+            let Const::Aggregate(ids) = &m.consts[c as usize].1 else { unreachable!() };
+            let Const::Int(w) = m.consts[ids[0] as usize].1 else { unreachable!() };
+            w
+        };
+        let (mut m, h) = module(11 | 0x1000, true);
+        assert!(m.coherent_uavs(false));
+        assert_eq!(word(&m, h), 11 | 0x1000 | 0x4000);
+        let (mut m, h) = module(11 | 0x1000, false);
+        assert!(!m.coherent_uavs(false));
+        assert_eq!(word(&m, h), 11 | 0x1000);
+        assert!(m.coherent_uavs(true));
+        assert_eq!(word(&m, h), 11 | 0x1000 | 0x4000);
+        // An SRV is never marked.
+        let (mut m, h) = module(11, true);
+        assert!(!m.coherent_uavs(true));
+        assert_eq!(word(&m, h), 11);
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each
