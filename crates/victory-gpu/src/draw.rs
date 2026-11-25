@@ -68,7 +68,7 @@ thread_local! {
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While a stage's tables are walked: the stage is one of the structure
     /// builder's and the builder is quarantined
-    /// (`crate::pipeline::builder_quarantined`), so what it stores through
+    /// (`crate::pipeline::quarantined`), so what it stores through
     /// its views is not copied back either.
     static QUARANTINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -965,9 +965,9 @@ impl State {
             // stores by address; 205 MB a frame of its stores through views
             // went into title memory all the same, and the title read a
             // wild pointer within a minute.
-            let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
+            let quarantined = crate::pipeline::quarantined(self.pipeline as This);
             if quarantined {
-                once!("VICTORY_BVH_QUARANTINE=1: what the structure builder's stages store is not copied back into title memory, by address or through views");
+                once!("quarantine: what the structure builder's stages and the passes that walk the structures store is not copied back into title memory, by address or through views");
             }
             QUARANTINED.set(quarantined);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
@@ -981,7 +981,7 @@ impl State {
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+                && !quarantined;
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {

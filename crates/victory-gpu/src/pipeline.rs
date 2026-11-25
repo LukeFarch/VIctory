@@ -379,13 +379,45 @@ pub(crate) fn tracer_runs() -> bool {
 /// check for a first run of the whole builder: a stage that stores where
 /// it should not can then not reach the title's own objects (run 98), and
 /// the programs that walk the structures read the host's copies anyway.
+/// The passes that walk the structures ([`is_tracer`], which takes in
+/// `VICTORY_RT_GATE_ALSO`'s too) are held back the same way: what they
+/// make from structures not yet known good (infinities, run of
+/// 2026-11-24 23:50, where the title read them back and stopped) stays on
+/// the card. `VICTORY_QUARANTINE_ALSO=<hash starts>` holds back more
+/// pipelines, with or without the switch, and runs them as before.
 /// shortcut: not a way to run: the title also reads results back (sizes,
 /// counters) and gets none, and a copy's pages are overwritten from title
 /// memory when the title writes them.
 #[cfg(windows)]
-pub(crate) fn builder_quarantined(this: This) -> bool {
+pub(crate) fn quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    if this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    p.quarantined
+        || ((p.builder || p.tracer)
+            && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1")))
+}
+
+/// Whether one of `shaders` starts with a hash `VICTORY_QUARANTINE_ALSO`
+/// names ([`quarantined`]).
+#[cfg(windows)]
+fn quarantined_also(shaders: &[Arc<Shader>]) -> bool {
+    static ALSO: OnceLock<Vec<String>> = OnceLock::new();
+    let also = ALSO.get_or_init(|| {
+        std::env::var("VICTORY_QUARANTINE_ALSO")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let held = shaders.iter().any(|s| also.iter().any(|h| s.hash.starts_with(h.as_str())));
+    if held {
+        tracing::info!(?shaders, "what this pipeline stores is not copied back into title memory (VICTORY_QUARANTINE_ALSO)");
+    }
+    held
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -484,6 +516,9 @@ struct Pipeline {
     /// Walks ray-tracing structures ([`tracer_runs`]).
     #[cfg(windows)]
     tracer: bool,
+    /// Named by `VICTORY_QUARANTINE_ALSO` ([`quarantined`]).
+    #[cfg(windows)]
+    quarantined: bool,
     /// A precompiled graphics pipeline (device method 0x1c8): host
     /// pipelines made per set of bound target formats, as it names none.
     #[cfg(windows)]
@@ -855,6 +890,8 @@ fn hand_out_with(
     #[cfg(windows)]
     let tracer = !builder && (of_tracer(&shaders) || gated_also(&shaders));
     #[cfg(windows)]
+    let quarantined = quarantined_also(&shaders);
+    #[cfg(windows)]
     if tracer {
         tracing::info!(?shaders, "a pipeline that walks ray-tracing structures: held back while the structure builder does not run (VICTORY_RT_GATE=0 runs it)");
     }
@@ -874,6 +911,8 @@ fn hand_out_with(
         builder,
         #[cfg(windows)]
         tracer,
+        #[cfg(windows)]
+        quarantined,
         #[cfg(windows)]
         variants,
         shaders,
