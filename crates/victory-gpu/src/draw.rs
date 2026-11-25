@@ -382,6 +382,33 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a draw whose vertex or index memory the title has not all
+/// mapped is left out (`VICTORY_HOLD_UNMAPPED_GEOMETRY=1`; off by default).
+/// The host copy of memory not there reads as zeros (or as what it held
+/// before), and a draw of it shows as boxes and long stretched triangles
+/// until the title's streaming maps the rest: the object comes a frame or
+/// more later instead of broken.
+pub(crate) fn hold_unmapped_geometry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLD_UNMAPPED_GEOMETRY").is_some_and(|v| v == "1"))
+}
+
+/// Draws left out by [`hold_unmapped_geometry`] since the start.
+pub(crate) static HELD_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether title memory `[address, address + len)` is all mapped, asked at
+/// most once a frame per range.
+fn geometry_mapped(address: u64, len: u64) -> bool {
+    static SEEN: std::sync::Mutex<(u64, Option<std::collections::HashMap<(u64, u64), bool>>)> = std::sync::Mutex::new((0, None));
+    let frame = crate::frame::current();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != frame {
+        *seen = (frame, Some(std::collections::HashMap::new()));
+    }
+    let map = seen.1.get_or_insert_with(std::collections::HashMap::new);
+    *map.entry((address, len)).or_insert_with(|| crate::texture::committed(address as *const u8, len as usize))
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -827,6 +854,20 @@ impl State {
             return false;
         }
         let l = &list.list;
+        // Geometry the title has not all mapped yet is not drawn
+        // (`hold_unmapped_geometry`).
+        if hold_unmapped_geometry() {
+            let vertex = self.vertex.iter().enumerate().filter(|(slot, v)| p.slots & 1 << slot != 0 && v.address != 0 && v.size != 0);
+            let mut ranges: Vec<(u64, u64)> = vertex.map(|(_, v)| (v.address, u64::from(v.size))).collect();
+            if indexed && self.index.address != 0 {
+                ranges.push((self.index.address, u64::from(self.index.size)));
+            }
+            if !ranges.iter().all(|&(a, n)| geometry_mapped(a, n)) {
+                crate::pipeline::note_fault("a draw's geometry is not all mapped yet (held: not drawn this frame, VICTORY_HOLD_UNMAPPED_GEOMETRY=1)");
+                HELD_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+        }
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;

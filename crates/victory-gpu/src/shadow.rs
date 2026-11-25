@@ -139,6 +139,13 @@ fn gaps_ask_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GAPS_ASK_ONCE").is_some_and(|v| v == "1"))
 }
 
+/// Whether a title write into a quarantined page is merged by
+/// [`Shadow::merge_title_fast`] (`VICTORY_FAST_MERGE=1`; off by default).
+fn fast_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_MERGE").is_some_and(|v| v == "1"))
+}
+
 /// Frames a quarantined page stays the card's with no pass marking it
 /// (`VICTORY_QUARANTINE_OWN_FRAMES`, 600). Two gave pages back as the
 /// camera moved and the passes wrote other tiles (lighting test 4: about
@@ -2004,6 +2011,9 @@ impl Shadow {
     /// into the copy, and `before` takes them. What the card made in the
     /// rest stays. Returns the bytes copied.
     fn merge_title(&self, lo: usize, before: &mut [u8]) -> usize {
+        if fast_merge() {
+            return self.merge_title_fast(lo, before);
+        }
         let n = before.len();
         let mut now = vec![0; n];
         if !crate::host::read_into(lo as *const u8, &mut now) {
@@ -2031,6 +2041,56 @@ impl Shadow {
             i = j;
         }
         merged
+    }
+
+    /// [`Shadow::merge_title`] with the same result, faster
+    /// (`VICTORY_FAST_MERGE=1`): title memory read into memory kept per
+    /// thread, equal bytes skipped 8 at a time, and the changed runs told to
+    /// the card's side in one go (and the kept snapshot once for their
+    /// span). The byte-by-byte form was 126 ms a frame for 1,255 pages in
+    /// run 4's prison window, about 100 microseconds a page.
+    fn merge_title_fast(&self, lo: usize, before: &mut [u8]) -> usize {
+        thread_local! {
+            static NOW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let n = before.len();
+        NOW.with(|now| {
+            let mut now = now.borrow_mut();
+            now.resize(n, 0);
+            if !crate::host::read_into(lo as *const u8, &mut now) {
+                return 0;
+            }
+            let start = self.start as usize;
+            // SAFETY: `[lo, lo + n)` lies in the copy (an owned page's bytes).
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(lo - start), n) };
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let mut i = 0;
+            while i < n {
+                // Equal words at once, then equal bytes one by one.
+                if i + 8 <= n && now[i..i + 8] == before[i..i + 8] {
+                    i += 8;
+                    continue;
+                }
+                if now[i] == before[i] {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < n && now[j] != before[j] {
+                    j += 1;
+                }
+                held[i..j].copy_from_slice(&now[i..j]);
+                before[i..j].copy_from_slice(&now[i..j]);
+                runs.push((lo - start + i, lo - start + j));
+                i = j;
+            }
+            let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
+                return 0;
+            };
+            self.changed(first.0, last.1);
+            self.card_changed_many(&runs);
+            runs.iter().map(|r| r.1 - r.0).sum()
+        })
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -2877,6 +2937,23 @@ impl Shadow {
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
+    /// [`Shadow::card_changed`] for many ranges in order, under one lock.
+    fn card_changed_many(&self, ranges: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        for &(from, to) in ranges {
+            if from >= to {
+                continue;
+            }
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
+        }
+    }
+
     fn card_changed(&self, from: usize, to: usize) {
         let Some(card) = &self.card else {
             return;

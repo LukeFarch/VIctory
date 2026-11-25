@@ -6732,6 +6732,10 @@ impl Meter {
             self.logged = std::time::Instant::now();
             crate::budget::line();
             crate::watch::census_line();
+            if crate::draw::hold_unmapped_geometry() {
+                let held = crate::draw::HELD_DRAWS.load(Ordering::Relaxed);
+                tracing::info!(held, "draws held since the start because their geometry was not all mapped yet (VICTORY_HOLD_UNMAPPED_GEOMETRY=1)");
+            }
             {
                 let dropped = PRESENTS_DROPPED.load(Ordering::Relaxed);
                 if dropped > 0 {
