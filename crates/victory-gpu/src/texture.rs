@@ -696,6 +696,7 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
+        let _z = crate::trace::zone("texture refresh");
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
