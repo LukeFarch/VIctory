@@ -1232,6 +1232,47 @@ pub(crate) extern "system" fn create_precompiled_graphics(
     }
 }
 
+/// Whether `desc` reads as a whole pipeline stream description: readable,
+/// of known subobjects that end where its size says, with at least one
+/// shader whose code is readable. For a method whose description is not
+/// known (device 0x1b8), before it is taken as one.
+#[cfg(windows)]
+pub(crate) fn is_stream(desc: usize) -> bool {
+    let mut head = [0u8; 16];
+    if desc < 0x10000 || !crate::host::read_into(desc as *const u8, &mut head) {
+        return false;
+    }
+    let size = u64::from_le_bytes(head[..8].try_into().unwrap_or_default()) as usize;
+    let at = u64::from_le_bytes(head[8..].try_into().unwrap_or_default()) as usize;
+    if !(8..=0x4000).contains(&size) || at < 0x10000 {
+        return false;
+    }
+    let mut stream = vec![0u8; size];
+    if !crate::host::read_into(at as *const u8, &mut stream) {
+        return false;
+    }
+    let word = |i: usize| stream.get(i..i + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or_default()));
+    let (mut i, mut shaders) = (0, 0);
+    while i + 8 <= size {
+        let kind = u32::from_le_bytes(stream[i..i + 4].try_into().unwrap_or_default());
+        let Some((len, stage)) = subobject(kind) else {
+            return false;
+        };
+        if stage.is_some() {
+            let (code, bytes) = (word(i + 8) as usize, word(i + 16) as usize);
+            if code != 0 {
+                let mut magic = [0u8; 4];
+                if !(4..=1 << 26).contains(&bytes) || !crate::host::read_into(code as *const u8, &mut magic) {
+                    return false;
+                }
+                shaders += 1;
+            }
+        }
+        i += len;
+    }
+    i == size && shaders > 0
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
