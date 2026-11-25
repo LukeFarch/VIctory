@@ -230,8 +230,24 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !known_view(first) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            continue;
+        }
+        if !known_view(first) {
+            if ask_kernel(j, first, last) {
+                j.ahead.push((first, last));
+            }
+        } else if views_once() {
+            // View memory: the guards answer, once for the submission, as
+            // the kernel does for the rest.
+            let _z = crate::trace::zone("guard: a submission's view range, once");
+            if let Some(pages) = guard(first * PAGE, last * PAGE) {
+                let now = j.ahead_asked;
+                for page in pages {
+                    j.written.insert(page, now);
+                }
+                j.ahead.push((first, last));
+            }
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -337,6 +353,19 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 fn skip_views() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_SKIP_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// Whether a submission's one asking ([`ask_once`]) also asks the guards
+/// about the view memory its lists refresh (`VICTORY_VIEWS_ASK_ONCE=1`;
+/// off by default; with `VICTORY_WATCH_SKIP_VIEWS=1`). Views were left to
+/// [`writes`], which asked the guards at every refresh: 4,300 askings a
+/// frame in run 14's prison profile, 438 ms summed with the kernel's, and
+/// most of the 242 ms the threads waited for the guards' lock. Answered as
+/// the kernel's askings are: what the title writes after the submission's
+/// asking is seen by the next submission's.
+fn views_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| skip_views() && std::env::var_os("VICTORY_VIEWS_ASK_ONCE").is_some_and(|v| v == "1"))
 }
 
 /// Whether pages `[first, last)` begin in a block the guards hold
