@@ -142,18 +142,33 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1536).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
+///
+/// Were 16 and 512 until run 23: in its prison window the ten big copies
+/// filled the 512 MB (492 MB), and the copies of 1-16 MiB were still
+/// snapshotted and searched on the CPU, 354 of the 382 MB a frame
+/// ("snapshots 54.9 ms", "20.5 ms finding pieces that differ"). On the card
+/// the same search is a compute pass over 64 KiB pieces, and only the
+/// pieces that differ come back. The card had 5.4 GB of its 15.2 GB budget
+/// free; `card_for` still keeps a fifth of the budget free, so textures
+/// keep their room. `VICTORY_CARD_BUFFERS_MIN_MB=16
+/// VICTORY_CARD_BUFFERS_MB=512` is the old behaviour.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1536))
     })
 }
+
+/// Since the last frame line: bytes of pages a copy-back of ours wrote
+/// that their copy was noted current for (not copied again), and those
+/// left stale because title memory differed ([`Shadow::settle`]).
+pub(crate) static SETTLED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -1915,6 +1930,7 @@ impl Shadow {
                 self.changed(at, at + n);
             }
             let mut title = vec![0u8; PIECE];
+            let mut settle: Vec<(usize, usize, u64)> = Vec::new();
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -1949,16 +1965,25 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
+                    let own = crate::watch::own_write_begin(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
+                    if let Some(now) = crate::watch::own_write_end(own) {
+                        settle.push((at, at + n, now));
+                    }
                 }
             }
-            // Our write shows as a title write at the copy's next refresh,
-            // which copies those pages once more (some dozens of MB a
-            // frame). Asking about the whole range here, to note them
-            // current, cost more: 19-31 askings a frame over 110-174 MB of
-            // view memory, each a walk of its guards.
+            // Our write would show as a title write at the copy's next
+            // refresh, which copied those pages once more (run 23: some
+            // 70 MB a frame). The blocks it opened are guarded again at
+            // once, and the copy is noted current where it holds what
+            // title memory holds (`settle`); asking about the whole range
+            // instead cost more (19-31 askings a frame over 110-174 MB of
+            // view memory, each a walk of its guards).
+            drop(title);
+            for (from, to, now) in settle {
+                self.settle(from, to, now);
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
@@ -2410,6 +2435,58 @@ impl Shadow {
         to - from
     }
 
+    /// After a copy-back of ours wrote title memory at the copy's offsets
+    /// `[from, to)` and noted its pages written under asking `now`
+    /// ([`crate::watch::own_write_end`]): each page of the copy that holds
+    /// exactly what title memory holds there now is noted copied at `now`,
+    /// so the next refresh does not copy it again. A page that differs (the
+    /// title wrote it meanwhile, or the copy was behind on it already)
+    /// stays stale and is copied as before. Pages are as `copy_stale` cuts
+    /// them: the part of a 64 KiB page inside the buffer. Returns the bytes
+    /// noted current.
+    ///
+    /// `VICTORY_SETTLE_OWN=0` leaves every page stale, as before (the
+    /// blocks are still guarded again; only the copy's note changes).
+    fn settle(&self, from: usize, to: usize, now: u64) -> usize {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_OWN").is_none_or(|v| v != "0")) || from >= to {
+            return 0;
+        }
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; PAGE]);
+        }
+        TITLE.with_borrow_mut(|title| self.settle_with(from, to, now, title))
+    }
+
+    fn settle_with(&self, from: usize, to: usize, now: u64, title: &mut [u8]) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let mut settled = 0;
+        let mut left = 0;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for page in (start + from) / PAGE..=(start + to - 1) / PAGE {
+            let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+            if lo >= hi || page < base || page - base >= copied.len() {
+                continue;
+            }
+            let n = hi - lo;
+            let title = &mut title[..n];
+            // SAFETY: offsets `[lo - start, hi - start)` lie in the mapping.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start), n) };
+            if crate::host::read_into(lo as *const u8, title) && *title == *held {
+                let at = &mut copied[page - base];
+                *at = (*at).max(now);
+                settled += n;
+            } else {
+                left += n;
+            }
+        }
+        drop(copied);
+        SETTLED[0].fetch_add(settled as u64, Ordering::Relaxed);
+        SETTLED[1].fetch_add(left as u64, Ordering::Relaxed);
+        settled
+    }
+
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
@@ -2566,9 +2643,12 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
+                let own = crate::watch::own_write_begin(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
+                if let Some(now) = crate::watch::own_write_end(own) {
+                    self.settle(at, at + n, now);
+                }
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the

@@ -586,6 +586,85 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// Our own write into title memory (a copy-back of what shaders wrote),
+/// begun with [`own_write_begin`]: the guarded blocks it opened.
+pub(crate) struct OwnWrite {
+    blocks: Vec<usize>,
+    at: usize,
+    len: usize,
+}
+
+/// [`writing`] for a write of ours that the host copy doing it already
+/// holds: opens the guarded blocks of `[at, at + len)` as [`writing`] does,
+/// and remembers which were guarded, so that [`own_write_end`] can guard
+/// them again at once instead of leaving them to show as title writes.
+///
+/// Before this, every block a copy-back wrote showed as written at the
+/// copy's next refresh, and the refresh copied all 64 KiB of it back into
+/// the copy (and, for a copy in the card's memory, sent it up again):
+/// bytes the copy held already. In run 23's prison window that was some
+/// 1,000 blocks a frame, about 70 of the 160 MB the frame line calls
+/// "copies".
+pub(crate) fn own_write_begin(at: usize, len: usize) -> OwnWrite {
+    let end = at.saturating_add(len);
+    let blocks: Vec<usize> = {
+        let mut g = guards();
+        let blocks = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+        open(&mut g, at, end);
+        blocks
+    };
+    crate::descriptor::host::remapped(at, len);
+    OwnWrite { blocks, at, len }
+}
+
+/// After the write [`own_write_begin`] began: the blocks it opened are
+/// guarded again and their pages noted written under a new asking (so the
+/// other host copies of the same memory take the new bytes); for memory
+/// that is write-watched, its pages are asked about, which clears the
+/// kernel's bits our write set. Returns that asking's number, or `None`
+/// if the memory is neither (then nothing changed, and the write shows at
+/// the next asking as before).
+///
+/// A title write between the two calls is not lost: its block is among
+/// those noted written, and the caller marks its copy current for a page
+/// only where the copy's bytes equal title memory after this call
+/// ([`crate::shadow::Shadow`]'s settling). A title write after this call
+/// faults into the guard, or sets the kernel's bit, as any other.
+pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
+    if w.len == 0 {
+        return None;
+    }
+    if w.blocks.is_empty() {
+        return writes(w.at, w.at.saturating_add(w.len), false).map(|(now, _)| now);
+    }
+    {
+        let mut g = guards();
+        let mut i = 0;
+        while i < w.blocks.len() {
+            let mut j = i + 1;
+            while j < w.blocks.len() && w.blocks[j] == w.blocks[j - 1] + 1 {
+                j += 1;
+            }
+            // Only blocks no one guarded again or remapped meanwhile.
+            let from = w.blocks[i];
+            let to = w.blocks[j - 1] + 1;
+            if !g.protected.contains(&from) {
+                protect(&mut g, from, to);
+            }
+            i = j;
+        }
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for &block in &w.blocks {
+        for page in block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE {
+            j.written.insert(page, now);
+        }
+    }
+    Some(now)
+}
+
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///
@@ -810,6 +889,56 @@ mod tests {
             )
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// A write of ours into guarded view memory leaves its blocks guarded
+    /// again and noted written once, under its own asking; a title write
+    /// after it is still taken by the guard.
+    #[test]
+    fn our_own_write_is_guarded_again_and_noted_once() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        const SIZE: usize = 3 * BLOCK;
+        // SAFETY: a new pagefile section of three blocks, mapped once.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view
+        };
+        let start = view.Value as usize;
+        // First asking: every block is new, then all are guarded.
+        assert_eq!(guard(start, start + SIZE).map(|w| w.len()), Some(3));
+        assert_eq!(guard(start, start + SIZE), Some(vec![]));
+        // Our write into the middle block, through the kernel.
+        let own = own_write_begin(start + BLOCK + 8, 4);
+        crate::host::write_mapped((start + BLOCK + 8) as *mut u8, b"ours".as_ptr(), 4);
+        let now = own_write_end(own).expect("guarded memory");
+        {
+            let j = JOURNAL.lock().unwrap();
+            assert_eq!(j.written.get(&((start + BLOCK) / PAGE)), Some(&now));
+        }
+        // Guarded again: the next asking finds nothing written.
+        assert_eq!(guard(start, start + SIZE), Some(vec![]));
+        // A title write after it faults into the guard and is reported.
+        install();
+        // SAFETY: inside our view; the handler gives write access back.
+        unsafe { ((start + BLOCK + 100) as *mut u8).write_volatile(7) };
+        assert_eq!(guard(start, start + SIZE), Some(vec![(start + BLOCK) / PAGE]));
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
+        title_memory_remapped(start, SIZE);
     }
 
     #[test]
