@@ -6186,6 +6186,14 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             crate::budget::line();
+            {
+                let [guarded, stale] = crate::watch::TWINS.each_ref().map(|c| c.load(Ordering::Relaxed));
+                if guarded + stale > 0 {
+                    tracing::info!(
+                        "pages shown at several addresses, since the start: {guarded} blocks guarded at another address; {stale} times a write at one address reached a clean copy at another (each was a missed write before; with VICTORY_VIEW_TWINS=0 they are counted and still missed)"
+                    );
+                }
+            }
             // Why draws and dispatches were not run, since the last such
             // line (the diagnostics build has them in its frame report).
             {
