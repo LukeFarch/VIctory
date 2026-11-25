@@ -1953,6 +1953,7 @@ impl Shadow {
                 match &mut o.title {
                     // The title's new bytes go in, the card's stay.
                     Some(before) => {
+                        let _m = crate::trace::zone("refresh: merge a title write into a quarantined page");
                         OWNED[1].fetch_add(1, Ordering::Relaxed);
                         OWNED[4].fetch_add(self.merge_title(o.lo, before) as u64, Ordering::Relaxed);
                     }
@@ -2821,6 +2822,7 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        let _z = crate::trace::zone("refresh: copy stale pages");
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();

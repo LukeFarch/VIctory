@@ -3677,7 +3677,10 @@ impl Host {
             }
             None => 0,
         };
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        let mut dirty = {
+            let _z = crate::trace::zone("card copies: take changed ranges");
+            crate::shadow::card_dirty(sent_as)
+        };
         if declared.is_empty() && dirty.is_empty() {
             return None;
         }
@@ -3716,6 +3719,7 @@ impl Host {
             };
         }
         let mut scattered = 0usize;
+        let _rec = crate::trace::zone("card copies: record sends and hashes");
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
