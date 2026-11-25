@@ -681,9 +681,29 @@ fn open_only(g: &mut Guards, start: usize, end: usize) -> Vec<usize> {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    // One call per run of blocks that touch, as `protect` guards them; block
+    // by block where a run spans views (the call then fails and changes
+    // nothing). A copy-back opens the blocks of each piece it writes, and
+    // each call that changes protection is a system call and a flush of
+    // the title threads' address translations.
+    let set = |from: usize, to: usize| {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0 }
+    };
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
+            j += 1;
+        }
+        if j - i == 1 || !set(blocks[i], blocks[j - 1] + 1) {
+            for &block in &blocks[i..j] {
+                set(block, block + 1);
+            }
+        }
+        i = j;
     }
     blocks
 }
