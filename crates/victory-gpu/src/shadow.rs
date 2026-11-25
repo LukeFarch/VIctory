@@ -170,6 +170,41 @@ fn card_limits() -> (u64, u64) {
 /// left stale because title memory differed ([`Shadow::settle`]).
 pub(crate) static SETTLED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// The settling a landing's merges leave ([`Shadow::settle`]), gathered
+/// so that each page of a copy is compared once with title memory however
+/// many of the landing's pieces wrote it. Pieces are 64 KiB at the copy's
+/// offsets and pages 64 KiB of title memory, so neighbouring pieces share
+/// pages, and flights of one landing write the same ones: run 30 compared
+/// 564 MB a frame this way for 73 MB written back.
+#[derive(Default)]
+pub(crate) struct Settle {
+    /// By copy (its id): the copy, and its pages with the newest asking.
+    copies: BTreeMap<u64, (Arc<Shadow>, BTreeMap<usize, u64>)>,
+}
+
+impl Settle {
+    /// Offsets `[from, to)` of `shadow` were written back under `asked`.
+    pub(crate) fn add(&mut self, shadow: &Arc<Shadow>, from: usize, to: usize, asked: u64) {
+        if from >= to {
+            return;
+        }
+        let start = shadow.start as usize;
+        let pages = &mut self.copies.entry(shadow.id).or_insert_with(|| (shadow.clone(), BTreeMap::new())).1;
+        for page in (start + from) / PAGE..=(start + to - 1) / PAGE {
+            let at = pages.entry(page).or_insert(asked);
+            *at = (*at).max(asked);
+        }
+    }
+
+    /// Compares each page once and notes the copies current where they
+    /// hold title memory's bytes.
+    pub(crate) fn run(self) {
+        for (_, (shadow, pages)) in self.copies {
+            shadow.settle_pages(&pages);
+        }
+    }
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -303,7 +338,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// (`crate::host`'s order of the queue): each range is noted with it, in
 /// the same lock that took it, so that a merge of pieces fetched before
 /// that send knows the card did not hold these bytes yet
-/// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
+/// ([`Shadow::card_merge_relay_into`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
@@ -2034,16 +2069,18 @@ impl Shadow {
     /// and puts the title's bytes into the copy and the snapshot: the two
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
-    pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
-        let (written, settle) = self.relay_merge_locked(at, n, now, title);
-        // Outside the snapshot's lock: `settle` takes the copy's notes.
-        if let Some((from, to, asked)) = settle {
-            self.settle(from, to, asked);
+    ///
+    /// The settling is left to `settle`, which does each page once for
+    /// all the merges of a landing (outside the snapshot's lock).
+    pub(crate) fn relay_merge_into(self: &Arc<Self>, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>, settle: &mut Settle) -> usize {
+        let (written, asked) = self.relay_merge_locked(at, n, now, title);
+        if let Some((from, to, asked)) = asked {
+            settle.add(self, from, to, asked);
         }
         written
     }
 
-    /// [`Shadow::relay_merge`] under the snapshot's lock; also what to
+    /// [`Shadow::relay_merge_into`] under the snapshot's lock; also what to
     /// settle once it is let go ([`Shadow::settle`]).
     ///
     /// Settling here is sound although later flights may be writing the
@@ -2486,6 +2523,19 @@ impl Shadow {
         TITLE.with_borrow_mut(|title| self.settle_with(from, to, now, title))
     }
 
+    /// [`Shadow::settle`] for whole pages (title page numbers), each with
+    /// the newest asking that noted it written: each compared once.
+    fn settle_pages(&self, pages: &BTreeMap<usize, u64>) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let lo = |page: usize| (page * PAGE).max(start) - start;
+        let hi = |page: usize| ((page + 1) * PAGE).min(end) - start;
+        for (&page, &asked) in pages {
+            if page * PAGE < end && (page + 1) * PAGE > start {
+                self.settle(lo(page), hi(page), asked);
+            }
+        }
+    }
+
     fn settle_with(&self, from: usize, to: usize, now: u64, title: &mut [u8]) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
@@ -2706,16 +2756,24 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
-    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
-        let (written, settle) = self.card_merge_relay_locked(at, gpu, fetched_after, title);
-        // Outside the CPU side's lock, as in `relay_merge`.
-        if let Some((from, to, asked)) = settle {
-            self.settle(from, to, asked);
+    ///
+    /// The settling is left to `settle`, outside the CPU side's lock.
+    pub(crate) fn card_merge_relay_into(
+        self: &Arc<Self>,
+        at: usize,
+        gpu: &[u8],
+        fetched_after: u64,
+        title: &mut Vec<u8>,
+        settle: &mut Settle,
+    ) -> usize {
+        let (written, asked) = self.card_merge_relay_locked(at, gpu, fetched_after, title);
+        if let Some((from, to, asked)) = asked {
+            settle.add(self, from, to, asked);
         }
         written
     }
 
-    /// [`Shadow::card_merge_relay`] under the CPU side's lock; also what
+    /// [`Shadow::card_merge_relay_into`] under the CPU side's lock; also what
     /// to settle once it is let go. The CPU side holds the merged bytes
     /// here, and the title's bytes not yet sent up where the merge left
     /// them out, so it equals title memory wherever nothing else wrote.
