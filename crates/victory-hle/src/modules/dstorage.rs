@@ -931,11 +931,104 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
+            Err(error) if refused_buffer(&error) && bounce() => {
+                break read_bounced(file, &mut out[done..], request.offset + done as u64, &error);
+            }
             Err(error) => break Err(from_win32(&error)),
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// Whether a read failed because the kernel could not write the buffer:
+/// `ERROR_INVALID_USER_BUFFER` (1784) or `ERROR_NOACCESS` (998).
+fn refused_buffer(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(998 | 1784))
+}
+
+/// `VICTORY_READ_BOUNCE=0`: a read the kernel refuses for its buffer fails,
+/// as before. On by default.
+fn bounce() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_BOUNCE").is_none_or(|v| v != "0"))
+}
+
+/// Reads refused for their buffer and done again through a buffer of ours.
+static BOUNCED: AtomicU64 = AtomicU64::new(0);
+
+/// A raw read into title memory that the kernel refused: read into memory
+/// of ours and copied from there by our own code.
+///
+/// Why it is refused: the GPU side leaves 64 KiB blocks of title memory
+/// read-only to see the title's next write (`victory_gpu`'s guards), and a
+/// kernel write into such a block fails instead of faulting into the
+/// handler that would open it. `into_destination` opens the destination's
+/// blocks first, but another thread can guard one again while the read
+/// runs: sixteen workers read while the submitting thread refreshes
+/// copies. The G1 run of 2026-11-24 (20:36) lost two raw reads this way
+/// (`hr=0x800706f8`) in the diner load, and the title stopped on its own
+/// breakpoint 80 ms later. A write of ours faults into the handler like a
+/// title write, so the copy below cannot be refused that way.
+///
+/// A destination that is not committed memory keeps the kernel's error:
+/// writing it ourselves would fault for good.
+fn read_bounced(
+    file: &std::fs::File,
+    out: &mut [u8],
+    offset: u64,
+    refused: &std::io::Error,
+) -> Result<(), HRESULT> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let (start, end) = (out.as_ptr() as usize, out.as_ptr() as usize + out.len());
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 {
+            tracing::warn!(
+                address = format_args!("{at:#x}"),
+                state = format_args!("{:#x}", info.State),
+                protect = format_args!("{:#x}", info.Protect),
+                "dstorage: a read's destination is not memory that can be written; the read fails"
+            );
+            return Err(from_win32(refused));
+        }
+        at = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    }
+    // In pieces, so that a big read does not take its size again.
+    const PIECE: usize = 1 << 20;
+    let mut ours = vec![0u8; out.len().min(PIECE)];
+    let mut done = 0;
+    while done < out.len() {
+        let want = (out.len() - done).min(PIECE);
+        match file.seek_read(&mut ours[..want], offset + done as u64) {
+            Ok(0) => return Err(END_OF_FILE),
+            Ok(n) => {
+                // Opened again for the piece; a block guarded between this
+                // and the copy faults into the handler, as a title write.
+                victory_gpu::kernel_will_write(start + done, n);
+                out[done..done + n].copy_from_slice(&ours[..n]);
+                done += n;
+            }
+            Err(error) => return Err(from_win32(&error)),
+        }
+    }
+    let count = BOUNCED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        tracing::warn!(
+            count,
+            len = out.len(),
+            address = format_args!("{start:#x}"),
+            error = %refused,
+            "dstorage: the kernel refused a read's destination (a block guarded again while the read ran?); read through a buffer of ours instead (VICTORY_READ_BOUNCE=0: the read fails, as before)"
+        );
+    }
+    Ok(())
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
