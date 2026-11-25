@@ -66,6 +66,10 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// The lighting as the last memory line found it, for the window's
+/// caption: 0 not known yet, 1 fed, 2 in part, 3 not fed.
+static LIGHTING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// Host objects the title let go of while a submission may still use them
 /// (a texture its descriptors name, a descriptor slot's old resource), by
 /// the submission count they wait for. The title's descriptor writes and
@@ -6768,13 +6772,14 @@ impl Meter {
                 // Whether the lighting was fed: its passes ran, not dropped.
                 let [traced, untraced, built, unbuilt, blocked] = crate::pipeline::take_fed();
                 if traced + untraced + built + unbuilt + blocked > 0 {
-                    let fed = if traced > 0 && untraced == 0 && unbuilt == 0 {
-                        "FED"
+                    let (fed, shown) = if traced > 0 && untraced == 0 && unbuilt == 0 {
+                        ("FED", 1)
                     } else if traced > 0 {
-                        "PART"
+                        ("PART", 2)
                     } else {
-                        "UNFED"
+                        ("UNFED", 3)
                     };
+                    LIGHTING.store(shown, Ordering::Relaxed);
                     tracing::info!(
                         "lighting {fed} since the last such line: ray-traced dispatches {traced} run, {untraced} dropped; structure builder dispatches {built} run, {unbuilt} dropped; {blocked} ms waited for pipelines (VICTORY_PIPELINE_BLOCK=1)"
                     );
@@ -6951,9 +6956,44 @@ impl Meter {
             buffer.truncate(n.max(0) as usize);
             self.caption = Some(buffer);
         }
-        let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        if self.caption.is_none() {
+            return;
+        }
+        // The caption shows up in screenshots: the frame's split, memory,
+        // the lighting and the switches that change the copying.
+        let private_gb = {
+            use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            // SAFETY: plain data, filled in by the call.
+            let mut m: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+            m.cb = size_of_val(&m) as u32;
+            // SAFETY: a valid out pointer of the size given.
+            if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut m).cast(), m.cb) } != 0 {
+                m.PrivateUsage as f64 / (1u64 << 30) as f64
+            } else {
+                0.0
+            }
+        };
+        let lighting = ["", " | lighting FED", " | lighting PART", " | lighting UNFED"][usize::from(LIGHTING.load(Ordering::Relaxed)).min(3)];
+        let waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed);
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        let switches: Vec<&str> = [
+            ("VICTORY_CARD_RESIDENT", "resident"),
+            ("VICTORY_CARD_GATHER", "gather"),
+            ("VICTORY_CARD_SCATTER", "scatter"),
+            ("VICTORY_FAST_MERGE", "merge"),
+            ("VICTORY_WIDE_REFRESH", "wide"),
+            ("VICTORY_JOURNAL_UNLOCKED_ASK", "unlocked"),
+        ]
+        .into_iter()
+        .filter(|(name, _)| on(name))
+        .map(|(_, tag)| tag)
+        .collect();
+        let text = format!(
+            "J | GTA 6 | {fps:.1} fps {ms:.0} ms | CPU {cpu:.0} (copies {copy_ms:.0}, textures {texture_ms:.0}) GPU {gpu:.0} copy-back {back_ms:.0} ms | {draws:.0} draws | {private_gb:.1} GB{lighting} | textures waiting {waiting}{}",
+            if switches.is_empty() { String::new() } else { format!(" | {}", switches.join(" ")) }
+        );
+        let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
