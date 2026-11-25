@@ -1493,6 +1493,11 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// With [`card_gather`]: the compare that also copies the pieces it
+    /// finds differing, and its gather buffers not in use (buffer,
+    /// mapping): a plan takes one, `Host::card_done` gives it back.
+    gather: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
+    gathers: Vec<(ID3D12Resource, usize)>,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -1553,6 +1558,171 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// [`CARD_COMPARE`] with 64 threads to a piece (`VICTORY_CARD_WIDE_HASH=1`,
+/// or with [`card_gather`]): each thread hashes a sixty-fourth of the
+/// piece and the first folds the 64 hashes. The serial form walks a piece
+/// 16 bytes at a time, 4,096 loads one after the other, so a pass took the
+/// time of a whole piece however many pieces ran beside it: our checking
+/// passes were a good part of the card's time per frame. The hash is
+/// another, so the passes that store hashes and those that compare them
+/// all take this form or none does (a piece flagged wrongly either way
+/// costs a fetch that finds nothing, never a lost write).
+///
+/// With `GATHER` (`card_gather`): a piece found differing takes a slot of
+/// `gathered` (a CPU-visible buffer of the plan's, in the PC's memory) and
+/// the group copies the piece's bytes into it, in the same submission, as
+/// they are when its lists end; its dword in `differs` is then the slot
+/// plus 2 (1: differs, no slot left). What used to be a fetch of its own
+/// after the flight, behind everything queued since (the biggest wait of
+/// the frame), is in memory the CPU reads when the flight's fence is.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#ifdef GATHER
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2)"
+#else
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#endif
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+#ifdef GATHER
+    uint slots;    // room in `gathered`, in pieces
+    uint unused;
+#endif
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+#ifdef GATHER
+// Dword 0: slots taken. From byte 256 on, 65,792 bytes a slot: the piece
+// from its first byte rounded down to 16 (the bytes hashed).
+RWByteAddressBuffer gathered : register(u2);
+#endif
+#define SLOT 65792u
+#define BASE 256u
+uint4 mix(uint4 h, uint4 v) {
+    h = (h ^ v) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
+groupshared uint4 part[64];
+groupshared uint slot_of;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
+    uint index = g.x + g.y * 65535u;
+    // No return before the barriers: a group past the end does nothing.
+    bool live = index < pieces;
+    uint piece = first + index;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint words = (hi - lo) / 16u;
+    uint per = (words + 63u) / 64u;
+    uint a = lo + min(t * per, words) * 16u;
+    uint b = live ? lo + min((t + 1u) * per, words) * 16u : a;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ t;
+    [loop]
+    for (uint at = a; at < b; at += 16u) {
+        h = mix(h, now.Load4(at));
+    }
+    part[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (live && t == 0u) {
+        uint4 whole = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+        [loop]
+        for (uint i = 0u; i < 64u; i++) {
+            whole = mix(whole, part[i]);
+        }
+        uint slot = 0xFFFFFFFFu;
+        if (compare != 0u) {
+            bool d = any(whole != hashes.Load4(piece * 16u));
+            uint flag = d ? 1u : 0u;
+#ifdef GATHER
+            if (d) {
+                uint taken;
+                gathered.InterlockedAdd(0, 1u, taken);
+                if (taken < slots) {
+                    slot = taken;
+                    flag = taken + 2u;
+                }
+            }
+#endif
+            differs.Store(out_at + index * 4u, flag);
+            if (compare == 2u) hashes.Store4(piece * 16u, whole);
+        } else {
+            hashes.Store4(piece * 16u, whole);
+        }
+        slot_of = slot;
+    }
+    if (!live && t == 0u) slot_of = 0xFFFFFFFFu;
+#ifdef GATHER
+    GroupMemoryBarrierWithGroupSync();
+    uint s = slot_of;
+    if (s != 0xFFFFFFFFu) {
+        uint to = BASE + s * SLOT - lo;
+        [loop]
+        for (uint at = a; at < b; at += 16u) {
+            gathered.Store4(to + at, now.Load4(at));
+        }
+    }
+#endif
+}
+"#;
+
+/// The bytes a gathered piece's slot holds from: the first byte the
+/// compare hashes of piece `piece` of a copy whose piece 0 starts `skew`
+/// bytes before it (as `CARD_COMPARE_WIDE` cuts it).
+pub(crate) fn gathered_from(piece: u32, skew: u32) -> usize {
+    let lo = piece as usize * 65536;
+    (if lo > skew as usize { lo - skew as usize } else { 0 }) & !15
+}
+/// `CARD_COMPARE_WIDE`'s slot size and where slot 0 starts in `gathered`.
+const GATHER_SLOT: usize = 65792;
+const GATHER_BASE: usize = 256;
+
+/// Whether our hash passes over copies in the card's memory run 64 threads
+/// to a piece ([`CARD_COMPARE_WIDE`]; `VICTORY_CARD_WIDE_HASH=1`, or with
+/// [`card_gather`]). Off by default.
+fn card_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| card_gather() || std::env::var_os("VICTORY_CARD_WIDE_HASH").is_some_and(|v| v == "1"))
+}
+
+/// Whether the compare after a flight copies the pieces it finds differing
+/// into memory the CPU reads, in the flight itself (`VICTORY_CARD_GATHER=1`;
+/// off by default; see [`CARD_COMPARE_WIDE`]), so that landing the flight
+/// needs no fetch of its own for them. Pieces past a plan's room
+/// (`VICTORY_CARD_GATHER_MB`, 32 MB) and ranges not compared are fetched
+/// as before.
+fn card_gather() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_GATHER").is_some_and(|v| v == "1"))
+}
+
+/// Since the start, with [`card_gather`]: pieces merged from a gather
+/// buffer, their bytes, and pieces found changed past a plan's room
+/// (fetched as before).
+pub(crate) static GATHER_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Slots of a plan's gather buffer.
+fn gather_slots() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        let mb: usize = std::env::var("VICTORY_CARD_GATHER_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32);
+        ((mb << 20) / GATHER_SLOT).clamp(16, 1 << 16) as u32
+    })
+}
+
+/// Groups for a dispatch of `pieces` pieces at 64 threads a piece.
+fn wide_groups(pieces: u32) -> (u32, u32) {
+    (pieces.clamp(1, 65535), pieces.div_ceil(65535).max(1))
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -1616,6 +1786,9 @@ struct CardPlan {
     /// of the queue (`card_before`'s `sent_as`). Every send up to it had
     /// run on the card when the submission's lists had.
     sent_as: u64,
+    /// With [`card_gather`]: the buffer its compare copied the differing
+    /// pieces into (buffer, mapping).
+    gather: Option<(ID3D12Resource, usize)>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3282,44 +3455,73 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
+        let compile = |source: &str| -> windows::core::Result<ID3DBlob> {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; the out
+            // pointer is ours.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    windows::core::s!("card compare"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+            }
+            code.ok_or_else(windows::core::Error::empty)
+        };
+        let code = compile(if card_wide() { CARD_COMPARE_WIDE } else { CARD_COMPARE })?;
+        let make = |code: &ID3DBlob| -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+            // SAFETY: the blob's own bytes; the root signature is inside
+            // the shader.
+            unsafe {
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })?;
+                Ok((root, pso))
+            }
+        };
+        let gather = if card_gather() {
+            match compile(&format!("#define GATHER 1\n{CARD_COMPARE_WIDE}")).and_then(|code| make(&code)) {
+                Ok(made) => {
+                    tracing::info!(
+                        slots = gather_slots(),
+                        "card gather on (VICTORY_CARD_GATHER=1): the compare after each flight copies the pieces it finds changed into the PC's memory itself"
+                    );
+                    Some(made)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no card gather: the compare that copies could not be made; pieces are fetched as before");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if card_wide() {
+            tracing::info!("card hash passes run 64 threads to a piece (VICTORY_CARD_WIDE_HASH=1 or VICTORY_CARD_GATHER=1)");
         }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
-        unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
+        let (root, pso) = make(&code)?;
+        {
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -3328,6 +3530,8 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                gather,
+                gathers: Vec::new(),
                 taken: 0,
                 out: 0,
             })
@@ -3455,7 +3659,12 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            if card_wide() {
+                                let (x, y) = wide_groups(run.pieces);
+                                list.Dispatch(x, y, 1);
+                            } else {
+                                list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            }
                         }
                     }
                     list.Close()?;
@@ -3475,6 +3684,7 @@ impl Host {
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
             sent_as,
+            gather: None,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3512,6 +3722,24 @@ impl Host {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
+            // With the gather: a buffer for the pieces found changed, its
+            // count of slots taken set to 0 (its last plan is done with it).
+            if flown && work.gather.is_some() {
+                let size = (GATHER_BASE + gather_slots() as usize * GATHER_SLOT) as u64;
+                plan.gather = work.gathers.pop().or_else(|| {
+                    let made = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize));
+                    if let Some((buffer, _)) = &made {
+                        name(buffer, || "card gather: changed pieces for the CPU".into());
+                    }
+                    made
+                });
+                if let Some((_, data)) = &plan.gather {
+                    // SAFETY: the buffer's mapping, at least 256 bytes; no
+                    // submission uses it now.
+                    unsafe { (*data as *mut u32).write_volatile(0) };
+                }
+            }
+            let gather = plan.gather.as_ref().zip(work.gather.as_ref());
             let (allocator, list) = &check;
             // SAFETY: the list's last run finished (its submission was
             // waited for, and it came back after that); live buffers; the
@@ -3530,18 +3758,32 @@ impl Host {
                             }),
                         },
                     }]);
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
+                    match gather {
+                        Some(((buffer, _), (root, pso))) => {
+                            list.SetComputeRootSignature(root);
+                            list.SetPipelineState(pso);
+                            list.SetComputeRootUnorderedAccessView(4, buffer.GetGPUVirtualAddress());
+                        }
+                        None => {
+                            list.SetComputeRootSignature(&work.root);
+                            list.SetPipelineState(&work.pso);
+                        }
+                    }
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }, gather_slots(), 0];
+                        list.SetComputeRoot32BitConstants(0, if gather.is_some() { 8 } else { 6 }, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        if card_wide() {
+                            let (x, y) = wide_groups(r.span.pieces);
+                            list.Dispatch(x, y, 1);
+                        } else {
+                            list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        }
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -3580,6 +3822,9 @@ impl Host {
         };
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
+        }
+        if let Some(gather) = plan.gather {
+            work.gathers.push(gather);
         }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
@@ -3647,13 +3892,34 @@ impl Host {
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        // With the gather: pieces whose bytes the compare copied into a
+        // plan's gather buffer, by (copy, lo, hi): the copy, where the
+        // bytes for `lo` are, and the plan's send. The latest plan that
+        // has a piece decides how it comes (a later one has newer bytes).
+        let mut gathered: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, Option<(usize, u64)>)> = Vec::new();
+        let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
             for plan in plans {
+                // The plan's gathered pieces: (copy, piece) → where its
+                // bytes start in the plan's gather buffer.
+                let mut slots: std::collections::HashMap<(usize, u32), usize> = std::collections::HashMap::new();
+                if let Some((_, data)) = &plan.gather {
+                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                        for p in 0..r.span.pieces {
+                            let d = differs.get((r.at + p) as usize).copied().unwrap_or(0);
+                            if d >= 2 {
+                                let at = data + GATHER_BASE + (d - 2) as usize * GATHER_SLOT;
+                                slots.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p), at);
+                            } else if d == 1 {
+                                GATHER_STATS[2].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
@@ -3668,20 +3934,62 @@ impl Host {
                 for r in &plan.ranges {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
-                        if !fetched.contains(&(copy, r.span.first + p)) {
+                        let piece = r.span.first + p;
+                        if !fetched.contains(&(copy, piece)) {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                        if lo >= hi {
+                            continue;
+                        }
+                        let from = slots.get(&(copy, piece)).map(|&at| (at + (lo - gathered_from(piece, r.span.skew)), plan.sent_as));
+                        match index.get(&(copy, lo, hi)) {
+                            Some(&i) => gathered[i].3 = from,
+                            None => {
+                                index.insert((copy, lo, hi), gathered.len());
+                                gathered.push((r.shadow.clone(), lo, hi, from));
+                            }
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
         }
+        // Those not gathered are fetched, as before.
+        let mut taken: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> = Vec::new();
+        for (shadow, lo, hi, from) in gathered {
+            match from {
+                Some((at, sent_as)) => taken.push((shadow, lo, hi, at, sent_as)),
+                None => {
+                    pieces.push((shadow, lo, hi, total));
+                    total += (hi - lo) as u64;
+                }
+            }
+        }
+        if !taken.is_empty() {
+            let _z = crate::trace::zone("relay: merge gathered pieces (no fetch)");
+            let mut title = Vec::new();
+            let mut written = 0;
+            let mut settle = crate::shadow::Settle::default();
+            for (shadow, lo, hi, at, sent_as) in &taken {
+                // SAFETY: inside the plan's gather buffer (a slot holds the
+                // piece from `gathered_from` on), which its compare wrote
+                // and the card has run; the plan is not done with yet.
+                let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                written += shadow.card_merge_relay_into(*lo, gpu, *sent_as, &mut title, &mut settle);
+                GATHER_STATS[1].fetch_add((hi - lo) as u64, Ordering::Relaxed);
+            }
+            settle.run();
+            GATHER_STATS[0].fetch_add(taken.len() as u64, Ordering::Relaxed);
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        }
         if pieces.is_empty() {
+            if !taken.is_empty() {
+                // Every send up to the latest landed plan's had run when its
+                // compare copied the pieces: no later merge needs them.
+                crate::shadow::relay_fetched(plans.iter().map(|p| p.sent_as).max().unwrap_or(0));
+                return;
+            }
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
             return;
@@ -6249,6 +6557,19 @@ impl Meter {
             self.logged = std::time::Instant::now();
             crate::budget::line();
             crate::watch::census_line();
+            if card_gather() {
+                static LAST: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+                let now = GATHER_STATS.each_ref().map(|c| c.load(Ordering::Relaxed));
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                let d: [u64; 3] = std::array::from_fn(|i| now[i] - last[i]);
+                *last = now;
+                tracing::info!(
+                    "card gather since the last such line: {} pieces ({} MB) merged straight from the compare's copy, no fetch; {} past the plans' room (fetched as before, VICTORY_CARD_GATHER_MB)",
+                    d[0],
+                    d[1] >> 20,
+                    d[2]
+                );
+            }
             {
                 // Whether the lighting was fed: its passes ran, not dropped.
                 let [traced, untraced, built, unbuilt, blocked] = crate::pipeline::take_fed();

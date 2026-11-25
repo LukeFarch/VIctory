@@ -764,6 +764,64 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The wide compare with the gather (`VICTORY_CARD_GATHER=1`): a piece
+    /// found changed takes a slot (its dword is the slot plus 2) and its
+    /// bytes, as they are now, are in the slot; others are 0.
+    #[test]
+    fn warp_card_gather_copies_the_changed_piece() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let wide = compile_cs(&warp.device, crate::host::CARD_COMPARE_WIDE).expect("the wide compare must compile on WARP");
+        let gather = compile_cs(&warp.device, &format!("#define GATHER 1\n{}", crate::host::CARD_COMPARE_WIDE))
+            .expect("the gathering compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        const SLOT: usize = 65792;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_gathered, gathered_ptr, gathered_gpu) = warp.shared_buffer((256 + 4 * SLOT) as u64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, gathering: bool, mode: u32| -> [u32; 3] {
+            // SAFETY: as in the test above; the gather buffer's mapping
+            // holds its count.
+            unsafe {
+                gathered_ptr.cast::<u32>().write_volatile(0);
+                let c = if gathering { &gather } else { &wide };
+                warp.list.SetComputeRootSignature(&c.root);
+                warp.list.SetPipelineState(&c.pso);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode, 4, 0];
+                warp.list.SetComputeRoot32BitConstants(0, if gathering { 8 } else { 6 }, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                if gathering {
+                    warp.list.SetComputeRootUnorderedAccessView(4, gathered_gpu);
+                }
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        run(&mut warp, false, 0);
+        assert_eq!(run(&mut warp, true, 2), [0, 0, 0]);
+        let at = PIECE + 1234;
+        // SAFETY: inside the mapping.
+        unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x40) };
+        assert_eq!(run(&mut warp, true, 2), [0, 2, 0]);
+        // SAFETY: slot 0 of the gather buffer, a piece's bytes.
+        let slot = unsafe { std::slice::from_raw_parts(gathered_ptr.add(256), PIECE) };
+        let mut want = content[PIECE..2 * PIECE].to_vec();
+        want[1234] ^= 0x40;
+        assert!(slot == &want[..], "the slot holds the piece as it is now");
+        assert_eq!(run(&mut warp, true, 2), [0, 0, 0]);
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
