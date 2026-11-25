@@ -275,8 +275,43 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PIPELINE_BLOCK=1`: a draw or dispatch whose host pipeline is
+/// still being made waits until it is, however long, instead of being
+/// dropped. What a run shows then does not hang on how fast the driver
+/// was: a pass the title runs once (a bake, a voxelization) was lost for
+/// the run when its pipeline was late, and runs of one build differed in
+/// their walls and light.
+fn block() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PIPELINE_BLOCK").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_PIPELINE_BLOCK=1: draws and dispatches wait for their host pipelines, however long");
+        }
+        on
+    })
+}
+
+/// Milliseconds waited with [`block`] since the last memory line.
+pub(crate) static BLOCKED_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    if block() {
+        let started = Instant::now();
+        let (lock, done) = &DONE;
+        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while p.made.get().is_none() {
+            held = done.wait_timeout(held, Duration::from_millis(250)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        drop(held);
+        let ms = started.elapsed().as_millis() as u64;
+        BLOCKED_MS.fetch_add(ms, Ordering::Relaxed);
+        if ms > 5_000 {
+            tracing::warn!(ms, shaders = ?p.shaders, "waited for a host pipeline (VICTORY_PIPELINE_BLOCK=1)");
+        }
+        return;
+    }
     let budget = wait_budget();
     if budget.is_zero() || slow(p) {
         return;

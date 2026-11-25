@@ -6187,6 +6187,22 @@ impl Meter {
             self.logged = std::time::Instant::now();
             crate::budget::line();
             {
+                // Whether the lighting was fed: its passes ran, not dropped.
+                let [traced, untraced, built, unbuilt, blocked] = crate::pipeline::take_fed();
+                if traced + untraced + built + unbuilt + blocked > 0 {
+                    let fed = if traced > 0 && untraced == 0 && unbuilt == 0 {
+                        "FED"
+                    } else if traced > 0 {
+                        "PART"
+                    } else {
+                        "UNFED"
+                    };
+                    tracing::info!(
+                        "lighting {fed} since the last such line: ray-traced dispatches {traced} run, {untraced} dropped; structure builder dispatches {built} run, {unbuilt} dropped; {blocked} ms waited for pipelines (VICTORY_PIPELINE_BLOCK=1)"
+                    );
+                }
+            }
+            {
                 let [kept, wrote, idle, over] = crate::shadow::OWNED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
                 if kept + wrote + idle + over > 0 {
                     tracing::info!(
