@@ -4815,6 +4815,7 @@ impl Host {
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
+            let _z = crate::trace::zone("submit: sweep");
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
@@ -4827,7 +4828,10 @@ impl Host {
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
-        crate::descriptor::make_waiting();
+        {
+            let _z = crate::trace::zone("submit: slots that waited for a texture");
+            crate::descriptor::make_waiting();
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -4878,7 +4882,11 @@ impl Host {
             settled += settling.elapsed();
         }
         for list in runs {
-            list.run_deferred(&mut batch);
+            {
+                let mut _z = crate::trace::zone("submit: a list's steps");
+                _z.arg(list.deferred().copies.len() as u64);
+                list.run_deferred(&mut batch);
+            }
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -4887,6 +4895,7 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        let _snapshots_zone = crate::trace::zone("submit: snapshots of shader-written ranges");
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -4897,6 +4906,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        drop(_snapshots_zone);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -4913,18 +4923,26 @@ impl Host {
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            let mut _x = crate::trace::zone("submit: ExecuteCommandLists and signal");
+            _x.arg(lists.len() as u64);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 crate::rebar::flush_writes();
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
-            self.card_sent();
+            drop(_x);
+            {
+                let _z = crate::trace::zone("submit: after sending (card copies noted sent)");
+                self.card_sent();
+            }
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            let _w = crate::trace::zone("submit: what goes back, noted");
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            drop(_w);
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
@@ -6019,6 +6037,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    let _z = crate::trace::zone("submit: a title buffer copy");
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -6046,7 +6065,14 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
-                    work();
+                    {
+                        let _z = crate::trace::zone(if matches!(step, Step::Run(_)) {
+                            "submit: work that may write title memory"
+                        } else {
+                            "submit: work on host memory"
+                        });
+                        work();
+                    }
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
@@ -7060,6 +7086,7 @@ impl Host {
         crate::trace::present();
         let _z = crate::trace::zone("present");
         frame_sleep(frame);
+        crate::trace::page_faults();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -7067,7 +7094,7 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
-        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut presenter = crate::trace::lock("lock wait: presenter", &self.presenter);
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
@@ -7126,6 +7153,7 @@ impl Host {
                 Some(i) => &p.ahead[i].0,
                 None => &p.copy,
             };
+            let mut _rec = crate::trace::zone("present: record the copy");
             copy.reset();
             let list = &copy.list;
             list.ResourceBarrier(&[
@@ -7184,6 +7212,7 @@ impl Host {
                 ),
             ]);
             copy.close();
+            drop(_rec);
             {
                 let _z = crate::trace::zone(if slot.is_some() { "present: send the copy ahead" } else { "present: send the copy and wait" });
                 match slot {
@@ -7196,6 +7225,7 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
+                let _z = crate::trace::zone("present: save a captured frame");
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             if p.source != shown
@@ -7217,7 +7247,12 @@ impl Host {
                     PRESENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            p.meter.frame(p.hwnd);
+            {
+                let _z = crate::trace::zone("present: frame meter");
+                p.meter.frame(p.hwnd);
+            }
+            #[cfg(feature = "diagnostics")]
+            let _p = crate::trace::zone("present: black-frame probe");
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]

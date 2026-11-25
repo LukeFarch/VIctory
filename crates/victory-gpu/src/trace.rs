@@ -128,6 +128,33 @@ fn thread() -> u32 {
     })
 }
 
+/// At each present while spans are recorded: the process's page faults
+/// since the last present (soft and hard together, from
+/// `GetProcessMemoryInfo`), and the bytes it holds in memory then. Tells
+/// whether our copies run into memory the system took away (the profiles
+/// had 30 GB private and 4 GB of it in memory).
+pub(crate) fn page_faults() {
+    use std::sync::atomic::AtomicU32;
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    if !on() {
+        return;
+    }
+    // SAFETY: plain data filled in by the call.
+    let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    pmc.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: our own process and a buffer of the size given.
+    if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) } == 0 {
+        return;
+    }
+    let last = LAST.swap(pmc.PageFaultCount, Ordering::Relaxed);
+    if last != 0 {
+        count("memory: page faults (soft and hard)", u64::from(pmc.PageFaultCount.wrapping_sub(last)));
+    }
+    count("memory: bytes in memory, summed over presents", pmc.WorkingSetSize as u64);
+}
+
 /// Whether spans are being recorded now.
 #[inline]
 pub(crate) fn on() -> bool {
