@@ -2342,7 +2342,7 @@ fn late_threads() {
 }
 
 /// Whether the title's submissions are prepared on a thread of their own
-/// (`VICTORY_SUBMIT_THREAD`; on with [`late`] unless `0`).
+/// (`VICTORY_SUBMIT_THREAD=1`, with [`late`]; off by default).
 ///
 /// With [`late`] alone the card runs while we prepare, but the preparing
 /// (title memory copied into host copies, textures detiled, snapshots,
@@ -2375,7 +2375,12 @@ fn late_threads() {
 /// console's card reads it too.
 pub(crate) fn ahead() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| late() && std::env::var_os("VICTORY_SUBMIT_THREAD").is_none_or(|v| v != "0"))
+    // Off unless asked for (`VICTORY_SUBMIT_THREAD=1`): run 30 had cloth
+    // drawn with vertices of two frames (a shirt's triangles stretched
+    // across the screen), gone with the thread off (run 30a). The title
+    // rewrites such buffers right after its call returns; until what a
+    // list reads is taken at the call, the title's thread prepares.
+    *ON.get_or_init(|| late() && std::env::var_os("VICTORY_SUBMIT_THREAD").is_some_and(|v| v == "1"))
 }
 
 /// The most submissions the line of [`ahead`] holds before the title's
