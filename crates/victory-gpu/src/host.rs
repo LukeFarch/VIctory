@@ -1265,6 +1265,10 @@ fn dred_part(part: &str) -> bool {
 /// `VICTORY_FRAME_SLEEP_MS`: the frame thread sleeps this long before each
 /// present from frame `VICTORY_FRAME_SLEEP_FROM` on (0), to tell what time
 /// alone changes from what a switch changes.
+/// Presents dropped since the start with `VICTORY_PRESENT_NO_WAIT=1`
+/// (the swap chain's queue was full).
+pub(crate) static PRESENTS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn frame_sleep(frame: u64) {
     static MS: OnceLock<(u64, u64)> = OnceLock::new();
     let (ms, from) = *MS.get_or_init(|| {
@@ -6557,6 +6561,12 @@ impl Meter {
             self.logged = std::time::Instant::now();
             crate::budget::line();
             crate::watch::census_line();
+            {
+                let dropped = PRESENTS_DROPPED.load(Ordering::Relaxed);
+                if dropped > 0 {
+                    tracing::info!(dropped, "presents dropped since the start, the swap chain's queue full (VICTORY_PRESENT_NO_WAIT=1)");
+                }
+            }
             if card_gather() {
                 static LAST: Mutex<[u64; 3]> = Mutex::new([0; 3]);
                 let now = GATHER_STATS.each_ref().map(|c| c.load(Ordering::Relaxed));
@@ -6924,12 +6934,15 @@ impl Host {
                 ),
             ]);
             copy.close();
-            match slot {
-                Some(i) => {
-                    let flown = self.execute_own(copy);
-                    p.ahead[i].1 = flown;
+            {
+                let _z = crate::trace::zone(if slot.is_some() { "present: send the copy ahead" } else { "present: send the copy and wait" });
+                match slot {
+                    Some(i) => {
+                        let flown = self.execute_own(copy);
+                        p.ahead[i].1 = flown;
+                    }
+                    None => self.execute(&[copy]),
                 }
-                None => self.execute(&[copy]),
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
@@ -6941,7 +6954,19 @@ impl Host {
             {
                 p.source = shown;
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            {
+                let _z = crate::trace::zone("present: the swap chain's Present");
+                // `VICTORY_PRESENT_NO_WAIT=1`: a swap chain with its queue of
+                // frames full drops this one instead of holding the
+                // presenting thread (the title's) until the card has shown
+                // one; the next present shows a newer frame.
+                static NO_WAIT: OnceLock<bool> = OnceLock::new();
+                let no_wait = *NO_WAIT.get_or_init(|| std::env::var_os("VICTORY_PRESENT_NO_WAIT").is_some_and(|v| v == "1"));
+                let flags = if no_wait { DXGI_PRESENT_DO_NOT_WAIT } else { DXGI_PRESENT(0) };
+                if p.swap_chain.Present(0, flags) == DXGI_ERROR_WAS_STILL_DRAWING {
+                    PRESENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
