@@ -272,6 +272,30 @@ fn of_tracer(shaders: &[Arc<Shader>]) -> bool {
         })
 }
 
+/// `VICTORY_RT_GATE_ALSO=<hash prefixes, comma separated>`: pipelines held
+/// back with the tracers ([`tracer_runs`]) though their programs have no
+/// node test of their own: the passes that only serve the tracing (ray
+/// binning, probe ray requests, the gathers of what the rays hit), which
+/// cost GPU time for nothing while no structure is built (run 23: 68 ms a
+/// frame in two of them). Compute pipelines, by the start of the hash.
+#[cfg(windows)]
+fn gated_also(shaders: &[Arc<Shader>]) -> bool {
+    static ALSO: OnceLock<Vec<String>> = OnceLock::new();
+    let also = ALSO.get_or_init(|| {
+        std::env::var("VICTORY_RT_GATE_ALSO")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let held = shaders.iter().any(|s| also.iter().any(|h| s.hash.starts_with(h.as_str())));
+    if held {
+        tracing::info!(?shaders, "held back with the ray-traced passes (VICTORY_RT_GATE_ALSO)");
+    }
+    held
+}
+
 /// The frame of the last dispatch of the structure builder that ran
 /// (`u64::MAX`: none yet).
 #[cfg(windows)]
@@ -696,7 +720,7 @@ fn hand_out_with(
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
-    let tracer = !builder && of_tracer(&shaders);
+    let tracer = !builder && (of_tracer(&shaders) || gated_also(&shaders));
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
