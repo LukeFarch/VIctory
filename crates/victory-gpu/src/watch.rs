@@ -1989,6 +1989,9 @@ pub(crate) fn census_open(at: usize, len: usize) -> bool {
     let (reader, kind) = WHO.with(|w| w.get());
     for &block in &blocks {
         let writer = c.waiting.remove(&block).map_or(0, |w| w.2);
+        if reader == 0 {
+            census_untagged();
+        }
         seen(
             match kind {
                 _ if reader != 0 && reader == writer => Seen::ReadSame,
@@ -2009,11 +2012,28 @@ pub(crate) fn census_open(at: usize, len: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// Our kernel reads of copied-back blocks by no copy the census knows
+/// (`Seen::ReadOther`), by the reading thread's name: who they are decides
+/// whether GPU-owned pages can stay on the card (step 3 of the dirty-page
+/// mask) or are read back at once anyway.
+static UNTAGGED: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+fn census_untagged() {
+    let name = std::thread::current().name().unwrap_or("unnamed").trim_end_matches(|c: char| c.is_ascii_digit() || c == '-').to_owned();
+    *UNTAGGED.lock().unwrap_or_else(|e| e.into_inner()).entry(name).or_default() += 1;
+}
+
 /// For the memory line: what the census saw since the line before.
 pub(crate) fn census_line() {
     use std::sync::atomic::Ordering::Relaxed;
     if !census() {
         return;
+    }
+    {
+        let untagged = std::mem::take(&mut *UNTAGGED.lock().unwrap_or_else(|e| e.into_inner()));
+        if !untagged.is_empty() {
+            tracing::info!("read census, our kernel reads by no known copy since the last such line, by thread: {untagged:?}");
+        }
     }
     static LAST: Mutex<[u64; SEEN]> = Mutex::new([0; SEEN]);
     let now: [u64; SEEN] = std::array::from_fn(|i| SEEN_N[i].load(Relaxed));
