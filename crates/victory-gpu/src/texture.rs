@@ -65,9 +65,9 @@ struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
     /// When a partly mapped texture was last read.
-    partial: Option<std::time::Instant>,
-    /// When the guarded texture was last hashed.
-    hashed: Option<std::time::Instant>,
+    partial: Option<(std::time::Instant, u64)>,
+    /// When the guarded texture was last hashed (time and frame).
+    hashed: Option<(std::time::Instant, u64)>,
     /// The guard saw no write, yet the hash found the texture changed: it
     /// is written where the guard cannot see (the intro video's planes,
     /// run 19: shown up to a few frames late, the zoom jumping back and
@@ -76,13 +76,13 @@ struct Last {
     /// streamed texture written once that way goes back to the guard.
     blind: bool,
     still: u32,
-    /// Changes the guard did not see in a row, each within `AGAIN` of the
-    /// one before, and when the last was found: a texture becomes blind
+    /// Hash turns in a row that found a change the guard did not see (any
+    /// turn finding none starts over; counted in turns, not time, so the
+    /// frame rate does not decide it, run 21d): a texture becomes blind
     /// only after `UNSEEN` of them (rewritten over and over, as a video
     /// is), not when it streams in once (run 20: marking those cost as
     /// much as no guard at all, 2.9 s of uploads in a frame).
     unseen: u32,
-    unseen_at: Option<std::time::Instant>,
 }
 
 /// Retry and hash periods are wall-clock time, not frames: counted in
@@ -91,6 +91,16 @@ struct Last {
 /// `VICTORY_TEXTURE_PARTIAL_MS` and `VICTORY_TEXTURE_HASH_MS` set them.
 /// Textures blind now (`Last::blind`), at most 32.
 pub(crate) static BLIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Frames that must pass besides the period, `default` unless
+/// `VICTORY_TEXTURE_MIN_FRAMES` sets one count for both: in time alone, a
+/// slow frame made every texture due at every frame, and the hashing slowed
+/// the frame further (runs 20-21: 1-3 s of texture work a frame at 0.5 fps,
+/// where frames counted alone had each texture hashed every 8th).
+fn min_frames(default: u64) -> u64 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| std::env::var("VICTORY_TEXTURE_MIN_FRAMES").ok().and_then(|v| v.parse().ok())).unwrap_or(default)
+}
 
 fn period(name: &str, default: u64, cell: &'static std::sync::OnceLock<std::time::Duration>) -> std::time::Duration {
     *cell.get_or_init(|| {
@@ -685,11 +695,11 @@ impl Staging {
             last.asked = now;
             // Staggered by the texture's address, so the textures take turns.
             let every = period("VICTORY_TEXTURE_HASH_MS", 133, &HASH) + std::time::Duration::from_millis(((start >> 16) & 7) as u64 * 17);
-            let turn = last.hashed.is_none_or(|at| at.elapsed() >= every);
+            let turn = last.hashed.is_none_or(|(at, frame)| at.elapsed() >= every && crate::frame::current() >= frame + min_frames(8));
             if unwritten && !turn && !last.blind {
                 return 0;
             }
-            last.hashed = Some(std::time::Instant::now());
+            last.hashed = Some((std::time::Instant::now(), crate::frame::current()));
             if last.blind {
                 const STILL: u32 = 120;
                 let before = last.hash;
@@ -704,15 +714,14 @@ impl Staging {
             }
             if unwritten && !last.blind {
                 use std::sync::atomic::Ordering::Relaxed;
-                const UNSEEN: u32 = 4;
-                const AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+                const UNSEEN: u32 = 3;
                 const MAX_BLIND: u64 = 32;
                 let before = last.hash;
                 let read = self.refresh_read(last, size);
-                if before.is_some() && last.hash != before {
-                    let now = std::time::Instant::now();
-                    last.unseen = if last.unseen_at.is_some_and(|at| now - at <= AGAIN) { last.unseen + 1 } else { 1 };
-                    last.unseen_at = Some(now);
+                if before.is_none() || last.hash == before {
+                    last.unseen = 0;
+                } else {
+                    last.unseen += 1;
                     if last.unseen >= UNSEEN
                         && BLIND.fetch_update(Relaxed, Relaxed, |n| (n < MAX_BLIND).then_some(n + 1)).is_ok()
                     {
@@ -763,10 +772,10 @@ impl Staging {
             }
             static RETRY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
             let every = period("VICTORY_TEXTURE_PARTIAL_MS", 500, &RETRY);
-            if last.partial.is_some_and(|at| at.elapsed() < every) {
+            if last.partial.is_some_and(|(at, frame)| at.elapsed() < every || crate::frame::current() < frame + min_frames(4)) {
                 return 0;
             }
-            last.partial = Some(std::time::Instant::now());
+            last.partial = Some((std::time::Instant::now(), crate::frame::current()));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
