@@ -52,72 +52,10 @@ fn folder() -> Option<String> {
     if storage.as_os_str().is_empty() {
         return None;
     }
-    static SIZED: std::sync::Once = std::sync::Once::new();
-    SIZED.call_once(|| set_render_size(&storage));
     #[cfg(windows)]
     return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
     #[cfg(not(windows))]
     None
-}
-
-/// Where RAGE titles keep their video settings in their storage.
-const SETTINGS: &str = r"settings\settings.xml";
-
-/// Writes the render size the user asked for (`console::render_size`)
-/// into the title's saved video settings before the title can read them.
-/// The title (2026) sizes its window and render targets from
-/// `resolutionFullscreen` there, not from the display mode; the file is
-/// the title's own, so the first one it wrote is kept beside it, once.
-/// shortcut: a storage with no settings file yet is left alone (the title
-/// writes its defaults on its first run; the size applies from the next).
-fn set_render_size(storage: &Path) {
-    let Some((width, height)) = victory_gpu::console::render_size() else {
-        return;
-    };
-    let file = storage.join(SETTINGS);
-    let Ok(xml) = std::fs::read_to_string(&file) else {
-        tracing::info!(file = %file.display(), "no saved video settings yet; the render size applies from the next run");
-        return;
-    };
-    let Some(sized) = with_resolution(&xml, width, height) else {
-        tracing::warn!(file = %file.display(), "no resolutionFullscreen in the saved video settings; render size not set");
-        return;
-    };
-    if sized == xml {
-        tracing::info!(
-            width,
-            height,
-            "saved video settings already at the render size"
-        );
-        return;
-    }
-    let kept = file.with_extension("xml.victory-original");
-    if !kept.exists() {
-        let _ = std::fs::write(&kept, &xml);
-    }
-    match std::fs::write(&file, sized) {
-        Ok(()) => {
-            tracing::info!(width, height, file = %file.display(), "render size written to the saved video settings")
-        }
-        Err(e) => tracing::warn!(error = %e, "render size not written to the saved video settings"),
-    }
-}
-
-/// `xml` with the width and height of its `resolutionFullscreen` element
-/// set; `None` if it has none.
-fn with_resolution(xml: &str, width: u32, height: u32) -> Option<String> {
-    const OPEN: &str = "<resolutionFullscreen>";
-    const CLOSE: &str = "</resolutionFullscreen>";
-    let start = xml.find(OPEN)? + OPEN.len();
-    let end = start + xml[start..].find(CLOSE)?;
-    let mut inner = xml[start..end].to_owned();
-    for (name, value) in [("width", width), ("height", height)] {
-        let tag = format!("<{name} value=\"");
-        let at = inner.find(&tag)? + tag.len();
-        let len = inner[at..].find('"')?;
-        inner.replace_range(at..at + len, &value.to_string());
-    }
-    Some(format!("{}{inner}{}", &xml[..start], &xml[end..]))
 }
 
 extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
@@ -238,24 +176,6 @@ static VTABLE: Methods<8> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
-
-    #[test]
-    fn the_render_size_goes_into_the_saved_video_settings() {
-        let xml = "<video>\n  <uiResolution>\n    <width value=\"0\" />\n    <height value=\"0\" />\n  </uiResolution>\n  <resolutionFullscreen>\n    <width value=\"3840\" />\n    <height value=\"2160\" />\n  </resolutionFullscreen>\n</video>";
-        let sized = with_resolution(xml, 1920, 1080).unwrap();
-        assert!(sized.contains(
-            "<resolutionFullscreen>\n    <width value=\"1920\" />\n    <height value=\"1080\" />"
-        ));
-        assert!(
-            sized.contains("<width value=\"0\" />\n    <height value=\"0\" />\n  </uiResolution>"),
-            "the UI size is left"
-        );
-        assert_eq!(
-            with_resolution(&sized, 1920, 1080).as_deref(),
-            Some(sized.as_str())
-        );
-        assert_eq!(with_resolution("<video />", 1920, 1080), None);
-    }
 
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
