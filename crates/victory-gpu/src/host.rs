@@ -139,6 +139,19 @@ fn sweep() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
+    if sweep_thread() {
+        static STARTED_ONCE: std::sync::Once = std::sync::Once::new();
+        STARTED_ONCE.call_once(|| match std::thread::Builder::new().name("victory-sweep".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            sweep_parts();
+        }) {
+            Ok(_) => tracing::info!("the sweep runs on a thread of its own, once a second (VICTORY_SWEEP_THREAD=1)"),
+            Err(e) => tracing::warn!(error = %e, "no thread for the sweep; it stays with the submitting thread"),
+        });
+        if STARTED_ONCE.is_completed() {
+            return;
+        }
+    }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
@@ -149,10 +162,43 @@ fn sweep() {
     {
         return;
     }
-    crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
-    crate::resource::let_go_idle();
+    sweep_parts();
+}
+
+/// Whether the sweep's parts run on a thread of their own, once a second,
+/// instead of on the submitting thread before a submission
+/// (`VICTORY_SWEEP_THREAD=1`; off by default).
+///
+/// Run 15's prison profile: "submit: sweep" 71-84 ms a frame on the
+/// submitting thread, about 100 ms each time it ran. Every part looks only
+/// at what no list and no slot holds (the copies' and textures' own counts
+/// say so, read under the tables' locks) and gives it to [`retire`], which
+/// waits for the submissions running then: the title's recording threads
+/// already run beside the sweep, and nothing in it needed to be before a
+/// submission.
+fn sweep_thread() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_THREAD").is_some_and(|v| v == "1"))
+}
+
+/// The sweep's four parts, each a span of its own.
+fn sweep_parts() {
+    {
+        let _z = crate::trace::zone("sweep: pipeline library trimmed");
+        crate::pipeline::trim_library();
+    }
+    {
+        let _z = crate::trace::zone("sweep: idle windows of title memory");
+        crate::shadow::let_go_idle();
+    }
+    {
+        let _z = crate::trace::zone("sweep: idle staging of textures");
+        crate::texture::let_go_idle();
+    }
+    {
+        let _z = crate::trace::zone("sweep: idle host textures");
+        crate::resource::let_go_idle();
+    }
 }
 
 /// Drops `object` once every submission running now has finished: at once
