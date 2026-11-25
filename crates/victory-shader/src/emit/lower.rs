@@ -2838,6 +2838,30 @@ impl<'a> Lower<'a> {
     /// up; code that takes the address masks those away.)
     fn view_address(&mut self, site: Site) -> Option<(V, V)> {
         use super::shader::USER_VIEW_ADDRESS;
+        let (slot, dword) = self.view_table_dword(site)?;
+        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), slot, dword);
+        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), slot, dword);
+        Some((lo, hi))
+    }
+
+    /// The bytes per element of the buffer view whose descriptor the load
+    /// at `site` reads: from the host by table dword
+    /// ([`super::shader::USER_VIEW_STRIDE`]) or by heap slot
+    /// ([`super::shader::SLOT_STRIDES`]); `None` for a load of another kind.
+    fn element_bytes(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let Source::Loaded { load, first: 0 } = src else {
+            return Ok(None);
+        };
+        if let Some((slot, dword)) = self.view_table_dword(*load) {
+            return Ok(Some(self.host_word(RootType::Other(super::shader::USER_VIEW_STRIDE), slot, dword)));
+        }
+        self.slot_stride(src)
+    }
+
+    /// The root parameter slot and table dword of the 4-dword buffer view
+    /// descriptor the scalar load at `site` reads from the start of a
+    /// table entry ([`Self::view_address`]).
+    fn view_table_dword(&mut self, site: Site) -> Option<(u8, u32)> {
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
         if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
@@ -2858,9 +2882,7 @@ impl<'a> Lower<'a> {
         if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
             return None;
         }
-        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
-        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
-        Some((lo, hi))
+        Some((rp.slot, dword))
     }
 
     /// The title address (low, high dword) of the buffer view that the
@@ -10825,8 +10847,19 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                // The element's size is the view's format's: not known here.
-                self.mark_dirty_view(src, None, 0, guard)?;
+                // The element's size is the view's format's, which the host
+                // tells (the descriptor's): the store writes at most 16 bytes
+                // from index times it.
+                if super::dirty_mask() != 0 {
+                    let at = match self.element_bytes(src)? {
+                        Some(k) => Some(match index {
+                            Some(index) => self.s.m.bin(c, Bin::Mul, index, k),
+                            None => self.s.m.i32(0),
+                        }),
+                        None => None,
+                    };
+                    self.mark_dirty_view(src, at, 16, guard)?;
+                }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {

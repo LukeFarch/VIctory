@@ -106,6 +106,13 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// runs in one dimension (65,535), which it runs in parts. No program asks
 /// for it yet: until the translator does, such a dispatch runs as before.
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// bytes per element of the buffer view at dword `dword` of the
+/// descriptor table of root parameter `slot`, as the console's descriptor
+/// holds them (structured: the stride; typed: the format's; raw: 1; 0: no
+/// buffer view). Asked only for the dirty-page marks of typed stores
+/// (`VICTORY_DIRTY_MASK`), whose code does not say the element's size.
+pub const USER_VIEW_STRIDE: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

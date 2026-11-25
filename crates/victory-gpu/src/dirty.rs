@@ -345,7 +345,7 @@ pub(crate) fn line() {
     }
     let sites = &victory_shader::emit::DIRTY_SITES;
     tracing::info!(
-        "dirty pages since the last such line: {} submissions read, {} pages marked ({:.1} MB); {} not all marked (a store not placed ran), {} list overflows; pages the card changed, checked: {:.2} MB, {:.2} MB of them in marked pages, {:.2} MB in pages not marked (misses, {} runs), {:.2} MB not marked while stores not placed ran; store sites translated: {} placed, {} not; copy-back by marks (VICTORY_DIRTY_MASK=1): {} ranges looked at marked pages only ({:.1} MB declared, {:.1} MB looked at), {} looked everywhere (marks not all there)",
+        "dirty pages since the last such line: {} submissions read, {} pages marked ({:.1} MB); {} not all marked (a store not placed ran), {} list overflows; pages the card changed, checked: {:.2} MB, {:.2} MB of them in marked pages, {:.2} MB in pages not marked (misses, {} runs), {:.2} MB not marked while stores not placed ran; store sites translated in this process (not by the warm): {} placed, {} not; copy-back by marks (VICTORY_DIRTY_MASK=1): {} ranges looked at marked pages only ({:.1} MB declared, {:.1} MB looked at), {} looked everywhere (marks not all there)",
         s[0],
         s[1],
         s[1] as f64 * 4096.0 / 1e6,
