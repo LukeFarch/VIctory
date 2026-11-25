@@ -312,16 +312,21 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // `VICTORY_FULL_REFRESH=1`: every page asked about counts as written,
     // so every host copy is brought up to date whole each time it is used
     // (slow; to tell a missed write from another cause of a stale copy).
-    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FULL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let full = *FULL.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_FULL_REFRESH").is_some_and(|v| v == "1");
-        if on {
-            tracing::warn!("VICTORY_FULL_REFRESH=1: every page asked about counts as written; copies are refreshed whole (slow)");
+        let on = std::env::var("VICTORY_FULL_REFRESH").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0);
+        match on {
+            1 => tracing::warn!("VICTORY_FULL_REFRESH=1: every page asked about counts as written; copies are refreshed whole (slow)"),
+            // The half of it that only asks the kernel (or the guard)
+            // every time, in place of the journal of ranges asked ahead.
+            2 => tracing::warn!("VICTORY_FULL_REFRESH=2: ranges asked ahead are asked again each time; pages count as written only where they were"),
+            _ => {}
         }
         on
     });
+    let (full, asks) = (full == 1, full != 0);
     // Asked ahead with the submission's other ranges: the journal has it.
-    if !full && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !asks && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
             j.ahead_asked,
             j.written
