@@ -269,6 +269,7 @@ pub(crate) fn reserve(kind: Kind, size: u64, cpu_read: bool) -> bool {
         }
         _ => return false,
     }
+    crate::trace::count("rebar: host copies placed in card memory (bytes)", size);
     let now = PLACED[0].fetch_add(size, Ordering::Relaxed) + size;
     PLACED[1].fetch_add(1, Ordering::Relaxed);
     let line = NEXT_LINE.load(Ordering::Relaxed);
@@ -352,6 +353,7 @@ pub(crate) fn cpu_reads(n: usize) {
     if n == 0 {
         return;
     }
+    crate::trace::count("rebar: CPU reads of card memory (bytes)", n as u64);
     let before = STATS[0].fetch_add(n as u64, Ordering::Relaxed);
     let times = STATS[1].fetch_add(1, Ordering::Relaxed);
     if times == 0 || (before >> 26) != ((before + n as u64) >> 26) {
@@ -365,6 +367,7 @@ pub(crate) fn cpu_reads(n: usize) {
 
 /// A placed copy shaders wrote is let go to move out.
 pub(crate) fn moved_out() {
+    crate::trace::count("rebar: placed copies moved out (shaders wrote them)", 1);
     STATS[3].fetch_add(1, Ordering::Relaxed);
 }
 
