@@ -352,6 +352,53 @@ pub fn set_why_label(label: &str) {
     WHY_LABEL.with(|l| *l.borrow_mut() = label.to_owned());
 }
 
+thread_local! {
+    /// See [`set_container_hash`].
+    static CONTAINER_HASH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The container this thread translates from now on, by the hash a run's log names it by
+/// (the first 16 hex digits of its BLAKE3), for the switches that pick programs by hash
+/// (`VICTORY_WAVE_WIDE_ONLY`). The shader cache's translation and the translate command
+/// set it; a translation without it is not picked by any of them.
+pub fn set_container_hash(hash: &str) {
+    CONTAINER_HASH.with(|h| *h.borrow_mut() = hash.to_ascii_lowercase());
+}
+
+/// `VICTORY_WAVE_WIDE_ONLY=<hash>,<hash>,...`: the wave-wide form ([`widen`]) for these
+/// containers only, as `VICTORY_WAVE_WIDE=1` gives it to every one. A wave64 program in a
+/// thread group of one console wave that is otherwise taken an approximate way (each host
+/// wave on its own: a tile's count, sum or first lane becomes two half-tile ones) is then
+/// exact. `VICTORY_WAVE_WIDE=1` stays off by default because runs 121-124 lost the card in
+/// `ptfx_CS_lightAtlas_Sprite` and `_Trail`; a list leaves those out. Entries are 16 hex
+/// digits (a prefix of at least 8 matches too). Part of the translation of the listed
+/// containers only: the shader cache keys those apart (`victory-gpu`'s does).
+fn wide_listed() -> bool {
+    CONTAINER_HASH.with(|h| wave_wide_listed(&h.borrow()))
+}
+
+/// Whether `VICTORY_WAVE_WIDE_ONLY` names the container of this hash (16 hex digits). The
+/// shader cache keys the translations of those containers apart, so a run with the switch
+/// translates only them again.
+pub fn wave_wide_listed(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| parse_hash_list(std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().as_deref()));
+    let hash = hash.to_ascii_lowercase();
+    !hash.is_empty() && list.iter().any(|x| hash.starts_with(x.as_str()))
+}
+
+/// A comma- or semicolon-separated list of container hashes (8 to 16 hex digits each,
+/// lower-cased); other entries are dropped. Pure, for testing.
+fn parse_hash_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split([',', ';', ' '])
+        .map(str::trim)
+        .filter(|x| (8..=16).contains(&x.len()) && x.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// [`set_why_label`]'s label to append to a diagnostic line ("" when none is set).
 pub(crate) fn why_label() -> String {
     WHY_LABEL.with(|l| {
@@ -471,7 +518,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || wide_listed();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -895,6 +942,15 @@ mod tests {
         assert_eq!(parse_uav_coherent(Some("2")), 2);
         assert_eq!(parse_uav_coherent(Some("3")), 0);
         assert_eq!(parse_uav_coherent(Some("on")), 0);
+    }
+
+    #[test]
+    fn wide_only_switch_keeps_hex_hashes() {
+        assert!(super::parse_hash_list(None).is_empty());
+        assert_eq!(
+            super::parse_hash_list(Some("8DD8D739047FE557, ce2378e5;xyz,123, 0a5ecfee6b79e13b")),
+            ["8dd8d739047fe557", "ce2378e5", "0a5ecfee6b79e13b"]
+        );
     }
 
     #[test]

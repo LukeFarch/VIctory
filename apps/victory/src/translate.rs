@@ -333,6 +333,8 @@ fn translate(
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
     let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    // (for the switches that pick programs by it, `VICTORY_WAVE_WIDE_ONLY`)
+    emit::set_container_hash(&hash);
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
