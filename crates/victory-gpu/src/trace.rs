@@ -7,8 +7,8 @@
 //! presents. Nothing is recorded, and each span costs one relaxed load,
 //! unless the variable is set.
 //!
-//! `VICTORY_TRACE_FROM` (presents, 2000 by default: well into the world)
-//! is where recording starts and `VICTORY_TRACE_FRAMES` (30) how many
+//! `VICTORY_TRACE_FROM` (presents after the world's first frame, the
+//! first with 500 draws or more; 600 by default) is where recording starts and `VICTORY_TRACE_FRAMES` (30) how many
 //! presents it covers. The file is written on a thread of its own when
 //! the window ends. Spans past [`MOST`] in the window are dropped (and
 //! counted in the file's metadata).
@@ -33,6 +33,10 @@ static ON: AtomicBool = AtomicBool::new(false);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Presents seen so far.
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
+/// Draws counted at the last present, and the present of the world's
+/// first frame (0: not yet).
+static DRAWN: AtomicU64 = AtomicU64::new(0);
+static WORLD: AtomicU64 = AtomicU64::new(0);
 /// A small number per thread for the file (thread ids are long).
 static NEXT_THREAD: AtomicUsize = AtomicUsize::new(1);
 
@@ -195,7 +199,19 @@ pub(crate) fn present() {
         return;
     };
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
-    let from = number("VICTORY_TRACE_FROM", 2000);
+    // The world's first frame: the first with 500 draws or more since the
+    // present before it (menus and loading screens draw a few dozen).
+    let drawn = crate::draw::drawn();
+    let before = DRAWN.swap(drawn, Ordering::Relaxed);
+    if WORLD.load(Ordering::Relaxed) == 0 && drawn.saturating_sub(before) >= 500 {
+        WORLD.store(n, Ordering::Relaxed);
+        tracing::info!(present = n, "trace: the world's first frame");
+    }
+    let world = WORLD.load(Ordering::Relaxed);
+    if world == 0 {
+        return;
+    }
+    let from = world + number("VICTORY_TRACE_FROM", 600);
     let frames = number("VICTORY_TRACE_FRAMES", 30).max(1);
     if n == from {
         let _ = epoch();
