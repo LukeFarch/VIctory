@@ -1126,6 +1126,9 @@ fn resident_cap() -> usize {
 struct Resident {
     image: Box<[u8]>,
     card: Box<[bool]>,
+    /// The section that holds the block's physical pages, and the block's
+    /// offset in it ([`write_kept`] writes through it).
+    section: (usize, u64),
 }
 
 static RESIDENT: Mutex<BTreeMap<usize, Resident>> = Mutex::new(BTreeMap::new());
@@ -1186,6 +1189,18 @@ pub(crate) fn resident_merge(at: usize, n: usize, merge: impl FnOnce(&mut [u8]) 
         resident_stat(7, 1);
         return Kept::No;
     }
+    // Each block one run of a section, so that it can be written in with
+    // the title's address kept closed.
+    let mut sections = Vec::with_capacity(last - first);
+    for b in first..last {
+        match crate::inplace::cover(b * BLOCK, BLOCK) {
+            crate::inplace::Cover::Run(section, offset) if offset.is_multiple_of(BLOCK as u64) => sections.push((section, offset)),
+            _ => {
+                resident_stat(7, 1);
+                return Kept::No;
+            }
+        }
+    }
     let mut twin = false;
     crate::inplace::twins(first * BLOCK, last * BLOCK, |_, _| twin = true);
     if twin {
@@ -1231,6 +1246,7 @@ pub(crate) fn resident_merge(at: usize, n: usize, merge: impl FnOnce(&mut [u8]) 
             None => Resident {
                 image,
                 card: vec![false; BLOCK].into_boxed_slice(),
+                section: sections[b - first],
             },
         };
         for x in lo..hi {
@@ -1270,17 +1286,27 @@ pub(crate) fn resident_merge(at: usize, n: usize, merge: impl FnOnce(&mut [u8]) 
 
 /// Writes the card's bytes of kept block `b` into title memory and leaves
 /// it read-only (guarded). The block has no access (it is kept).
+///
+/// Through a view of our own of the block's physical pages (its section,
+/// [`Resident::section`]): the title's address stays with no access until
+/// every byte is in. Run 7 made the title's address writable, then copied:
+/// a title thread that read the block in that moment, without a fault,
+/// took the old bytes (a pointer the card had not written yet) and
+/// crashed on it.
 fn write_kept(b: usize, kept: &Resident) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    let mut old = 0;
-    // SAFETY: a kept block of title view memory, which we left with no
-    // access or read-only; written only where the card wrote, then back to
-    // read-only.
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile, VirtualProtect};
+    let (section, offset) = kept.section;
+    // SAFETY: the runtime's section of the block's physical pages, which
+    // outlives the title's views of it; a view of BLOCK bytes from an
+    // offset on the allocation granularity (64 KiB), unmapped below.
+    let view = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, BLOCK) };
+    let base = view.Value.cast::<u8>();
+    if base.is_null() {
+        resident_stat(6, 1);
+        return;
+    }
+    // SAFETY: our view of BLOCK bytes; written only where the card wrote.
     unsafe {
-        if VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) == 0 {
-            return;
-        }
-        let base = (b * BLOCK) as *mut u8;
         let mut i = 0;
         while i < BLOCK {
             if !kept.card[i] {
@@ -1294,8 +1320,12 @@ fn write_kept(b: usize, kept: &Resident) {
             std::ptr::copy_nonoverlapping(kept.image.as_ptr().add(i), base.add(i), k - i);
             i = k;
         }
-        VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old);
+        UnmapViewOfFile(view);
     }
+    let mut old = 0;
+    // SAFETY: a kept block of title view memory, which we left with no
+    // access; back to read-only (guarded), its bytes all in.
+    unsafe { VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) };
 }
 
 /// Whether block `b` can be read now (committed, with some access).
