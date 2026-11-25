@@ -402,6 +402,17 @@ pub fn set_container_hash(hash: &str) {
 /// `ptfx_CS_lightAtlas_Sprite` and `_Trail`; a list leaves those out. Entries are 16 hex
 /// digits (a prefix of at least 8 matches too). Part of the translation of the listed
 /// containers only: the shader cache keys those apart (`victory-gpu`'s does).
+/// The low 32 bits of the container hash being translated (never 0), for
+/// the dirty mask's "not all marked" dword: the host names the shader
+/// whose store could not be placed (`SLOT_DIRTY`).
+pub(crate) fn container_tag() -> u32 {
+    CONTAINER_HASH.with(|h| {
+        let h = h.borrow();
+        let low = &h[h.len().saturating_sub(8)..];
+        u32::from_str_radix(low, 16).unwrap_or(1).max(1)
+    })
+}
+
 fn wide_listed() -> bool {
     CONTAINER_HASH.with(|h| wave_wide_listed(&h.borrow()))
 }

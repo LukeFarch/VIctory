@@ -59,8 +59,9 @@ pub const SLOT_VIEW_ADDRESSES: u8 = 252;
 /// `dirty.rs`): the root UAV `u<SLOT_DIRTY>` in [`ROOT_CBV_SPACE`] of a
 /// shader that stores to buffers. One raw buffer of [`DIRTY_DWORDS`]:
 /// dword 0 counts the pages listed; dword 1 is set when a store the
-/// translator could not place in title memory ran (the host then trusts
-/// no mark of that submission); dwords from [`DIRTY_LIST_AT`] list the
+/// translator could not place in title memory ran (to the low 32 bits of
+/// that shader's container hash; the host then trusts no mark of that
+/// submission); dwords from [`DIRTY_LIST_AT`] list the
 /// pages marked (title address / 4096), one entry past [`DIRTY_LIST`] a
 /// sink; from [`DIRTY_MASK_AT`] one bit per 4 KiB page of title address
 /// space below 128 GiB. Each store sets the bit of each page it writes;

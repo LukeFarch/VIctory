@@ -3181,7 +3181,8 @@ impl<'a> Lower<'a> {
     }
 
     /// A store the dirty mask cannot place ran (`shader.rs` `SLOT_DIRTY`,
-    /// dword 1), for lanes where `guard` holds.
+    /// dword 1: the low 32 bits of this container's hash, so the host can
+    /// name it), for lanes where `guard` holds.
     fn dirty_unplaced(&mut self, guard: Option<V>) {
         use super::shader::SLOT_DIRTY;
         let h = self.s.root_uav_handle(SLOT_DIRTY);
@@ -3189,7 +3190,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let iu = self.s.m.undef(i32t);
-        let (four, one) = (self.s.m.i32(4), self.s.m.i32(1));
+        let (four, one) = (self.s.m.i32(4), self.s.m.i32(super::container_tag()));
         let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
         let void = self.s.t.void;
         self.s.op(

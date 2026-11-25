@@ -2244,6 +2244,7 @@ impl Shadow {
     /// into the copy, and `before` takes them. What the card made in the
     /// rest stays. Returns the bytes copied.
     fn merge_title(&self, lo: usize, before: &mut [u8]) -> usize {
+        let _why = crate::watch::census_why(3);
         self.wc_read(before.len());
         if fast_merge() {
             return self.merge_title_fast(lo, before);
@@ -2456,6 +2457,7 @@ impl Shadow {
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         let _who = crate::watch::census_who(self.id, self.census_kind());
+        let _why = crate::watch::census_why(4);
         if self.place.is_some() {
             return 0;
         }
@@ -2989,6 +2991,7 @@ impl Shadow {
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         let _who = crate::watch::census_who(self.id, self.census_kind());
+        let _why = crate::watch::census_why(1);
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -3108,6 +3111,7 @@ impl Shadow {
     }
 
     fn settle_with(&self, from: usize, to: usize, now: u64, title: &mut [u8]) -> usize {
+        let _why = crate::watch::census_why(2);
         // Run 16 compared 316-467 MB a frame of pages here for 53-77 MB
         // copied back: whole 64 KiB pages read through the kernel and
         // compared, for pieces of a few bytes. The zone says what it costs.

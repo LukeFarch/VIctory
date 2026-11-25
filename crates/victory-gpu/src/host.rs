@@ -6294,6 +6294,7 @@ impl HostList {
                     }
                     batch.title_written();
                     let _z = crate::trace::zone("submit: a title buffer copy");
+                    let _why = crate::watch::census_why(5);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -6305,6 +6306,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    let _why = crate::watch::census_why(6);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }

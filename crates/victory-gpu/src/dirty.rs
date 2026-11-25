@@ -64,6 +64,10 @@ struct Dirty {
     /// could not place ran, or the list overflowed): the check skips
     /// changed pages up to this one.
     blind_until: u64,
+    /// Since the last line: submissions not all marked, by the container
+    /// hash (low 32 bits) of a shader whose store was not placed (the last
+    /// such store of the submission).
+    unplaced: HashMap<u32, u64>,
 }
 
 // SAFETY: COM objects used under the mutex only.
@@ -111,6 +115,7 @@ pub(crate) fn mask(host: &Host) -> Option<u64> {
             marked: BTreeMap::new(),
             landed: 0,
             blind_until: 0,
+            unplaced: HashMap::new(),
         });
     }
     // SAFETY: a live buffer.
@@ -204,6 +209,7 @@ pub(crate) fn landed(number: u64) {
         STATS[1].fetch_add(n as u64, Ordering::Relaxed);
         if unplaced != 0 {
             STATS[2].fetch_add(1, Ordering::Relaxed);
+            *d.unplaced.entry(unplaced).or_default() += 1;
         }
         if count > DIRTY_LIST {
             STATS[3].fetch_add(1, Ordering::Relaxed);
@@ -328,6 +334,15 @@ pub(crate) fn line() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+    let mut unplaced: Vec<(u32, u64)> = lock().as_mut().map(|d| std::mem::take(&mut d.unplaced).into_iter().collect()).unwrap_or_default();
+    unplaced.sort_by_key(|u| std::cmp::Reverse(u.1));
+    if !unplaced.is_empty() {
+        let top: Vec<String> = unplaced.iter().take(12).map(|(h, n)| format!("{h:08x} {n}")).collect();
+        tracing::info!(
+            "dirty pages: submissions not all marked since the last such line, by a shader whose store was not placed (container hash, last 8 digits, then submissions): {}",
+            top.join(", ")
+        );
+    }
     let sites = &victory_shader::emit::DIRTY_SITES;
     tracing::info!(
         "dirty pages since the last such line: {} submissions read, {} pages marked ({:.1} MB); {} not all marked (a store not placed ran), {} list overflows; pages the card changed, checked: {:.2} MB, {:.2} MB of them in marked pages, {:.2} MB in pages not marked (misses, {} runs), {:.2} MB not marked while stores not placed ran; store sites translated: {} placed, {} not; copy-back by marks (VICTORY_DIRTY_MASK=1): {} ranges looked at marked pages only ({:.1} MB declared, {:.1} MB looked at), {} looked everywhere (marks not all there)",

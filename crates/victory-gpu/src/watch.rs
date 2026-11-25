@@ -2010,6 +2010,8 @@ pub(crate) fn census_open(at: usize, len: usize) -> bool {
         if reader == 0 {
             census_untagged();
         }
+        let why = WHY.with(|w| w.get());
+        *BY_WHY.lock().unwrap_or_else(|e| e.into_inner()).entry((reader != 0 && reader == writer, why)).or_default() += 1;
         seen(
             match kind {
                 _ if reader != 0 && reader == writer => Seen::ReadSame,
@@ -2036,6 +2038,38 @@ pub(crate) fn census_open(at: usize, len: usize) -> bool {
 /// mask) or are read back at once anyway.
 static UNTAGGED: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
+thread_local! {
+    /// What our code on this thread is doing when it reads title memory,
+    /// for the census ([`census_why`]).
+    static WHY: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// What our reads are for, as the census names them.
+const WHY_NAMES: [&str; 8] = ["other", "a copy's refresh", "a settle", "a quarantine merge", "a copy-back", "a title buffer copy", "a fill of upload memory", "a texture"];
+
+/// Our kernel reads of copied-back blocks since the last line, by (reader
+/// is the copy that copied the block back, what the read was for).
+static BY_WHY: Mutex<BTreeMap<(bool, u8), u64>> = Mutex::new(BTreeMap::new());
+
+/// Until what it returns is dropped, title memory read on this thread is
+/// read for `why` (an index of [`WHY_NAMES`]), for the census.
+pub(crate) fn census_why(why: u8) -> Why {
+    if !census() {
+        return Why(None);
+    }
+    Why(Some(WHY.with(|w| w.replace(why))))
+}
+
+/// [`census_why`]'s guard.
+pub(crate) struct Why(Option<u8>);
+impl Drop for Why {
+    fn drop(&mut self) {
+        if let Some(was) = self.0 {
+            WHY.with(|w| w.set(was));
+        }
+    }
+}
+
 fn census_untagged() {
     let name = std::thread::current().name().unwrap_or("unnamed").trim_end_matches(|c: char| c.is_ascii_digit() || c == '-').to_owned();
     *UNTAGGED.lock().unwrap_or_else(|e| e.into_inner()).entry(name).or_default() += 1;
@@ -2051,6 +2085,14 @@ pub(crate) fn census_line() {
         let untagged = std::mem::take(&mut *UNTAGGED.lock().unwrap_or_else(|e| e.into_inner()));
         if !untagged.is_empty() {
             tracing::info!("read census, our kernel reads by no known copy since the last such line, by thread: {untagged:?}");
+        }
+        let by_why = std::mem::take(&mut *BY_WHY.lock().unwrap_or_else(|e| e.into_inner()));
+        if !by_why.is_empty() {
+            let text: Vec<String> = by_why
+                .iter()
+                .map(|(&(same, why), n)| format!("{} for {} {n}", if same { "the copy that copied it back" } else { "another reader" }, WHY_NAMES.get(usize::from(why)).copied().unwrap_or("other")))
+                .collect();
+            tracing::info!("read census, our kernel reads of copied-back blocks since the last such line, by reader and purpose: {}", text.join(", "));
         }
     }
     static LAST: Mutex<[u64; SEEN]> = Mutex::new([0; SEEN]);
