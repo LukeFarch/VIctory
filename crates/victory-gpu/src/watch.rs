@@ -812,11 +812,17 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The journal is shared by the whole process and keeps pages it
+        // was told of after their memory goes: a test running beside this
+        // one (or before it, at an address reused here) may have left
+        // entries for these pages. Only what is newer than this first
+        // asking is this test's.
+        let (first, _) = writes(start, end, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
+        assert!(now > first);
+        let after: Vec<_> = after.into_iter().filter(|&(_, w)| w > first).collect();
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
