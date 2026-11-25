@@ -342,7 +342,9 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section's handle and, per 64 KiB page of it, whether the page has
+/// been committed (for the commit line: `victory_gpu::TITLE_PAGES`).
+struct Section(HANDLE, Mutex<Vec<bool>>);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -351,6 +353,10 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        let pages = self.1.get_mut().unwrap_or_else(|e| e.into_inner());
+        let committed = pages.iter().filter(|&&c| c).count();
+        victory_gpu::TITLE_PAGES[0].fetch_sub((pages.len() * PAGE) as u64, Ordering::Relaxed);
+        victory_gpu::TITLE_PAGES[1].fetch_sub((committed * PAGE) as u64, Ordering::Relaxed);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -440,7 +446,12 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    // Under Wine the section is committed whole when made.
+    victory_gpu::TITLE_PAGES[0].fetch_add(size as u64, Ordering::Relaxed);
+    if on_wine() {
+        victory_gpu::TITLE_PAGES[1].fetch_add(size as u64, Ordering::Relaxed);
+    }
+    let section = Arc::new(Section(handle, Mutex::new(vec![on_wine(); n])));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -771,6 +782,15 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
+    }
+    {
+        // Counted once per page of the section, whichever view commits it.
+        let mut pages = slice.section.1.lock().unwrap_or_else(|e| e.into_inner());
+        let mut new = 0;
+        for committed in pages.iter_mut().skip(slice.index).take(len / PAGE) {
+            new += usize::from(!std::mem::replace(committed, true));
+        }
+        victory_gpu::TITLE_PAGES[1].fetch_add((new * PAGE) as u64, Ordering::Relaxed);
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);

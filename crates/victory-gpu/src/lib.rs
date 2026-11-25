@@ -70,6 +70,8 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
+pub use budget::TITLE_PAGES;
+#[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};

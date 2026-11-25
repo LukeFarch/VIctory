@@ -27,6 +27,69 @@ fn process_memory() -> (u64, u64) {
     (c.WorkingSetSize as u64, c.PagefileUsage as u64)
 }
 
+/// The title's page pool (the runtime's sections of physical pages): the
+/// bytes of the sections made, and the bytes of their pages committed so
+/// far. A section's commit is charged to the PC, not to "private": the
+/// memory line's private figure never held it (6.2 GB in the title).
+pub static TITLE_PAGES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The PC's commit in bytes: the limit (memory plus page files as they
+/// are now) and what is left of it.
+fn system_commit() -> (u64, u64) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    (m.ullTotalPageFile, m.ullAvailPageFile)
+}
+
+/// The commit line, beside the memory line: whose the PC's commit is.
+///
+/// The memory line's "left to commit" was 2-5 GB seven seconds into every
+/// run of 2026-11-24, with 7.3 GB private and 12 GB of memory free: most
+/// of the PC's commit was not this process's private bytes. This line
+/// says how much: the limit, what is committed in all, ours (private and
+/// the page pool's sections), and the rest, which is other programs', the
+/// kernel's and the card driver's. A program that cannot commit fails
+/// (`ERROR_COMMITMENT_LIMIT`, or a null from an allocator) however much
+/// memory is free.
+fn commit_line(private: u64) {
+    let (limit, left) = system_commit();
+    let committed = limit.saturating_sub(left);
+    let pool = [0, 1].map(|i| TITLE_PAGES[i].load(Relaxed));
+    let ours = private + pool[1];
+    tracing::info!(
+        "commit: the PC has {} of {} MB committed ({} MB left); ours {} MB ({} MB private and {} MB of the title's page pool, \
+         {} MB of sections made); everything else {} MB",
+        mb(committed),
+        mb(limit),
+        mb(left),
+        mb(ours),
+        mb(private),
+        mb(pool[1]),
+        mb(pool[0]),
+        mb(committed.saturating_sub(ours)),
+    );
+    // Said aloud once a minute while it lasts: the next allocation of any
+    // size may fail, in the title, the driver or here.
+    const LOW: u64 = 1536 << 20;
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if left < LOW && SAID.fetch_add(1, Relaxed).is_multiple_of(12) {
+        tracing::warn!(
+            "commit: only {} MB left to commit on this PC (limit {} MB, of it {} MB ours, {} MB everything else): \
+             allocations may start to fail. Close other programs or give Windows a bigger page file",
+            mb(left),
+            mb(limit),
+            mb(ours),
+            mb(committed.saturating_sub(ours)),
+        );
+    } else if left >= LOW {
+        SAID.store(0, Relaxed);
+    }
+}
+
 /// The PC's memory in bytes: physical memory in all, free, and what is
 /// left to commit.
 fn system_memory() -> (u64, u64, u64) {
@@ -120,4 +183,5 @@ pub(crate) fn line() {
         mb(kept[3]),
         mb(kept[4]),
     );
+    commit_line(private);
 }
