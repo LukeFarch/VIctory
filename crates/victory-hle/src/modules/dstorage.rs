@@ -1058,7 +1058,11 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let n = fill(out)?;
+        // `VICTORY_STREAM_ONCE=1`: the host copies over the destination take
+        // the bytes now, on this thread, instead of at the next refresh.
+        victory_gpu::stream_landed(request.destination as usize, n.min(len));
+        return Ok(());
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];

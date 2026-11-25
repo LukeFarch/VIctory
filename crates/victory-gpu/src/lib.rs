@@ -92,6 +92,8 @@ pub fn trace_count(name: &'static str, n: u64) {
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
+pub use shadow::stream_landed;
+#[cfg(windows)]
 pub use watch::{
     kernel_wrote, title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
 };

@@ -3011,6 +3011,53 @@ impl Shadow {
         bytes
     }
 
+    /// [`stream_landed`] for this copy: the whole pages of `[from, to)`
+    /// (title addresses) inside the buffer are copied from title memory
+    /// and noted current at asking `now`, unless the copy is in place, not
+    /// write-watched, or has shader-written or quarantined pages there
+    /// (left to the refresh). Returns the bytes taken and left.
+    fn take_streamed(&self, from: usize, to: usize, now: u64) -> (usize, usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return (0, 0);
+        }
+        if self.place.is_some() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return (0, to - from);
+        }
+        let busy = self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from);
+        let owned = self.owned.lock().unwrap_or_else(|e| e.into_inner()).range(from / PAGE..to.div_ceil(PAGE)).next().is_some();
+        if busy || owned {
+            return (0, to - from);
+        }
+        // Whole pages of the buffer only: a page cut by the range stays as
+        // the journal says (stale), and the refresh copies it.
+        let base = start / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut taken, mut run): (usize, Option<usize>) = (0, None);
+        let first = from / PAGE;
+        let last = (to - 1) / PAGE;
+        for page in first..=last + 1 {
+            let whole = page <= last
+                && (page * PAGE).max(start) >= from
+                && ((page + 1) * PAGE).min(end) <= to
+                && page >= base
+                && page - base < copied.len();
+            if whole {
+                run.get_or_insert(page);
+                continue;
+            }
+            if let Some(a) = run.take() {
+                taken += self.copy((a * PAGE).max(start), (page * PAGE).min(end));
+                for p in a..page {
+                    let at = &mut copied[p - base];
+                    *at = (*at).max(now);
+                }
+            }
+        }
+        (taken, (to - from).saturating_sub(taken))
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -3294,6 +3341,97 @@ impl Shadow {
         let own = crate::watch::own_write_begin(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         (n, crate::watch::own_write_end(own).map(|asked| (at, at + n, asked)))
+    }
+}
+
+/// Whether host copies take what DirectStorage wrote into title memory as
+/// soon as it lands, on the DirectStorage thread ([`stream_landed`];
+/// `VICTORY_STREAM_ONCE=1`; off by default).
+///
+/// A streamed buffer was read from the file into title memory, and then
+/// the next submission's refresh found its pages written (a write-watch
+/// asking, the journal, the quarantine path) and copied them into each
+/// host copy over them, on the submitting thread: in run 14's diner, 1,030
+/// ms of refreshes and 890 ms of quarantined pages summed a frame, for
+/// buffers DirectStorage had just filled. With the switch the copies over
+/// the destination take the bytes right after the read, on the thread that
+/// read them, and note the pages current, so the refresh finds nothing to
+/// do there.
+fn stream_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Streamed bytes host copies took at once since the start, and bytes
+/// left to the refresh (a copy with shader-written or quarantined pages
+/// there, in place, or memory not write-watched): logged now and then.
+static STREAMED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn streamed(taken: usize, left: usize) {
+    crate::trace::count("stream: bytes host copies took at once", taken as u64);
+    crate::trace::count("stream: bytes left to the refresh", left as u64);
+    let t = STREAMED[0].fetch_add(taken as u64, Ordering::Relaxed) + taken as u64;
+    let l = STREAMED[1].fetch_add(left as u64, Ordering::Relaxed) + left as u64;
+    let n = STREAMED[2].fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            landings = n,
+            "streamed data (VICTORY_STREAM_ONCE): {} MB taken by host copies as it landed, {} MB left to the refresh",
+            t >> 20,
+            l >> 20
+        );
+    }
+}
+
+/// DirectStorage wrote `[at, at + len)` of title memory (a raw read or a
+/// decompression into a title buffer). With [`stream_once`] the host
+/// copies over it take the bytes now and note the pages current.
+///
+/// Order with the write watch: the pages are asked about first (which
+/// notes them written under a new asking in the journal, for every other
+/// copy of the same memory, and clears the kernel's bits), and copied
+/// after. A title write after the asking sets the bit again, and the next
+/// refresh copies that page as before; one before it is in the bytes
+/// copied. A copy whose range has shader-written (pending) or quarantined
+/// pages is left to the refresh: those need the merge.
+pub fn stream_landed(at: usize, len: usize) {
+    if !stream_once() || len == 0 {
+        return;
+    }
+    let mut _z = crate::trace::zone("stream: host copies take what DirectStorage wrote");
+    _z.arg(len as u64);
+    let end = at.saturating_add(len);
+    let mut over: Vec<Arc<Shadow>> = Vec::new();
+    {
+        // As `in_place_let_go` finds them: among the 256 that start below.
+        let map = buffers();
+        for (_, entry) in map.range(..(end as u64, 0)).rev().take(256) {
+            if entry.end > at as u64
+                && let Some(shadow) = &entry.shadow
+            {
+                over.push(shadow.clone());
+            }
+        }
+    }
+    {
+        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, shadow) in loose.range(((at as u64).saturating_sub(WINDOW), 0)..(end as u64, 0)) {
+            if key.0 + key.1 > at as u64 && !over.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                over.push(shadow.clone());
+            }
+        }
+    }
+    if over.is_empty() {
+        return;
+    }
+    // Not write-watched memory: the refresh copies it whole anyway.
+    let Some((now, _)) = crate::watch::writes(at, end, false) else {
+        streamed(0, len);
+        return;
+    };
+    for shadow in over {
+        let (taken, left) = shadow.take_streamed(at, end, now);
+        streamed(taken, left);
     }
 }
 
