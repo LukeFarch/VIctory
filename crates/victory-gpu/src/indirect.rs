@@ -738,7 +738,8 @@ void main() {
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(4, capture_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_groups(PIECES, true);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -806,7 +807,8 @@ void main() {
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(4, capture_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_groups(PIECES, true);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
         };
@@ -839,6 +841,29 @@ void main() {
         // SAFETY: inside the mapping.
         let now = unsafe { std::slice::from_raw_parts(now_ptr.add(named * PIECE), PIECE) };
         assert_eq!(slot(2), now);
+    }
+
+    /// The compare's dispatch: a group per piece in rows of 65,535 (wide),
+    /// or a group per 64 pieces (serial, as before); nothing for nothing.
+    #[test]
+    fn card_compare_groups_cover_every_piece() {
+        use crate::host::card_groups;
+        assert_eq!(card_groups(0, true), (0, 1));
+        assert_eq!(card_groups(3, true), (3, 1));
+        assert_eq!(card_groups(65535, true), (65535, 1));
+        assert_eq!(card_groups(65536, true), (65535, 2));
+        assert_eq!(card_groups(200_000, true), (65535, 4));
+        assert_eq!(card_groups(0, false), (0, 1));
+        assert_eq!(card_groups(65, false), (2, 1));
+    }
+
+    /// The compare as it was (`VICTORY_CARD_HASH_WIDE=0`) still compiles.
+    #[test]
+    fn warp_card_compare_serial_compiles() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        compile_cs(&warp.device, crate::host::CARD_COMPARE_SERIAL).expect("the serial card compare must compile on WARP");
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
