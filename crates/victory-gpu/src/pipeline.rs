@@ -722,6 +722,10 @@ fn hand_out_with(
     #[cfg(windows)]
     let tracer = !builder && (of_tracer(&shaders) || gated_also(&shaders));
     #[cfg(windows)]
+    if tracer {
+        tracing::info!(?shaders, "a pipeline that walks ray-tracing structures: held back while the structure builder does not run (VICTORY_RT_GATE=0 runs it)");
+    }
+    #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
