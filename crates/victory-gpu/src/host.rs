@@ -6187,10 +6187,10 @@ impl Meter {
             self.logged = std::time::Instant::now();
             crate::budget::line();
             {
-                let [kept, given, over] = crate::shadow::OWNED.each_ref().map(|c| c.load(Ordering::Relaxed));
-                if kept + given + over > 0 {
+                let [kept, wrote, idle, over] = crate::shadow::OWNED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                if kept + wrote + idle + over > 0 {
                     tracing::info!(
-                        "quarantined ranges, since the start: {} MB left as the card made them at a refresh; {given} given back (the title wrote them, or no pass for two frames); {} MB re-uploaded from title memory over them (VICTORY_QUARANTINE_OWN=0)",
+                        "quarantined pages since the last such line: {} MB left as the card made them at refreshes; given back {wrote} because the title wrote them, {idle} because no pass marked them lately; {} MB re-uploaded from title memory over them (VICTORY_QUARANTINE_OWN=0)",
                         kept >> 20,
                         over >> 20
                     );

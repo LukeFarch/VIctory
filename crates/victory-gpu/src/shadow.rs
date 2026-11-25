@@ -77,35 +77,47 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
-    /// Ranges (title addresses) a quarantined pass writes
+    /// The 64 KiB pages (title page numbers) a quarantined pass writes
     /// ([`Shadow::gpu_owned`]): what is there is the card's, and a refresh
-    /// does not copy title memory over it. Each with the write-watch
-    /// asking when it was first marked, the frame it was last marked, and
-    /// whether title memory was copied in once since.
-    owned: Mutex<Vec<Owned>>,
+    /// does not copy title memory over it.
+    owned: Mutex<BTreeMap<usize, Owned>>,
 }
 
-/// See [`Shadow::owned`].
+/// A page of [`Shadow::owned`]: the bytes of it the passes wrote (title
+/// addresses), the write-watch asking when it was first marked, the frame
+/// it was last marked, and whether title memory was copied in once since.
 #[derive(Clone, Copy)]
 struct Owned {
-    from: usize,
-    to: usize,
+    lo: usize,
+    hi: usize,
     asked: u64,
     frame: u64,
     primed: bool,
 }
 
-/// Bytes of quarantined ranges a refresh left as the card had them; such
-/// ranges given back because the title wrote them or no quarantined pass
-/// marked them for two frames; and, with `VICTORY_QUARANTINE_OWN=0`, bytes
-/// of them copied over from title memory all the same. Since the start.
-pub(crate) static OWNED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Since the last memory line: bytes of quarantined pages a refresh left
+/// as the card made them; pages given back because the title wrote them;
+/// pages given back because no quarantined pass marked them for
+/// [`own_frames`] frames; and, with `VICTORY_QUARANTINE_OWN=0`, bytes of
+/// them copied over from title memory all the same.
+pub(crate) static OWNED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Whether ranges quarantined passes write are left to the card
 /// (`VICTORY_QUARANTINE_OWN=0`: not, as before, only counted).
 fn own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUARANTINE_OWN").is_none_or(|v| v != "0"))
+}
+
+/// Frames a quarantined page stays the card's with no pass marking it
+/// (`VICTORY_QUARANTINE_OWN_FRAMES`, 600). Two gave pages back as the
+/// camera moved and the passes wrote other tiles (lighting test 4: about
+/// 100 a frame, and the flicker while moving).
+fn own_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_QUARANTINE_OWN_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(600)
+    })
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1809,7 +1821,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
-            owned: Mutex::default(),
+            owned: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1854,56 +1866,77 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        let (from, to) = (address as usize, (address + len) as usize);
-        let frame = crate::frame::current();
-        let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(o) = owned.iter_mut().find(|o| o.from == from && o.to == to) {
-            o.frame = frame;
+        if len == 0 {
             return;
         }
-        owned.push(Owned { from, to, asked: crate::watch::asking(), frame, primed: false });
+        let (from, to) = (address as usize, (address + len) as usize);
+        let frame = crate::frame::current();
+        let asked = crate::watch::asking();
+        let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        for page in from / PAGE..=(to - 1) / PAGE {
+            let (lo, hi) = (from.max(page * PAGE), to.min((page + 1) * PAGE));
+            owned
+                .entry(page)
+                .and_modify(|o| {
+                    o.lo = o.lo.min(lo);
+                    o.hi = o.hi.max(hi);
+                    o.frame = frame;
+                })
+                .or_insert(Owned { lo, hi, asked, frame, primed: false });
+        }
     }
 
     /// The ranges of `[from, to)` (title addresses) a refresh leaves to
-    /// the card ([`Shadow::gpu_owned`]); gives back those the title wrote
-    /// or no pass marked lately.
+    /// the card ([`Shadow::gpu_owned`]); gives back the pages the title
+    /// wrote or no pass marked lately.
     fn owned_in(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
-        if owned.is_empty() {
+        let range = from / PAGE..to.div_ceil(PAGE);
+        if owned.range(range.clone()).next().is_none() {
             return Vec::new();
         }
         let frame = crate::frame::current();
-        let watched = self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
-        let mut kept = Vec::new();
-        owned.retain_mut(|o| {
-            if frame.saturating_sub(o.frame) > 2 {
+        // The title's writes there, by page, from the write watch.
+        let written: BTreeMap<usize, u64> = if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            crate::watch::writes(from, to, true).map(|(_, w)| w.into_iter().collect()).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        let mut gone = Vec::new();
+        let mut kept: Vec<(usize, usize)> = Vec::new();
+        for (&page, o) in owned.range_mut(range) {
+            if written.get(&page).is_some_and(|&w| w > o.asked) {
                 OWNED[1].fetch_add(1, Ordering::Relaxed);
-                return false;
+                gone.push(page);
+                continue;
             }
-            if o.from >= to || o.to <= from {
-                return true;
+            if frame.saturating_sub(o.frame) > own_frames() {
+                OWNED[2].fetch_add(1, Ordering::Relaxed);
+                gone.push(page);
+                continue;
             }
             if !o.primed {
                 // Title memory is copied in once, for the pass's first run.
                 o.primed = true;
-                return true;
+                continue;
             }
-            if watched
-                && let Some((_, written)) = crate::watch::writes(o.from, o.to, true)
-                && written.iter().any(|&(_, w)| w > o.asked)
-            {
-                OWNED[1].fetch_add(1, Ordering::Relaxed);
-                return false;
+            let (a, e) = (o.lo.max(from), o.hi.min(to));
+            if a >= e {
+                continue;
             }
-            let (a, e) = (o.from.max(from), o.to.min(to));
-            if own() {
-                OWNED[0].fetch_add((e - a) as u64, Ordering::Relaxed);
-                kept.push((a, e));
-            } else {
-                OWNED[2].fetch_add((e - a) as u64, Ordering::Relaxed);
+            if !own() {
+                OWNED[3].fetch_add((e - a) as u64, Ordering::Relaxed);
+                continue;
             }
-            true
-        });
+            OWNED[0].fetch_add((e - a) as u64, Ordering::Relaxed);
+            match kept.last_mut() {
+                Some(last) if last.1 == a => last.1 = e,
+                _ => kept.push((a, e)),
+            }
+        }
+        for page in gone {
+            owned.remove(&page);
+        }
         kept
     }
 
