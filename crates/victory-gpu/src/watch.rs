@@ -86,6 +86,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .iter()
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .filter(|&(first, _)| !known_view(first))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -201,7 +202,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !known_view(first) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -262,7 +263,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let mut _z = crate::trace::zone("GetWriteWatch");
+    let mut _z = crate::trace::zone("GetWriteWatch: a submission's ranges together");
     _z.arg(((last - first) * PAGE) as u64);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -276,6 +277,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         )
     } != 0;
     if failed {
+        drop(_z);
+        let _f = crate::trace::zone("GetWriteWatch failed (not watched: cut in halves)");
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -291,6 +294,27 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         j.written.insert(page, now);
     }
     true
+}
+
+/// Whether the kernel is not asked about view memory the guards hold
+/// (`VICTORY_WATCH_SKIP_VIEWS=1`; off by default). Views (xmem's page
+/// pool) cannot be write-watched: every asking about one failed, and then
+/// the guards answered. A submission's ranges asked together
+/// ([`ask_ahead`]) were cut in halves after each failure, down to single
+/// ranges: about two failed calls per view range, most of the 15,500
+/// write-watch calls a frame of the S2b timeline. A range whose first
+/// block the guards hold read-only is a view and goes to the guards at
+/// once (only `protected`: `absent` blocks can lie in write-watched
+/// reservations too).
+fn skip_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_SKIP_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// Whether pages `[first, last)` begin in a block the guards hold
+/// read-only: view memory, which the kernel cannot watch.
+fn known_view(first: usize) -> bool {
+    skip_views() && GUARDS.lock().unwrap_or_else(|e| e.into_inner()).protected.contains(&(first * PAGE / BLOCK))
 }
 
 /// The number of the latest asking: a page the journal notes written
@@ -350,10 +374,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let mut _z = crate::trace::zone("GetWriteWatch");
+    let mut _z = crate::trace::zone("GetWriteWatch: one range");
     _z.arg(((last - first) * PAGE) as u64);
+    let view = guarded && known_view(first);
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
+    let failed = view || unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
