@@ -6163,6 +6163,21 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             crate::budget::line();
+            // Why draws and dispatches were not run, since the last such
+            // line (the diagnostics build has them in its frame report).
+            #[cfg(not(feature = "diagnostics"))]
+            {
+                let drops = crate::pipeline::take_drops();
+                let all: u64 = drops.iter().map(|(_, n)| n).sum();
+                if all > 0 {
+                    let text: Vec<String> = drops.iter().take(24).map(|(why, n)| format!("{n} x {why}")).collect();
+                    tracing::info!(
+                        "draws and dispatches not run since the last such line: {all} for {} reasons; most first: {}",
+                        drops.len(),
+                        text.join(" | ")
+                    );
+                }
+            }
             if let Some(line) = self.pacing.take() {
                 tracing::info!("{line}");
             }
