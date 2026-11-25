@@ -1042,9 +1042,27 @@ fn open_only(g: &mut Guards, start: usize, end: usize, why: Seen) -> Vec<usize> 
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let open = |from: usize, to: usize| {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0 }
+    };
+    // Blocks next to each other in one call (run 16: 4,900 waits a frame for
+    // the guards, their longest 20-30 ms, behind calls made block by
+    // block); block by block where one call fails (the run spans views).
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
+            j += 1;
+        }
+        if j - i == 1 || !open(blocks[i], blocks[j - 1] + 1) {
+            for &block in &blocks[i..j] {
+                open(block, block + 1);
+            }
+        }
+        i = j;
     }
     census_forget(&blocks, why);
     blocks

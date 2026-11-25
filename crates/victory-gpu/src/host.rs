@@ -6390,6 +6390,36 @@ fn wide_gpu_writes() -> bool {
     *ON.get_or_init(|| wide_refresh() && std::env::var_os("VICTORY_WIDE_GPU_WRITES").is_some_and(|v| v == "1"))
 }
 
+/// The size a copy's refresh is cut to in a wide flush
+/// (`VICTORY_WIDE_SPLIT_MB`, with `VICTORY_WIDE_REFRESH=1`; 0, off, by
+/// default).
+///
+/// Run 16's prison profile: a wide flush took 255 ms a frame, and the
+/// longest single copy's refresh inside it 209 ms of that, while the
+/// threads' summed work was 621 ms (124 ms spread over five threads). The
+/// title's 90 MiB buffer at 0xd6b610000 was refreshed 11.6 times a frame,
+/// 8.7 ms each, one thread doing it while the others waited for it. With
+/// the switch a copy's refresh of more than twice this size is cut into
+/// pieces of about this size, at 64 KiB pages (so no page is in two
+/// pieces), and the biggest pieces are queued first. A copy with
+/// shader-written ranges to note after its refresh is not cut. Each piece
+/// is [`crate::shadow::Shadow::update`] of its range: what a refresh of
+/// the whole range does page by page, on disjoint pages. Pieces of one
+/// copy copy their pages without holding the copy's page notes
+/// (`Shadow::copy_stale`), so that they do not wait for one another.
+pub(crate) fn wide_split() -> usize {
+    static AT: OnceLock<usize> = OnceLock::new();
+    *AT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_WIDE_SPLIT_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        if mb > 0 && wide_refresh() {
+            tracing::info!("VICTORY_WIDE_SPLIT_MB={mb}: a wide flush cuts copies' refreshes over {} MiB into pieces of {mb} MiB", 2 * mb);
+            mb << 20
+        } else {
+            0
+        }
+    })
+}
+
 #[derive(Default)]
 struct Batch {
     /// Per copy: the range to refresh, and (with [`wide_gpu_writes`]) the
@@ -6525,11 +6555,38 @@ impl Batch {
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to, writes)| Box::new(move || Self::entry(&shadow, from, to, &writes)) as Box<dyn FnOnce() + Send>)
-                .collect();
+            let split = wide_split();
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = if split == 0 {
+                self.refreshes
+                    .drain(..)
+                    .map(|(shadow, from, to, writes)| Box::new(move || Self::entry(&shadow, from, to, &writes)) as Box<dyn FnOnce() + Send>)
+                    .collect()
+            } else {
+                // (bytes, job): the biggest first, so that the last job
+                // taken is a short one.
+                let mut sized: Vec<(usize, Box<dyn FnOnce() + Send>)> = Vec::new();
+                for (shadow, from, to, writes) in self.refreshes.drain(..) {
+                    if writes.is_empty() && to - from > 2 * split {
+                        let mut at = from;
+                        while at < to {
+                            let end = if to - at > split + split / 2 {
+                                ((at + split) / crate::watch::PAGE * crate::watch::PAGE).max(at + crate::watch::PAGE).min(to)
+                            } else {
+                                to
+                            };
+                            let shadow = shadow.clone();
+                            sized.push((end - at, Box::new(move || Self::update(&shadow, at, end))));
+                            at = end;
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        crate::trace::count("wide flush: copies' refreshes cut into pieces", 1);
+                    } else {
+                        sized.push((to - from, Box::new(move || Self::entry(&shadow, from, to, &writes))));
+                    }
+                }
+                sized.sort_by(|a, b| b.0.cmp(&a.0));
+                sized.into_iter().map(|(_, job)| job).collect()
+            };
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);

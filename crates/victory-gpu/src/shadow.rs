@@ -2990,6 +2990,11 @@ impl Shadow {
     }
 
     fn settle_with(&self, from: usize, to: usize, now: u64, title: &mut [u8]) -> usize {
+        // Run 16 compared 316-467 MB a frame of pages here for 53-77 MB
+        // copied back: whole 64 KiB pages read through the kernel and
+        // compared, for pieces of a few bytes. The zone says what it costs.
+        let mut _z = crate::trace::zone("copy-back: settle (compare whole pages)");
+        _z.arg((to - from) as u64);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         let mut settled = 0;
@@ -3025,9 +3030,16 @@ impl Shadow {
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let _z = crate::trace::zone("refresh: copy stale pages");
         let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        // The runs of stale pages (title addresses, cut to the range), and
+        // the pages whose whole part in the buffer is in the range (noted
+        // copied at `now`; a page only partly in the range is copied in
+        // part and stays stale for the rest).
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut current: Vec<usize> = Vec::new();
+        let mut run = None;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3037,22 +3049,43 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let at = copied[page - base];
+            if at == 0 || write > at {
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    current.push(page);
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                runs.push(((first * PAGE).max(from), (page * PAGE).min(to)));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to)));
+        }
+        let mut bytes = 0;
+        if crate::host::wide_split() == 0 {
+            // As before: copied with the notes held.
+            for &page in &current {
+                copied[page - base] = now;
+            }
+            for (a, e) in runs {
+                bytes += self.copy(a, e);
+            }
+            return bytes;
+        }
+        // With `wide_split`: the pieces of a copy's refresh copy their
+        // (disjoint) pages at once. The pages are noted copied after their
+        // bytes are in, and not below what another noted meanwhile: a title
+        // write after this asking has a higher number, and shows as stale.
+        drop(copied);
+        for (a, e) in runs {
+            bytes += self.copy(a, e);
+        }
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for page in current {
+            let at = &mut copied[page - base];
+            *at = (*at).max(now);
         }
         bytes
     }
