@@ -1173,7 +1173,7 @@ static RESIDENT_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 /// behind us); landings written as before (not view memory, twins, the
 /// cap, the copy not current); bytes merged without a write; blocks found
 /// changed behind us at write-in, and their bytes changed.
-pub(crate) static RESIDENT_STATS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+pub(crate) static RESIDENT_STATS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 fn resident_stat(i: usize, n: u64) {
     RESIDENT_STATS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1469,6 +1469,57 @@ pub(crate) fn resident_shown(section: usize, offset: u64, len: usize) {
     RESIDENT_N.store(r.len(), Ordering::Release);
 }
 
+/// [`resident`]: whether any block of `[at, at + len)` is kept (no lock
+/// on the guards).
+pub(crate) fn resident_holds(at: usize, len: usize) -> bool {
+    resident()
+        && RESIDENT_N.load(std::sync::atomic::Ordering::Acquire) > 0
+        && len > 0
+        && resident_lock().range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).next().is_some()
+}
+
+/// [`resident`]: our read of `[at, at + len)` into `dst` failed; if kept
+/// blocks are why, the read is made with their kept bytes (what title
+/// memory is to hold), the rest from title memory, and the blocks stay
+/// kept: a refresh of another copy of the memory no longer writes them in
+/// (run 12: 1,500 write-ins a frame, 104 ms, and the guards' lock waited
+/// 556 ms a frame behind them). False if a part not kept cannot be read.
+pub(crate) fn resident_read(at: usize, dst: *mut u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if !resident() || RESIDENT_N.load(std::sync::atomic::Ordering::Acquire) == 0 || len == 0 {
+        return false;
+    }
+    let _z = crate::trace::zone("card resident: our read takes kept bytes");
+    let r = resident_lock();
+    let end = at + len;
+    let mut kept_any = false;
+    let mut x = at;
+    while x < end {
+        let b = x / BLOCK;
+        let to = ((b + 1) * BLOCK).min(end);
+        // SAFETY: inside the caller's destination of `len` bytes.
+        let out = unsafe { dst.add(x - at) };
+        if let Some(k) = r.get(&b) {
+            // SAFETY: as above; the image holds the whole block.
+            unsafe { std::ptr::copy_nonoverlapping(k.image.as_ptr().add(x - b * BLOCK), out, to - x) };
+            kept_any = true;
+        } else {
+            let mut done = 0;
+            // SAFETY: the destination is the caller's; the kernel checks
+            // the source.
+            if unsafe { ReadProcessMemory(GetCurrentProcess(), x as *const _, out.cast(), to - x, &mut done) } == 0 {
+                return false;
+            }
+        }
+        x = to;
+    }
+    if kept_any {
+        resident_stat(11, 1);
+    }
+    kept_any
+}
+
 /// [`resident`]: our kernel read of `[at, at + len)` failed; kept blocks
 /// there are written in (true if any was: the read is worth trying again).
 pub(crate) fn resident_open(at: usize, len: usize) -> bool {
@@ -1509,9 +1560,9 @@ pub(crate) fn resident_line() {
     if !resident() {
         return;
     }
-    static LAST: Mutex<[u64; 11]> = Mutex::new([0; 11]);
-    let now: [u64; 11] = std::array::from_fn(|i| RESIDENT_STATS[i].load(Relaxed));
-    let d: [u64; 11] = {
+    static LAST: Mutex<[u64; 12]> = Mutex::new([0; 12]);
+    let now: [u64; 12] = std::array::from_fn(|i| RESIDENT_STATS[i].load(Relaxed));
+    let d: [u64; 12] = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         let d = std::array::from_fn(|i| now[i] - last[i]);
         *last = now;
@@ -1519,7 +1570,7 @@ pub(crate) fn resident_line() {
     };
     let held = RESIDENT_N.load(Relaxed);
     tracing::info!(
-        "card resident (VICTORY_CARD_RESIDENT=1): {} blocks kept, {} merged again, {:.1} MB merged with no write; written in at first touch: {} by a fault, {} by our reads, {} opened for a write, {} remapped; {} dropped (newer bytes); {} landings written as before; {} blocks ({} MB) kept now; {} found changed behind us at write-in ({} bytes, theirs kept)",
+        "card resident (VICTORY_CARD_RESIDENT=1): {} blocks kept, {} merged again, {:.1} MB merged with no write; written in at first touch: {} by a fault, {} by our reads, {} opened for a write, {} remapped; {} dropped (newer bytes); {} landings written as before; {} blocks ({} MB) kept now; {} found changed behind us at write-in ({} bytes, theirs kept); {} of our reads took kept bytes (no write-in)",
         d[0],
         d[1],
         d[8] as f64 / 1e6,
@@ -1532,7 +1583,8 @@ pub(crate) fn resident_line() {
         held,
         (held * BLOCK) >> 20,
         d[9],
-        d[10]
+        d[10],
+        d[11]
     );
 }
 

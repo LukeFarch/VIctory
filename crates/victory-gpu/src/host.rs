@@ -6317,7 +6317,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             break;
         }
         // A block the read census watches is opened and read, not zeros.
-        if info.State != MEM_COMMIT || (info.Protect == PAGE_NOACCESS && !(crate::watch::census_open(at as usize, n) || crate::watch::resident_open(at as usize, n))) {
+        if info.State != MEM_COMMIT || (info.Protect == PAGE_NOACCESS && !(crate::watch::census_open(at as usize, n) || crate::watch::resident_holds(at as usize, n))) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -6368,6 +6368,9 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     }
     // A copied-back block the read census watches: opened, and read again.
     // SAFETY: as above.
+    if crate::watch::resident_read(src as usize, dst, len) {
+        return true;
+    }
     (crate::watch::census_open(src as usize, len) || crate::watch::resident_open(src as usize, len))
         && unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
