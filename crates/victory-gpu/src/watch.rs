@@ -1068,8 +1068,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 }
 
 /// Whether what shaders wrote into guarded view memory stays the card's
-/// until something touches it (`VICTORY_CARD_RESIDENT=1`; off by default,
-/// and off with the read census, which uses the same protection).
+/// until something touches it (`VICTORY_CARD_RESIDENT=1`; off by default;
+/// it turns the read census off, which uses the same protection).
 ///
 /// A landing's copy-back read each piece of title memory the card wrote,
 /// merged the card's bytes in and wrote it back, and only then told the
@@ -1097,7 +1097,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 pub(crate) fn resident() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_CARD_RESIDENT").is_some_and(|v| v == "1") && !census();
+        let on = std::env::var_os("VICTORY_CARD_RESIDENT").is_some_and(|v| v == "1");
         if on {
             tracing::info!(
                 "VICTORY_CARD_RESIDENT=1: what shaders wrote into view memory is written into title memory at its first touch, not at landing (cap {} MB)",
@@ -1437,7 +1437,13 @@ pub(crate) fn resident_line() {
 fn census() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_READ_CENSUS").is_some_and(|v| v == "1") && crate::inplace::level() == 0;
+        let asked = std::env::var_os("VICTORY_READ_CENSUS").is_some_and(|v| v == "1") && crate::inplace::level() == 0;
+        // The card-resident blocks use the same protection: they win.
+        let resident = std::env::var_os("VICTORY_CARD_RESIDENT").is_some_and(|v| v == "1");
+        if asked && resident {
+            tracing::warn!("read census off: VICTORY_CARD_RESIDENT=1 uses the same protection (it wins over VICTORY_READ_CENSUS=1)");
+        }
+        let on = asked && !resident;
         if on {
             tracing::info!("read census on (VICTORY_READ_CENSUS=1): copied-back blocks are watched for the title's reads");
         }

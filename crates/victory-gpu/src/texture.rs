@@ -1051,6 +1051,9 @@ fn by_query() -> bool {
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+    // Blocks the card keeps ([`crate::watch::resident`]) have no access
+    // until touched: this is the touch (the caller reads them next).
+    crate::watch::resident_open(at, len);
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
@@ -1090,6 +1093,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
+    crate::watch::resident_open(at as usize, len);
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
     let end = p + len;
