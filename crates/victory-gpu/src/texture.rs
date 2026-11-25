@@ -41,8 +41,12 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice, of the title's texture.
     mips: u32,
+    /// Mips the host texture leaves out at the top
+    /// (`crate::resource::host_trim`): its mip 0 is the title's mip
+    /// `trim`.
+    trim: u32,
     /// The first of them that is uploaded, and the bytes of title memory
     /// read for it and the smaller ones.
     first: u32,
@@ -469,6 +473,13 @@ pub(crate) fn memory() -> [u64; 3] {
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
 }
 
+/// Staging buffers alive and their bytes, for the memory line of every
+/// build (`crate::budget`).
+pub(crate) fn staging_alive() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed)]
+}
+
 /// Staging buffers let go as idle since the start, and their bytes.
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -679,7 +690,7 @@ impl Staging {
     /// The texture's subresource the `i`th part of the staging buffer is.
     fn subresource(&self, i: usize) -> u32 {
         let (mip, slice) = self.part(i);
-        slice * self.mips + mip
+        slice * (self.mips - self.trim) + mip - self.trim
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -1178,17 +1189,22 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // A host copy without the top mips (`resource::trim_for`, 2D textures
+    // of one slice only): the title's mip `trim` is its mip 0.
+    let trim = crate::resource::host_trim(resource);
+    let mips = u32::from(d.MipLevels) + trim;
     // Only where the title's layout can end behind the smaller mips.
-    let first = if first < u32::from(d.MipLevels) && layout.bytes_from(first) < layout.size {
+    let first = first.max(trim);
+    let first = if first > 0 && first < mips && layout.bytes_from(first) < layout.size {
         first
     } else {
-        0
+        trim
     };
     let size = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
+        mips * u32::from(d.DepthOrArraySize) - first
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -1197,7 +1213,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            first,
+            first - trim,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -1224,7 +1240,8 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
+        mips,
+        trim,
         first,
         size,
         bytes: total,

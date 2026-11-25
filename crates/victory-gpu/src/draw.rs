@@ -355,6 +355,11 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+/// Slots made null because their host copy was let go to make room
+/// (`HostHeap::texture_evicted`), since the start; and the slots waiting
+/// for room again at the last pass. For the memory line.
+pub(crate) static EVICTED_SLOTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_TEXTURES_EVICTED: AtomicU64 = AtomicU64::new(0);
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1555,17 +1560,34 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
-        if !room {
-            HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
-            once!("textures picked by index: the card has no room for more; they wait");
-        }
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
         host.texture_sweep(heap, frame);
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        // At the limit, and the title asks for textures: the ones used
+        // least recently make room (`resource::evict`), at most once a
+        // frame. (Without this the pass stopped for good once the card was
+        // full, and every texture asked for later stayed black: Lucia's
+        // eyes, the diner's walls, run 29f.) Slots whose host copy went
+        // wait for room again, after what the title asks for.
+        let mut room = crate::resource::room();
+        static EVICTED_IN: AtomicU64 = AtomicU64::new(u64::MAX);
+        if !room && host.texture_slots_wanted(frame) && EVICTED_IN.swap(frame, Ordering::Relaxed) != frame {
+            // What is over, and a frame's worth of uploads beside.
+            let gone = crate::resource::evict(crate::resource::over_limit() + PER_FRAME);
+            if !gone.is_empty() {
+                let slots = host.texture_evicted(&gone, frame);
+                EVICTED_SLOTS.fetch_add(slots, Ordering::Relaxed);
+            }
+            room = crate::resource::room();
+        }
+        if !room {
+            HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
+            once!("textures picked by index: the card has no room for more and nothing idle to let go; they wait");
+        }
+        let (due, census) = host.texture_slots_due(frame, 4096, room);
+        HEAP_TEXTURES_EVICTED.store(host.texture_slots_evicted(), Ordering::Relaxed);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);

@@ -3305,3 +3305,24 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+/// For the memory line of every build (`crate::budget`): host copies alive
+/// and the bytes of title memory they copy; of them the windows outside
+/// buffers and their bytes (each once); the bytes of copies' card sides,
+/// and of their "before" twins.
+pub(crate) fn holders() -> [u64; 6] {
+    let (windows, window_bytes) = {
+        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = std::collections::HashSet::new();
+        let bytes: u64 = loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)).map(|s| s.len).sum();
+        (seen.len() as u64, bytes)
+    };
+    [
+        LIVE[0].load(Ordering::Relaxed),
+        LIVE[1].load(Ordering::Relaxed),
+        windows,
+        window_bytes,
+        CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+        CARD_BYTES[1].load(Ordering::Relaxed),
+    ]
+}

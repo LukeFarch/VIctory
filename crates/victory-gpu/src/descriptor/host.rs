@@ -347,6 +347,10 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
+    /// Its host copy was let go to make room (`crate::resource::evict`):
+    /// served only while there is room, and never the reason to make
+    /// some.
+    evicted: bool,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -369,7 +373,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, evicted: false });
     }
 
     fn remove(&mut self, index: u32) {
@@ -386,10 +390,17 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
+    #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_of(frame, max, true)
+    }
+
+    /// [`TextureQueue::due`]; without the slots whose host copy was let go
+    /// to make room unless `evicted`.
+    fn due_of(&self, frame: u64, max: usize, evicted: bool) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame && (evicted || !w.evicted)) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((w.written, index, w.write));
         }
@@ -409,6 +420,29 @@ impl TextureQueue {
         }
         order.truncate(max);
         order
+    }
+
+    /// Whether a slot is due at `frame` whose host copy was not let go to
+    /// make room: one the title asks for now.
+    fn wanted(&self, frame: u64) -> bool {
+        self.slots.values().any(|w| w.due <= frame && !w.evicted)
+    }
+
+    /// The host copy slot `index` showed was let go to make room in
+    /// `frame`: the slot waits for room, after what the title asks for.
+    /// A slot in the queue already stays as it is.
+    fn evicted(&mut self, index: u32, frame: u64) {
+        if self.slots.contains_key(&index) {
+            return;
+        }
+        self.writes += 1;
+        let write = self.writes;
+        self.slots.insert(index, Waiting { due: frame + 1, written: frame, write, looks: 0, mapped: 0, evicted: true });
+    }
+
+    /// Slots waiting for room after their host copy was let go.
+    fn evicted_count(&self) -> u64 {
+        self.slots.values().filter(|w| w.evicted).count() as u64
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -448,7 +482,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, evicted: false });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -904,9 +938,65 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    /// Without `room`, the slots whose host copy was let go to make room
+    /// wait.
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize, room: bool) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        (if max == 0 { Vec::new() } else { textures.due_of(frame, max, room) }, textures.census(frame))
+    }
+
+    /// Whether a slot is due at `frame` that the title asks for now (not
+    /// one waiting for room after its host copy was let go).
+    pub(crate) fn texture_slots_wanted(&self, frame: u64) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).wanted(frame)
+    }
+
+    /// Slots waiting for room after their host copy was let go.
+    pub(crate) fn texture_slots_evicted(&self) -> u64 {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).evicted_count()
+    }
+
+    /// Host copies `gone` were let go to make room
+    /// (`crate::resource::evict`): the slots that show them are made null,
+    /// so that the card's memory is given back once the lists that read
+    /// them have run, and wait in the queue for room ([`TextureQueue::evicted`]).
+    /// Returns how many slots were made null.
+    pub(crate) fn texture_evicted(&self, gone: &[crate::resource::Evicted], frame: u64) -> u64 {
+        use windows::core::Interface;
+        if gone.is_empty() || self.sampler {
+            return 0;
+        }
+        let textures: std::collections::HashSet<usize> = gone.iter().map(|g| g.texture).collect();
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            gone.iter().flat_map(|g| placed.slots_in(g.start, g.end)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        // Only those that show one of them: other textures may lie in the
+        // same memory.
+        let showing: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            slots
+                .into_iter()
+                .filter(|&slot| {
+                    kept.get(slot as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|r| textures.contains(&(r.as_raw() as usize)))
+                })
+                .collect()
+        };
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in &showing {
+                self.unmake(&mut made, slot);
+            }
+        }
+        let mut queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        for &slot in &showing {
+            queue.evicted(slot, frame);
+        }
+        showing.len() as u64
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -1645,6 +1735,18 @@ macro_rules! once {
     }};
 }
 
+/// `desc`, a view of a 2D texture, for its host copy without the top
+/// `trim` mips: the same mips, counted from the host copy's first.
+fn trimmed_view(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, trim: u32) {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
+        return;
+    }
+    // SAFETY: the union holds a 2D view (the dimension says so).
+    let t = unsafe { &mut desc.Anonymous.Texture2D };
+    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(trim);
+    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - trim as f32).max(0.0);
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -2221,6 +2323,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                // A host copy without the mips the title has no memory for
+                // (`resource::trim_for`): the view starts lower by as many.
+                let trim = crate::resource::host_trim(resource);
+                if trim > 0
+                    && let Some(d) = desc.as_mut()
+                {
+                    trimmed_view(d, trim);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -2373,7 +2483,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
+    let texture = crate::resource::texture_at(address, resource, crate::resource::first_mip(desc))?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
@@ -2744,6 +2854,53 @@ mod tests {
     }
 
     #[test]
+    fn slots_let_go_to_make_room_wait_for_room() {
+        let mut q = TextureQueue::default();
+        q.written(1, 5, 0, false);
+        q.evicted(2, 5);
+        q.evicted(3, 5);
+        // Slot 1 is in the queue already: it stays as written.
+        q.evicted(1, 5);
+        assert_eq!(q.evicted_count(), 2);
+        // Without room only what the title asks for is served.
+        let order: Vec<u32> = q.due_of(6, 100, false).into_iter().map(|d| d.0).collect();
+        assert_eq!(order, [1]);
+        assert!(q.wanted(6));
+        let w1 = q.due_of(6, 100, false)[0].1;
+        q.done(1, w1);
+        // Then nothing is wanted: the waiting ones make no room themselves.
+        assert!(!q.wanted(6));
+        // With room they come back.
+        let mut back: Vec<u32> = q.due_of(6, 100, true).into_iter().map(|d| d.0).collect();
+        back.sort_unstable();
+        assert_eq!(back, [2, 3]);
+        // A slot the title writes again is wanted again.
+        q.written(2, 7, 0, false);
+        assert!(q.wanted(7));
+        assert_eq!(q.evicted_count(), 1);
+    }
+
+    #[test]
+    fn a_view_of_a_trimmed_copy_starts_lower() {
+        let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        d.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 4, MipLevels: 3, PlaneSlice: 0, ResourceMinLODClamp: 4.5 };
+        trimmed_view(&mut d, 4);
+        // SAFETY: a 2D view.
+        let t = unsafe { d.Anonymous.Texture2D };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (0, 3));
+        assert!((t.ResourceMinLODClamp - 0.5).abs() < 1e-6);
+        // Other views are left as they are.
+        let mut cube = D3D12_SHADER_RESOURCE_VIEW_DESC { ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE, ..Default::default() };
+        cube.Anonymous.TextureCube.MostDetailedMip = 2;
+        trimmed_view(&mut cube, 2);
+        // SAFETY: a cube view.
+        assert_eq!(unsafe { cube.Anonymous.TextureCube.MostDetailedMip }, 2);
+    }
+
+    #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
         // Slots 10..18 written in frames 1..9, slot 5 last.
@@ -2917,7 +3074,7 @@ mod tests {
         super::super::record(handle(2).unwrap(), view(64, at + 0x8_0000));
         // A newer, wider texture in the second one's memory.
         host.note_buffer(5, Some(&view(128, at + 0x8_0000)), false);
-        let queued = || -> Vec<u32> { host.texture_slots_due(u64::MAX, 8).0.into_iter().map(|d| d.0).collect() };
+        let queued = || -> Vec<u32> { host.texture_slots_due(u64::MAX, 8, true).0.into_iter().map(|d| d.0).collect() };
         for slot in queued() {
             host.textures.lock().unwrap().remove(slot);
         }
@@ -2936,7 +3093,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fee_0000_0000u64;
         let view = |address: u64, width: u32| {
@@ -2946,7 +3103,7 @@ mod tests {
         };
         let len = crate::resource::placed_bytes(&[3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0]).unwrap();
         assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
@@ -2970,7 +3127,7 @@ mod tests {
             return; // no host GPU
         };
         let frame = 100;
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
         let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
         assert!(is_texture_view(&texture));
         heap.queue_texture(2, true, false, frame);
