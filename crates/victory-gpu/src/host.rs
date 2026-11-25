@@ -1647,6 +1647,10 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Title memory shaders of the list may write in place
+    /// (`crate::inplace`): told to the other copies when the list is reset
+    /// ([`crate::watch::gpu_wrote`]).
+    in_place: Vec<(usize, usize)>,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -4860,6 +4864,10 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        let in_place = std::mem::take(&mut self.deferred().in_place);
+        for (address, len) in in_place {
+            crate::watch::gpu_wrote(address, len);
+        }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5333,6 +5341,15 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Shaders of the list may write title memory `[address, address +
+    /// len)` in place: told to the other copies of it when the list is
+    /// reset, after it has run.
+    pub(crate) fn in_place_written(&self, address: usize, len: usize) {
+        if len > 0 {
+            self.deferred().in_place.push((address, len));
+        }
+    }
+
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,

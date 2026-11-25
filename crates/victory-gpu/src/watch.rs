@@ -843,6 +843,34 @@ pub fn title_memory_reading_now() -> Option<Reading> {
     }
 }
 
+/// The card wrote title memory `[at, at + len)` in place (a buffer placed
+/// over it, `crate::inplace`), and has finished: neither write watching
+/// nor the guards saw it. Its pages are noted written under a new asking,
+/// so other host copies of the same bytes take them at their next
+/// refresh; its guarded blocks, and their other addresses, are no longer
+/// clean; textures placed there are looked at again.
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.asked += 1;
+        let now = j.asked;
+        for page in at / PAGE..end.div_ceil(PAGE) {
+            j.written.insert(page, now);
+        }
+    }
+    {
+        let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+        let (from, to) = (at / BLOCK, end.div_ceil(BLOCK));
+        let clean: Vec<usize> = g.clean.range(from..to).copied().collect();
+        for block in clean {
+            g.clean.remove(&block);
+        }
+        stale_twins(&mut g, from, to);
+    }
+    crate::descriptor::host::remapped(at, len);
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).

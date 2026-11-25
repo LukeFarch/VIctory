@@ -67,7 +67,10 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: also view memory that is
+/// one run of a committed section of physical pages (`VICTORY_POOL_COMMIT=1`
+/// in the runtime makes the title's pages one), placed in a heap opened
+/// on the section ([`place_view`]).
 ///
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made
@@ -88,6 +91,14 @@ pub(crate) fn probe_level() -> u8 {
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// `VICTORY_INPLACE_BIG=1`: with [`level`] 2 or more, title buffers too big
+/// for the PC's memory by `crate::shadow`'s rule (those it keeps in the
+/// card's memory) are in place as well.
+pub(crate) fn big() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| level() >= 2 && std::env::var_os("VICTORY_INPLACE_BIG").is_some_and(|v| v == "1"))
 }
 
 /// The most title memory in place at once, in bytes
@@ -138,10 +149,16 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    // View memory: known from the runtime without asking Windows. With
+    // level 3, a range that is one run of a committed section is placed
+    // in that section's heap (`place_view`); other view memory is copied.
+    match cover(start as usize, len as usize) {
+        Cover::None => {}
+        Cover::Run(section, offset) if level() >= 3 => return place_view(section, offset, start, len, window),
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -167,6 +184,74 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
     }
 }
+
+/// Heaps opened on the title's committed sections of physical pages, by
+/// section handle (`None`: the host refused, asked once).
+static SECTION_HEAPS: Mutex<Vec<(usize, Option<ID3D12Heap>)>> = Mutex::new(Vec::new());
+
+/// Title memory `[start, start + len)` that is one run of `section` from
+/// `offset` on, placed in a heap opened on the whole section
+/// (`VICTORY_INPLACE=3`). The heap is the section, not the view: the
+/// title may unmap, map elsewhere or protect its views with the heap
+/// standing (the probe on this PC: "whatever the views do true"), and
+/// opening locks nothing, so [`most`] does not count these. When the
+/// runtime maps that address anew the copy is let go
+/// ([`title_memory_freeing`]), as for private memory.
+fn place_view(section: usize, offset: u64, start: u64, len: u64, window: bool) -> Option<Placed> {
+    let committed = views().sections.iter().any(|s| s.0 == section && s.2);
+    if !committed {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let host = crate::host::host()?;
+    let heap = {
+        let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match heaps.iter().find(|h| h.0 == section) {
+            Some((_, heap)) => heap.clone(),
+            None => {
+                let heap = match open(&host.device, From::Section(section)) {
+                    Ok(heap) => {
+                        tracing::info!(section = format_args!("{section:#x}"), "the title's physical pages opened as a heap of the card's: views of them are used in place");
+                        Some(heap)
+                    }
+                    Err(e) => {
+                        tracing::warn!(section = format_args!("{section:#x}"), error = %e, "the title's physical pages could not be opened as a heap: views are copied");
+                        None
+                    }
+                };
+                heaps.push((section, heap.clone()));
+                heap
+            }
+        }
+    };
+    let Some(heap) = heap else {
+        STATS[5].fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let at = offset & !(K64 as u64 - 1);
+    let bias = offset - at;
+    let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+    match place(&host.device, &heap, at, bytes) {
+        Ok(buffer) => {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+            let k = if window { 0 } else { 2 };
+            STATS[k].fetch_add(1, Ordering::Relaxed);
+            STATS[k + 1].fetch_add(len, Ordering::Relaxed);
+            VIEW_STATS.fetch_add(1, Ordering::Relaxed);
+            Some(Placed { buffer, heap, gpu, bias })
+        }
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "a view not placed in its section's heap: a copy instead");
+            }
+            None
+        }
+    }
+}
+
+/// Views placed in their section's heap since the start.
+static VIEW_STATS: AtomicU64 = AtomicU64::new(0);
 
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
@@ -199,12 +284,13 @@ fn say() {
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
+        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); {} placed in a section's heap since the start; turned down: {} view memory not one run of a committed section, or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],
         s[1] >> 20,
         s[2],
         s[3] >> 20,
+        VIEW_STATS.load(Ordering::Relaxed),
         s[4],
         s[5],
         s[6],

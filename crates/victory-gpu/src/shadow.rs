@@ -1833,9 +1833,14 @@ impl Shadow {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
-        // inside this one with a copy of its own, a texture in it) is not
-        // told: the card's writes are not seen by write watching.
+        // inside this one with a copy of its own, a texture in it) learns
+        // of the card's writes only when the list is reset, not as soon as
+        // the card has run it.
         if self.place.is_some() {
+            // Except that the other copies are told once the list has run
+            // (`HostList::reset`): write watching and the guards do not see
+            // the card's writes.
+            list.in_place_written(address as usize, len.min(self.left(address)) as usize);
             return;
         }
         let len = len.min(self.left(address));
@@ -3060,7 +3065,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        // `VICTORY_INPLACE_BIG=1`: the big ones in place too (all of title
+        // memory one with the card's; their reads then cross the bus).
+        let big = cards() && size >= card_limits().0 && !crate::inplace::big();
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
