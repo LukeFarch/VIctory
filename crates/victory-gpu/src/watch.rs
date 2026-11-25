@@ -1382,7 +1382,19 @@ fn write_kept(b: usize, kept: &Resident) {
     unsafe { VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) };
 }
 
+/// Whether the address `at` can be read now (committed, with some
+/// access, no guard page).
+fn readable_at(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Protect & 0xff != PAGE_NOACCESS && info.Protect & PAGE_GUARD == 0 && info.Protect != 0
+}
+
 /// Whether block `b` can be read now (committed, with some access).
+#[allow(dead_code)]
 fn readable(b: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
     // SAFETY: plain data filled in by the query.
@@ -1914,10 +1926,12 @@ fn install() {
             && resident()
         {
             let block = r.ExceptionInformation[1] / BLOCK;
-            let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-            if resident_write(block, block + 1, 2) > 0
-                || (r.ExceptionInformation[0] != WRITE && g.protected.contains(&block) && !still_kept(block) && readable(block))
-            {
+            let _g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+            // A read is tried again whenever the address can be read now:
+            // the block may have been written in and opened for a write
+            // (no longer guarded) since this thread faulted (run 9's
+            // crash: a read of a kept block, read-write by the report).
+            if resident_write(block, block + 1, 2) > 0 || (r.ExceptionInformation[0] != WRITE && readable_at(r.ExceptionInformation[1])) {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
