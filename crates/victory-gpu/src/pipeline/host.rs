@@ -245,6 +245,10 @@ impl GraphicsState {
     /// Drawn as the console's rectangles (see `Formats::rects`).
     pub(crate) fn rectangles(&mut self) {
         self.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(RECTANGLES);
+        // The winding of the triangles a rectangle is completed into is
+        // ours, not the title's: with the title's culling the intro video's
+        // rectangle was not drawn (run 28d).
+        self.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
     }
 
     pub(crate) fn precompiled(
@@ -324,14 +328,26 @@ impl GraphicsState {
             g.depth.FrontFace
         };
         g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
-        if std::env::var_os("VICTORY_PRECOMPILED_CULL").is_some_and(|v| v == "1") {
+        // `VICTORY_PRECOMPILED_CULL=1`: bit 2 clear is a counter-clockwise
+        // front (the register's layout). Run 28d: faces came out right, the
+        // intro video and other draws went. So two more readings to try:
+        // `=2` the other winding as the front; `=3` clockwise unless 0x80 is
+        // set (the one other bit seen there).
+        let cull = std::env::var_os("VICTORY_PRECOMPILED_CULL");
+        let reading = cull.as_ref().and_then(|v| v.to_str()).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        if (1..=3).contains(&reading) {
             let mode = dword(regs, regs::MODE);
             g.rasterizer.CullMode = match mode & 3 {
                 1 => D3D12_CULL_MODE_FRONT,
                 2 => D3D12_CULL_MODE_BACK,
                 _ => D3D12_CULL_MODE_NONE,
             };
-            g.rasterizer.FrontCounterClockwise = (mode & 4 == 0).into();
+            g.rasterizer.FrontCounterClockwise = match reading {
+                1 => mode & 4 == 0,
+                2 => mode & 4 != 0,
+                _ => mode & 0x80 != 0,
+            }
+            .into();
         }
         g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         g.targets = targets;

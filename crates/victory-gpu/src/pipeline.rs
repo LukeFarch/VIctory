@@ -868,11 +868,34 @@ fn note_precompiled(slot: usize, shaders: &[&Arc<Shader>], regs: Option<&[u8]>) 
     use std::sync::atomic::{AtomicU32, Ordering};
     static MADE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let n = MADE[usize::from(slot == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
-    if n > 64 && !n.is_power_of_two() {
+    let word = |at: usize| regs.and_then(|r| r.get(at..at + 4)).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    // Each value of the word culling is read from is said once, with the
+    // words around it and how many pipelines had the ones seen so far.
+    static MODES: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut new_mode = false;
+    if regs.is_some() {
+        let mut modes = MODES.lock().unwrap_or_else(|e| e.into_inner());
+        match modes.iter_mut().find(|(mode, _)| *mode == word(0x84)) {
+            Some((_, count)) => *count += 1,
+            None => {
+                modes.push((word(0x84), 1));
+                new_mode = true;
+            }
+        }
+        if new_mode || n.is_power_of_two() {
+            let seen: Vec<String> = modes.iter().map(|(mode, count)| format!("{mode:#x}: {count}")).collect();
+            tracing::info!(
+                made = n,
+                ?seen,
+                around = format_args!("{:#x} {:#x} [{:#x}] {:#x} {:#x}", word(0x7c), word(0x80), word(0x84), word(0x88), word(0x8c)),
+                "precompiled pipelines by their mode word"
+            );
+        }
+    }
+    if n > 64 && !n.is_power_of_two() && !new_mode {
         return;
     }
     let names: Vec<String> = shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
-    let word = |at: usize| regs.and_then(|r| r.get(at..at + 4)).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     tracing::info!(
         slot = format_args!("{slot:#x}"),
         made = n,
