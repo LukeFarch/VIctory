@@ -361,6 +361,33 @@ pub(crate) fn twins(start: usize, end: usize, mut each: impl FnMut(usize, usize)
     }
 }
 
+/// Whether any 64 KiB piece of `[start, end)` is shown at another address
+/// too, however many (unlike [`twins`], which leaves out pieces shown at
+/// more than `MOST_TWINS`), or lies outside the views known.
+pub(crate) fn shown_elsewhere(start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    let v = views();
+    let mut at = start - start % PIECE;
+    while at < end {
+        let Some((&base, &(len, section, offset))) = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at) else {
+            return true;
+        };
+        if !base.is_multiple_of(PIECE) || !(offset as usize).is_multiple_of(PIECE) {
+            return true;
+        }
+        let stop = (base + len).min(end);
+        while at < stop {
+            if v.shown.get(&(section, offset + (at - base) as u64)).is_some_and(|s| s.len() > 1) {
+                return true;
+            }
+            at += PIECE;
+        }
+    }
+    false
+}
+
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
 }

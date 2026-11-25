@@ -1126,6 +1126,11 @@ fn resident_cap() -> usize {
 struct Resident {
     image: Box<[u8]>,
     card: Box<[bool]>,
+    /// The block's bytes when it was kept: at write-in, a byte of title
+    /// memory that differs from it was written by someone who never
+    /// faulted (a reader or writer we do not see), and is newer than the
+    /// card's: it is left as it is, and the block is reported.
+    was: Box<[u8]>,
     /// The section that holds the block's physical pages, and the block's
     /// offset in it ([`write_kept`] writes through it).
     section: (usize, u64),
@@ -1139,8 +1144,9 @@ static RESIDENT_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 /// written in by a fault, by our kernel reads, by an opening for a write,
 /// by a remapping; blocks dropped (newer bytes, or the protection changed
 /// behind us); landings written as before (not view memory, twins, the
-/// cap, the copy not current); bytes merged without a write.
-pub(crate) static RESIDENT_STATS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+/// cap, the copy not current); bytes merged without a write; blocks found
+/// changed behind us at write-in, and their bytes changed.
+pub(crate) static RESIDENT_STATS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 fn resident_stat(i: usize, n: u64) {
     RESIDENT_STATS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1201,9 +1207,7 @@ pub(crate) fn resident_merge(at: usize, n: usize, merge: impl FnOnce(&mut [u8]) 
             }
         }
     }
-    let mut twin = false;
-    crate::inplace::twins(first * BLOCK, last * BLOCK, |_, _| twin = true);
-    if twin {
+    if crate::inplace::shown_elsewhere(first * BLOCK, last * BLOCK) {
         resident_stat(7, 1);
         return Kept::No;
     }
@@ -1244,6 +1248,7 @@ pub(crate) fn resident_merge(at: usize, n: usize, merge: impl FnOnce(&mut [u8]) 
         let mut kept = match r.remove(&b) {
             Some(k) => k,
             None => Resident {
+                was: image.clone(),
                 image,
                 card: vec![false; BLOCK].into_boxed_slice(),
                 section: sections[b - first],
@@ -1305,22 +1310,44 @@ fn write_kept(b: usize, kept: &Resident) {
         resident_stat(6, 1);
         return;
     }
-    // SAFETY: our view of BLOCK bytes; written only where the card wrote.
+    // SAFETY: our view of BLOCK bytes; written only where the card wrote
+    // and nobody else did since the block was kept.
     unsafe {
-        let mut i = 0;
-        while i < BLOCK {
-            if !kept.card[i] {
-                i += 1;
-                continue;
+        let now = std::slice::from_raw_parts_mut(base, BLOCK);
+        let (mut foreign, mut kept_out, mut first) = (0usize, 0usize, None);
+        for i in 0..BLOCK {
+            if now[i] != kept.was[i] {
+                foreign += 1;
+                first.get_or_insert(i);
+                if kept.card[i] {
+                    kept_out += 1;
+                }
+            } else if kept.card[i] {
+                now[i] = kept.image[i];
             }
-            let mut k = i + 1;
-            while k < BLOCK && kept.card[k] {
-                k += 1;
-            }
-            std::ptr::copy_nonoverlapping(kept.image.as_ptr().add(i), base.add(i), k - i);
-            i = k;
         }
         UnmapViewOfFile(view);
+        if foreign > 0 {
+            resident_stat(9, 1);
+            resident_stat(10, foreign as u64);
+            let n = RESIDENT_STATS[9].load(std::sync::atomic::Ordering::Relaxed);
+            if n <= 64 {
+                tracing::warn!(
+                    block = format_args!("{:#x}", b * BLOCK),
+                    first = format_args!("{:#x}", b * BLOCK + first.unwrap_or(0)),
+                    foreign,
+                    card_bytes_left = kept_out,
+                    card_bytes = kept.card.iter().filter(|&&c| c).count(),
+                    section = format_args!("{:#x}+{:#x}", section, offset),
+                    twins_now = {
+                        let mut t = 0;
+                        crate::inplace::twins(b * BLOCK, (b + 1) * BLOCK, |_, _| t += 1);
+                        t
+                    },
+                    "card resident: a kept block was changed while kept by someone who never faulted; their bytes are kept, the card's left out where they overlap"
+                );
+            }
+        }
     }
     let mut old = 0;
     // SAFETY: a kept block of title view memory, which we left with no
@@ -1443,9 +1470,9 @@ pub(crate) fn resident_line() {
     if !resident() {
         return;
     }
-    static LAST: Mutex<[u64; 9]> = Mutex::new([0; 9]);
-    let now: [u64; 9] = std::array::from_fn(|i| RESIDENT_STATS[i].load(Relaxed));
-    let d: [u64; 9] = {
+    static LAST: Mutex<[u64; 11]> = Mutex::new([0; 11]);
+    let now: [u64; 11] = std::array::from_fn(|i| RESIDENT_STATS[i].load(Relaxed));
+    let d: [u64; 11] = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         let d = std::array::from_fn(|i| now[i] - last[i]);
         *last = now;
@@ -1453,7 +1480,7 @@ pub(crate) fn resident_line() {
     };
     let held = RESIDENT_N.load(Relaxed);
     tracing::info!(
-        "card resident (VICTORY_CARD_RESIDENT=1): {} blocks kept, {} merged again, {:.1} MB merged with no write; written in at first touch: {} by a fault, {} by our reads, {} opened for a write, {} remapped; {} dropped (newer bytes); {} landings written as before; {} blocks ({} MB) kept now",
+        "card resident (VICTORY_CARD_RESIDENT=1): {} blocks kept, {} merged again, {:.1} MB merged with no write; written in at first touch: {} by a fault, {} by our reads, {} opened for a write, {} remapped; {} dropped (newer bytes); {} landings written as before; {} blocks ({} MB) kept now; {} found changed behind us at write-in ({} bytes, theirs kept)",
         d[0],
         d[1],
         d[8] as f64 / 1e6,
@@ -1464,7 +1491,9 @@ pub(crate) fn resident_line() {
         d[6],
         d[7],
         held,
-        (held * BLOCK) >> 20
+        (held * BLOCK) >> 20,
+        d[9],
+        d[10]
     );
 }
 
