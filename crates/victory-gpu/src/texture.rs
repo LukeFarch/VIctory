@@ -83,14 +83,22 @@ struct Last {
     /// is), not when it streams in once (run 20: marking those cost as
     /// much as no guard at all, 2.9 s of uploads in a frame).
     unseen: u32,
+    /// The guard saw a write to the texture, or the runtime map pages of
+    /// it, since its last check: a partly mapped texture is read again at
+    /// once, not after its retry period (the pages it waits for arrived).
+    seen_write: bool,
 }
 
-/// Retry and hash periods are wall-clock time, not frames: counted in
-/// frames, "every 30 frames" was 30 s at 1 fps and streaming slowed with
-/// the frame rate. The defaults are what the frame counts were at 60 fps.
-/// `VICTORY_TEXTURE_PARTIAL_MS` and `VICTORY_TEXTURE_HASH_MS` set them.
 /// Textures blind now (`Last::blind`), at most 32.
 pub(crate) static BLIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a partly mapped texture is read again when the guard sees its
+/// pages written or mapped (`Last::seen_write`); `VICTORY_TEXTURE_EVENTS=0`
+/// waits out the retry period only.
+fn events() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_EVENTS").is_none_or(|v| v != "0"))
+}
 
 /// Frames that must pass besides the period, `default` unless
 /// `VICTORY_TEXTURE_MIN_FRAMES` sets one count for both: in time alone, a
@@ -102,6 +110,10 @@ fn min_frames(default: u64) -> u64 {
     SET.get_or_init(|| std::env::var("VICTORY_TEXTURE_MIN_FRAMES").ok().and_then(|v| v.parse().ok())).unwrap_or(default)
 }
 
+/// Retry and hash periods in wall-clock time (and frames, `min_frames`): counted in
+/// frames, "every 30 frames" was 30 s at 1 fps and streaming slowed with
+/// the frame rate. The defaults are what the frame counts were at 60 fps.
+/// `VICTORY_TEXTURE_PARTIAL_MS` and `VICTORY_TEXTURE_HASH_MS` set them.
 fn period(name: &str, default: u64, cell: &'static std::sync::OnceLock<std::time::Duration>) -> std::time::Duration {
     *cell.get_or_init(|| {
         std::time::Duration::from_millis(std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
@@ -692,6 +704,7 @@ impl Staging {
         {
             static HASH: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            last.seen_write = last.asked != 0 && !unwritten && events();
             last.asked = now;
             // Staggered by the texture's address, so the textures take turns.
             let every = period("VICTORY_TEXTURE_HASH_MS", 133, &HASH) + std::time::Duration::from_millis(((start >> 16) & 7) as u64 * 17);
@@ -772,7 +785,8 @@ impl Staging {
             }
             static RETRY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
             let every = period("VICTORY_TEXTURE_PARTIAL_MS", 500, &RETRY);
-            if last.partial.is_some_and(|(at, frame)| at.elapsed() < every || crate::frame::current() < frame + min_frames(4)) {
+            let seen = std::mem::take(&mut last.seen_write);
+            if !seen && last.partial.is_some_and(|(at, frame)| at.elapsed() < every || crate::frame::current() < frame + min_frames(4)) {
                 return 0;
             }
             last.partial = Some((std::time::Instant::now(), crate::frame::current()));
