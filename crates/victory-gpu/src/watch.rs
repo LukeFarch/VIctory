@@ -348,17 +348,21 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    // View memory the guards hold already (`guard`'s own test): no kernel
+    // asking first, which fails for every view. Most of a world frame's
+    // 8,500 askings are of views.
+    let failed = (guarded && guard_first() && guards_know(first * PAGE))
+        // SAFETY: the answer buffer holds `count` entries.
+        || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -423,6 +427,32 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `VICTORY_GUARD_ASK=1`: every check of view memory asks Windows whether
+/// it is a view, as before the guards knew their blocks.
+fn guard_ask() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+}
+
+/// Whether [`writes`] goes straight to the guards for a range whose first
+/// block they hold (on by default; `VICTORY_GUARD_FIRST=0` asks the kernel
+/// first, as before, and goes to the guards when that fails).
+///
+/// The guards hold only view memory, which the kernel cannot write-watch:
+/// for it the asking always failed, a system call for nothing.
+fn guard_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !guard_ask() && std::env::var_os("VICTORY_GUARD_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Whether the guards hold the block of `at` (read-only by our hand, or
+/// noted absent): it is view memory.
+fn guards_know(at: usize) -> bool {
+    let g = guards();
+    let block = at / BLOCK;
+    g.protected.contains(&block) || g.absent.contains(&block)
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -434,12 +464,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // pages: 0.6 ms for the title's 174 MB heap, 16 times a frame, and most
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
-    };
+    let known = !guard_ask() && guards_know(start);
     if !known && !is_view(start, end) {
         return None;
     }
@@ -597,21 +622,54 @@ fn guard_twins(g: &mut Guards, from: usize, to: usize) {
     if !view_twins() {
         return;
     }
+    let mut twins: Vec<usize> = Vec::new();
     crate::inplace::twins(from * BLOCK, to * BLOCK, |_, twin| {
         let twin = twin / BLOCK;
-        if g.protected.contains(&twin) {
-            return;
-        }
-        let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        if unsafe { VirtualProtect((twin * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
-            g.protected.insert(twin);
-            let n = TWINS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n == 1 {
-                tracing::info!("a block of title memory is shown at another address too: guarded there as well (VICTORY_VIEW_TWINS=0: not)");
-            }
+        if !g.protected.contains(&twin) {
+            twins.push(twin);
         }
     });
+    if twins.is_empty() {
+        return;
+    }
+    twins.sort_unstable();
+    twins.dedup();
+    // The twins of a run of blocks are mostly a run too (the same pages
+    // shown again further on): one call per run of twins that touch, block
+    // by block where a run spans views (the call then fails and changes
+    // nothing). Each call is a system call and a flush of the title
+    // threads' address translations.
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) != 0 }
+    };
+    let guarded = |g: &mut Guards, twin: usize| {
+        g.protected.insert(twin);
+        let n = TWINS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == 1 {
+            tracing::info!("a block of title memory is shown at another address too: guarded there as well (VICTORY_VIEW_TWINS=0: not)");
+        }
+    };
+    let mut i = 0;
+    while i < twins.len() {
+        let mut j = i + 1;
+        while j < twins.len() && twins[j] == twins[j - 1] + 1 {
+            j += 1;
+        }
+        if j - i > 1 && set(twins[i], twins[j - 1] + 1) {
+            for &twin in &twins[i..j] {
+                guarded(g, twin);
+            }
+        } else {
+            for &twin in &twins[i..j] {
+                if set(twin, twin + 1) {
+                    guarded(g, twin);
+                }
+            }
+        }
+        i = j;
+    }
 }
 
 /// Blocks `[from, to)` are written, or can be without a fault: the blocks
