@@ -2993,6 +2993,216 @@ impl<'a> Lower<'a> {
         (h, byte)
     }
 
+    /// With [`super::dirty_mask`]: the 4 KiB pages of title memory that
+    /// `bytes` bytes at the 40-bit address `lo`, `hi` lie in are marked in
+    /// the dirty mask (`shader.rs` `SLOT_DIRTY`), for lanes where `guard`
+    /// holds. A store's first and last byte: no store spans more than two.
+    fn mark_dirty(&mut self, lo: V, hi: V, bytes: u32, guard: Option<V>) {
+        if super::dirty_mask() == 0 {
+            return;
+        }
+        let first = self.dirty_page(lo, hi);
+        self.mark_page(first, guard);
+        if bytes > 1 {
+            let (elo, ehi) = self.address_plus(lo, hi, (bytes - 1) as i32);
+            let last = self.dirty_page(elo, ehi);
+            let c = self.cur;
+            let other = self.s.m.cmp(c, pred::NE, last, first);
+            let g = match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, g, other),
+                None => other,
+            };
+            self.mark_page(last, Some(g));
+        }
+    }
+
+    /// [`Self::mark_dirty`] for a store at byte `offset` of the buffer
+    /// view `src` (title addresses from the host: `USER_VIEW_ADDRESS` for
+    /// table views, `SLOT_VIEW_ADDRESSES` for heap views). A view the
+    /// translator cannot place in title memory sets the buffer's "not
+    /// all marked" dword instead, so the host trusts none of the
+    /// submission's marks.
+    fn mark_dirty_view(
+        &mut self,
+        src: &Source,
+        offset: Option<V>,
+        bytes: u32,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        if super::dirty_mask() == 0 {
+            return Ok(());
+        }
+        let base = match (src, offset) {
+            (Source::Loaded { load, first: 0 }, Some(_)) => match self.view_address(*load) {
+                Some(a) => Some(a),
+                None => self.heap_view_address(*load)?,
+            },
+            _ => None,
+        };
+        let (Some((lo, hi)), Some(off)) = (base, offset) else {
+            super::DIRTY_SITES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.dirty_unplaced(guard);
+            return Ok(());
+        };
+        super::DIRTY_SITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::Add, lo, off);
+        let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
+        let one = self.s.m.cast(c, Cast::ZExt, wrapped, self.s.t.i32);
+        let hi = self.s.m.bin(c, Bin::Add, hi, one);
+        self.mark_dirty(sum, hi, bytes, guard);
+        Ok(())
+    }
+
+    /// The dirty mask's page of a title address: bits 12 to 39, at most
+    /// the mask's last page.
+    fn dirty_page(&mut self, lo: V, hi: V) -> V {
+        use super::shader::DIRTY_PAGES;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let (k12, k20, kff) = (self.s.m.i32(12), self.s.m.i32(20), self.s.m.i32(0xFF));
+        let low = self.s.m.bin(c, Bin::LShr, lo, k12);
+        let high = self.s.m.bin(c, Bin::And, hi, kff);
+        let high = self.s.m.bin(c, Bin::Shl, high, k20);
+        let page = self.s.m.bin(c, Bin::Or, low, high);
+        let last = self.s.m.i32(DIRTY_PAGES - 1);
+        let page = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
+        self.s.m.tag(page, Tag::Clamp);
+        page
+    }
+
+    /// Sets the bit of `page` in the dirty mask for lanes where `guard`
+    /// holds, and lists the page if the bit was clear. Where every such
+    /// lane of the host wave has the same page (the common case: a wave
+    /// writes neighbouring bytes) one lane does it for all. Not in pixel
+    /// shaders (a helper lane may be the wave's first) or mesh shaders.
+    fn mark_page(&mut self, page: V, guard: Option<V>) {
+        use super::shader::{DIRTY_LIST, DIRTY_LIST_AT, DIRTY_MASK_AT, SLOT_DIRTY};
+        let c = self.cur;
+        let (i32t, i1t) = (self.s.t.i32, self.s.t.i1);
+        let h = self.s.root_uav_handle(SLOT_DIRTY);
+        let (target, doit) = if self.s.pixel || self.s.mesh.is_some() {
+            (page, guard)
+        } else {
+            let (none, zero) = (self.s.m.i32(u32::MAX), self.s.m.i32(0));
+            let (low, high) = match guard {
+                Some(g) => (
+                    self.s.m.select(c, g, page, none),
+                    self.s.m.select(c, g, page, zero),
+                ),
+                None => (page, page),
+            };
+            let (umin, umax, unsigned) = (self.s.m.i8(2), self.s.m.i8(3), self.s.m.i8(1));
+            let least = self.s.op(
+                c,
+                "waveActiveOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                119,
+                &[low, umin, unsigned],
+            );
+            let most = self.s.op(
+                c,
+                "waveActiveOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                119,
+                &[high, umax, unsigned],
+            );
+            let same = self.s.m.cmp(c, pred::EQ, least, most);
+            let first = self
+                .s
+                .op(c, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+            let active = match guard {
+                Some(g) => g,
+                None => self.s.m.bool(true),
+            };
+            let doit = self.s.m.select(c, same, first, active);
+            let target = self.s.m.select(c, same, least, page);
+            self.s.flags |= flags::WAVE_OPS;
+            (target, Some(doit))
+        };
+        let at = self.begin_guarded(doit);
+        let c = self.cur;
+        let iu = self.s.m.undef(i32t);
+        let (k5, k31, k2) = (self.s.m.i32(5), self.s.m.i32(31), self.s.m.i32(2));
+        let word = self.s.m.bin(c, Bin::LShr, target, k5);
+        let base = self.s.m.i32(DIRTY_MASK_AT);
+        let word = self.s.m.bin(c, Bin::Add, word, base);
+        let byte = self.s.m.bin(c, Bin::Shl, word, k2);
+        let shift = self.s.m.bin(c, Bin::And, target, k31);
+        let one = self.s.m.i32(1);
+        let bit = self.s.m.bin(c, Bin::Shl, one, shift);
+        let or = self.s.m.i32(2);
+        let old = self.s.op(
+            c,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, or, byte, iu, iu, bit],
+        );
+        let was = self.s.m.bin(c, Bin::And, old, bit);
+        let zero = self.s.m.i32(0);
+        let fresh = self.s.m.cmp(c, pred::EQ, was, zero);
+        let listed = self.begin_guarded(Some(fresh));
+        let c = self.cur;
+        let add = self.s.m.i32(0);
+        let counter = self.s.m.i32(0);
+        let n = self.s.op(
+            c,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, add, counter, iu, iu, one],
+        );
+        let sink = self.s.m.i32(DIRTY_LIST);
+        let n = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[n, sink]);
+        let first = self.s.m.i32(DIRTY_LIST_AT);
+        let n = self.s.m.bin(c, Bin::Add, n, first);
+        let at_byte = self.s.m.bin(c, Bin::Shl, n, k2);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[h, at_byte, iu, target, iu, iu, iu, mask, align],
+        );
+        self.end_guarded(listed, &[]);
+        self.end_guarded(at, &[]);
+    }
+
+    /// A store the dirty mask cannot place ran (`shader.rs` `SLOT_DIRTY`,
+    /// dword 1), for lanes where `guard` holds.
+    fn dirty_unplaced(&mut self, guard: Option<V>) {
+        use super::shader::SLOT_DIRTY;
+        let h = self.s.root_uav_handle(SLOT_DIRTY);
+        let at = self.begin_guarded(guard);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let iu = self.s.m.undef(i32t);
+        let (four, one) = (self.s.m.i32(4), self.s.m.i32(1));
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[h, four, iu, one, iu, iu, iu, mask, align],
+        );
+        self.end_guarded(at, &[]);
+    }
+
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
     /// memory by address (`resource::MEMORY`): the address is the VGPR
     /// pair, each lane its own.
@@ -3061,6 +3271,7 @@ impl<'a> Lower<'a> {
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
             let (h, byte) = self.memory(lo, hi, guard);
+            self.mark_dirty(lo, hi, 4 * u32::from(n), guard);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -3088,6 +3299,7 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let (h, byte) = self.memory(lo, hi, guard);
+        self.mark_dirty(lo, hi, 4, guard);
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -10505,6 +10717,7 @@ impl<'a> Lower<'a> {
             let set_next = self.s.m.bin(c, Bin::LShr, v, k8);
             let (and, or) = (self.s.m.i32(1), self.s.m.i32(2));
             let i32t = self.s.t.i32;
+            self.mark_dirty_view(src, Some(aligned), if bits == 16 { 8 } else { 4 }, guard)?;
             let at = self.begin_guarded(guard);
             for (op, x) in [(and, keep), (or, set)] {
                 let args = [h, op, aligned, iu, iu, x];
@@ -10526,11 +10739,11 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+            let (h, coords, at_byte) = match index {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu], byte)
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -10538,10 +10751,14 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let k = self.s.m.i32(stride);
+                    let at = self.s.m.bin(c, Bin::Mul, index, k);
+                    let at = self.s.m.bin(c, Bin::Add, at, off);
+                    (h, [index, off, iu], at)
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu], off),
             };
+            self.mark_dirty_view(src, Some(at_byte), 4, guard)?;
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
@@ -10607,6 +10824,8 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
+                // The element's size is the view's format's: not known here.
+                self.mark_dirty_view(src, None, 0, guard)?;
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
@@ -10614,12 +10833,13 @@ impl<'a> Lower<'a> {
                 }
                 (69, "bufferStore.f32")
             } else {
-                match index {
+                let at_byte = match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
                     Some(index) if used.is_some_and(|u| u.stride == 1) => {
                         let byte = self.s.m.bin(c, Bin::Add, index, off);
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([byte, iu]);
+                        byte
                     }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
@@ -10628,12 +10848,17 @@ impl<'a> Lower<'a> {
                         }
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
+                        let k = self.s.m.i32(stride);
+                        let at = self.s.m.bin(c, Bin::Mul, index, k);
+                        self.s.m.bin(c, Bin::Add, at, off)
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([off, iu]);
+                        off
                     }
-                }
+                };
+                self.mark_dirty_view(src, Some(at_byte), 4 * count, guard)?;
                 args.extend(&vals);
                 args.resize(3 + 4, iu);
                 (140, "rawBufferStore.i32")

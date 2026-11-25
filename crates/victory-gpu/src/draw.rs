@@ -1170,6 +1170,25 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_DIRTY {
+                    // Ours: the dirty-page mask (`crate::dirty`).
+                    let Some(gpu) = crate::host::host().and_then(crate::dirty::mask) else {
+                        once!("a shader that marks the pages it writes without the mask to mark them in: the draw is dropped");
+                        crate::pipeline::note_fault("a shader that marks the pages it writes without the mask: the draw is dropped");
+                        return false;
+                    };
+                    list.first_use(crate::dirty::USED);
+                    // SAFETY: an open list; the mask lives as long as the
+                    // process.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {

@@ -1315,20 +1315,41 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    // Step 2 of the dirty-page mask: a range whose marks are relied on is
+    // looked at in its marked pages only, here ([`Shadow::differing`]).
+    let mut by_marks: Vec<Option<Vec<(usize, usize)>>> = vec![None; work.len()];
     let scans = work
         .iter()
-        .map(|(shadow, address, end)| {
+        .enumerate()
+        .map(|(i, (shadow, address, end))| {
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
-            shadow.wc_read(to.saturating_sub(from));
+            let start = shadow.start as usize;
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
-            match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
-                None => (0, 0, 0, 0, 0),
+            let snapshot = shadow.before.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(before) = snapshot.as_ref() else {
+                return (0, 0, 0, 0, 0);
+            };
+            if from < to && crate::dirty::marked_in(start + from, start + to).is_some() {
+                // SAFETY: `writing` set the snapshot's bytes of every
+                // declared range, at the copy's offsets.
+                let old = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
+                by_marks[i] = Some(shadow.differing(from, to, old));
+                return (0, 0, 0, 0, 0);
             }
+            shadow.wc_read(to.saturating_sub(from));
+            (shadow.data as usize, before.as_ptr() as usize, start, from, to)
         })
         .collect();
-    find_pieces(scans)
+    let mut found = find_pieces(scans);
+    for (i, marked) in by_marks.into_iter().enumerate() {
+        if let Some(marked) = marked
+            && let Some(slot) = found.get_mut(i)
+        {
+            *slot = marked;
+        }
+    }
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -2491,6 +2512,7 @@ impl Shadow {
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
+                crate::dirty::check_changed(start + at, host, old);
                 // Title memory with the GPU's bytes put in; the copy takes
                 // the title's bytes in turn.
                 // Without a branch, so the loop runs many bytes at a time:
@@ -2623,6 +2645,7 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return (0, None);
         }
+        crate::dirty::check_changed(start + at, now, held);
         if !merge_piece(now, held, title) {
             return (0, None);
         }
@@ -2636,8 +2659,27 @@ impl Shadow {
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        self.wc_read(to.saturating_sub(from));
         let (start, data) = (self.start as usize, self.data as usize);
+        // Step 2 of the dirty-page mask: only the pages shaders marked.
+        if let Some(runs) = crate::dirty::marked_in(start + from, start + to) {
+            let mut found = Vec::new();
+            for (a, b) in runs {
+                let (a, b) = (a - start, b - start);
+                self.wc_read(b - a);
+                let mut at = a;
+                while at < b {
+                    let n = (PIECE - (start + at) % PIECE).min(b - at);
+                    // SAFETY: as in the scan below.
+                    let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
+                    if host != &before[at - from..at - from + n] {
+                        found.push((at, n));
+                    }
+                    at += n;
+                }
+            }
+            return found;
+        }
+        self.wc_read(to.saturating_sub(from));
         let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
@@ -3339,6 +3381,7 @@ impl Shadow {
         title.resize(n, 0);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
+            crate::dirty::check_changed(start + at, gpu, old);
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
@@ -3486,6 +3529,9 @@ impl Shadow {
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
+            if mapped {
+                crate::dirty::check_changed(start + at + a, &gpu[a..b], &held[a..b]);
+            }
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);

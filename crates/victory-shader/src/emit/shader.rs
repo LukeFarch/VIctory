@@ -55,6 +55,29 @@ pub const SLOT_FAULTS: u8 = 253;
 /// none). The host makes it for a heap only when such a shader first runs
 /// with it (16 MB).
 pub const SLOT_VIEW_ADDRESSES: u8 = 252;
+/// The dirty-page mask (`VICTORY_DIRTY_MASK`, see `victory-gpu`'s
+/// `dirty.rs`): the root UAV `u<SLOT_DIRTY>` in [`ROOT_CBV_SPACE`] of a
+/// shader that stores to buffers. One raw buffer of [`DIRTY_DWORDS`]:
+/// dword 0 counts the pages listed; dword 1 is set when a store the
+/// translator could not place in title memory ran (the host then trusts
+/// no mark of that submission); dwords from [`DIRTY_LIST_AT`] list the
+/// pages marked (title address / 4096), one entry past [`DIRTY_LIST`] a
+/// sink; from [`DIRTY_MASK_AT`] one bit per 4 KiB page of title address
+/// space below 128 GiB. Each store sets the bit of each page it writes;
+/// the lane that finds the bit clear lists the page. The host copies the
+/// count and list back and clears the buffer after each submission.
+pub const SLOT_DIRTY: u8 = 251;
+/// See [`SLOT_DIRTY`]: the first dword of the page list.
+pub const DIRTY_LIST_AT: u32 = 64;
+/// See [`SLOT_DIRTY`]: entries of the page list (one more is the sink).
+pub const DIRTY_LIST: u32 = 1 << 16;
+/// See [`SLOT_DIRTY`]: the first dword of the mask.
+pub const DIRTY_MASK_AT: u32 = DIRTY_LIST_AT + DIRTY_LIST + 64;
+/// See [`SLOT_DIRTY`]: 4 KiB pages the mask has a bit for (128 GiB); a
+/// store above marks the last.
+pub const DIRTY_PAGES: u32 = 1 << 25;
+/// See [`SLOT_DIRTY`]: dwords of the buffer.
+pub const DIRTY_DWORDS: u32 = DIRTY_MASK_AT + DIRTY_PAGES / 32;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.

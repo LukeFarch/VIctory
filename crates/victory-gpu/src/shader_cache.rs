@@ -96,6 +96,8 @@ fn build() -> &'static [u8; 32] {
                 bytes.push(victory_shader::emit::fast_math());
                 // And which unordered views are globally coherent (`VICTORY_UAV_COHERENT`).
                 bytes.push(victory_shader::emit::uav_coherent());
+                // And whether shaders mark the pages they write (`VICTORY_DIRTY_MASK`).
+                bytes.push(victory_shader::emit::dirty_mask());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
