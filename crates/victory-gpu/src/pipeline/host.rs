@@ -206,6 +206,46 @@ fn legal_dual_source(mut blend: D3D12_BLEND_DESC) -> D3D12_BLEND_DESC {
     blend
 }
 
+/// The blend state a host pipeline is made with: [`legal_dual_source`], and
+/// no blending on a target of an integer format. The console takes blend
+/// state on such a target (it does not blend there); D3D12 refuses the
+/// whole pipeline with E_INVALIDARG, and every draw of it was dropped
+/// ("host mesh pipeline refused", mesh f5e50eb2108c425b).
+/// `VICTORY_INTEGER_BLEND=0` leaves it as the title set it.
+fn legal_blend(g: &GraphicsState) -> D3D12_BLEND_DESC {
+    let mut blend = legal_dual_source(g.blend);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_INTEGER_BLEND").is_none_or(|v| v != "0")) {
+        return blend;
+    }
+    // The UINT and SINT formats a target can have.
+    let integer = |f: DXGI_FORMAT| matches!(f.0, 3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64);
+    let count = (g.targets.NumRenderTargets as usize).min(8);
+    let independent = blend.IndependentBlendEnable.as_bool();
+    let blends = |i: usize| blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool();
+    if !(0..count).any(|i| integer(g.targets.RTFormats[i]) && blends(i)) {
+        return blend;
+    }
+    if !independent {
+        // Each target its own state, so that the others keep theirs.
+        let first = blend.RenderTarget[0];
+        for t in &mut blend.RenderTarget[1..] {
+            *t = first;
+        }
+        blend.IndependentBlendEnable = true.into();
+    }
+    for i in 0..count {
+        if integer(g.targets.RTFormats[i]) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        tracing::info!("a pipeline blends on a target of an integer format: made without blending there (VICTORY_INTEGER_BLEND=0 leaves it)");
+    }
+    blend
+}
+
 fn precompiled_inputs(layout: &[u8]) -> Vec<(CString, D3D12_INPUT_ELEMENT_DESC)> {
     let mut out = Vec::new();
     let count = dword(layout, 0x4c).min(32);
@@ -896,7 +936,7 @@ impl HostPipeline {
                 pShaderBytecode: gs.as_ptr().cast(),
                 BytecodeLength: gs.len(),
             }),
-            BlendState: legal_dual_source(g.blend),
+            BlendState: legal_blend(g),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1062,7 +1102,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, legal_dual_source(g.blend)),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, legal_blend(g)),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -1149,7 +1189,7 @@ fn bounds_pipeline(
             add(s, kind, code);
         }
     }
-    add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, legal_dual_source(g.blend));
+    add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, legal_blend(g));
     add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask);
     add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer);
     let d = &g.depth;
