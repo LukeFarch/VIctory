@@ -346,6 +346,38 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Device method 0x1b8, a console method of unknown purpose: answered
+/// E_NOTIMPL as an unwritten one is, with its first four arguments and
+/// the 64 bytes behind each that points at readable memory logged (the
+/// first 8 calls), so that what it asks can be read.
+extern "system" fn probe_1b8(_: This, a: usize, b: usize, c: usize, d: usize) -> HRESULT {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
+        let behind = |p: usize| -> String {
+            #[cfg(windows)]
+            {
+                let mut bytes = [0u8; 64];
+                if p >= 0x10000 && crate::host::read_into(p as *const u8, &mut bytes) {
+                    return bytes.iter().map(|b| format!("{b:02x}")).collect();
+                }
+            }
+            let _ = p;
+            String::new()
+        };
+        tracing::warn!(
+            args = format_args!("{a:#x} {b:#x} {c:#x} {d:#x}"),
+            at_a = %behind(a),
+            at_b = %behind(b),
+            at_c = %behind(c),
+            at_d = %behind(d),
+            caller = crate::object::caller(),
+            "device method 0x1b8 (unknown) called; answered E_NOTIMPL"
+        );
+    }
+    E_NOTIMPL
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -382,6 +414,7 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[55] = probe_1b8 as *const (); // 0x1b8, unknown: logged
     f[57] = pipeline::create_precompiled_graphics as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
