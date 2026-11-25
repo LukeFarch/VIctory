@@ -2035,13 +2035,31 @@ impl Shadow {
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        let (written, settle) = self.relay_merge_locked(at, n, now, title);
+        // Outside the snapshot's lock: `settle` takes the copy's notes.
+        if let Some((from, to, asked)) = settle {
+            self.settle(from, to, asked);
+        }
+        written
+    }
+
+    /// [`Shadow::relay_merge`] under the snapshot's lock; also what to
+    /// settle once it is let go ([`Shadow::settle`]).
+    ///
+    /// Settling here is sound although later flights may be writing the
+    /// copy: a page is noted current only where the copy's bytes equal
+    /// title memory's after our write, and the note only says the refresh
+    /// need not copy title memory into the copy there. Bytes a later flight
+    /// writes into the copy are that flight's to merge; where they already
+    /// differ from title memory the page stays stale, as before.
+    fn relay_merge_locked(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> (usize, Option<(usize, usize, u64)>) {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
-            return 0;
+            return (0, None);
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Some(before) = snapshot.as_mut() else {
-            return 0;
+            return (0, None);
         };
         now.clear();
         now.reserve(n);
@@ -2058,7 +2076,7 @@ impl Shadow {
         // without the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
         let Some(first) = first_difference(now, held) else {
-            return 0;
+            return (0, None);
         };
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
@@ -2068,14 +2086,14 @@ impl Shadow {
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
         if !crate::host::read_into((start + at) as *const u8, title) {
-            return 0;
+            return (0, None);
         }
         if !merge_piece(now, held, title) {
-            return 0;
+            return (0, None);
         }
-        crate::watch::writing(start + at, n);
+        let own = crate::watch::own_write_begin(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        (n, crate::watch::own_write_end(own).map(|asked| (at, at + n, asked)))
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -2689,12 +2707,25 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        let (written, settle) = self.card_merge_relay_locked(at, gpu, fetched_after, title);
+        // Outside the CPU side's lock, as in `relay_merge`.
+        if let Some((from, to, asked)) = settle {
+            self.settle(from, to, asked);
+        }
+        written
+    }
+
+    /// [`Shadow::card_merge_relay`] under the CPU side's lock; also what
+    /// to settle once it is let go. The CPU side holds the merged bytes
+    /// here, and the title's bytes not yet sent up where the merge left
+    /// them out, so it equals title memory wherever nothing else wrote.
+    fn card_merge_relay_locked(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> (usize, Option<(usize, usize, u64)>) {
         let start = self.start as usize;
         let Some(card) = &self.card else {
-            return 0;
+            return (0, None);
         };
         if at + gpu.len() > self.len as usize {
-            return 0;
+            return (0, None);
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
@@ -2703,7 +2734,7 @@ impl Shadow {
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
-            return 0;
+            return (0, None);
         };
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
@@ -2729,11 +2760,11 @@ impl Shadow {
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
         if !mapped || !changed {
-            return 0;
+            return (0, None);
         }
-        crate::watch::writing(start + at, n);
+        let own = crate::watch::own_write_begin(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        (n, crate::watch::own_write_end(own).map(|asked| (at, at + n, asked)))
     }
 }
 
