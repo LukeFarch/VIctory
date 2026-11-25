@@ -359,9 +359,32 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// Limit target dumps to offsets from the first world frame when requested.
+/// Frame PNGs and operation logs still follow the normal capture selection.
+pub(crate) fn dump_target_frame(frame: u64) -> bool {
+    if !dump_on() {
+        return false;
+    }
+    static AFTER: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
+    let after = AFTER.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_TARGETS_WORLD_AFTER").ok().map(|list| {
+            list.split(',')
+                .filter_map(|n| n.trim().parse::<u64>().ok())
+                .collect()
+        })
+    });
+    match after {
+        Some(offsets) => {
+            let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+            first != u64::MAX && offsets.iter().any(|&n| frame == first.saturating_add(n))
+        }
+        None => listed(frame),
+    }
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_target_frame(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
