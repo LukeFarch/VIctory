@@ -2637,7 +2637,10 @@ struct RelayFetch {
 /// behind each fetch, and the frame took its turns again.
 fn fetch_queue() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_FETCH_QUEUE").is_none_or(|v| v != "0"))
+    // Off unless asked for (`=1`) in this build: run 31, the first with
+    // it on, hung at the prison load and then drew blocks and see-through
+    // walls; run 30a without it did not.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_FETCH_QUEUE").is_some_and(|v| v == "1"))
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
