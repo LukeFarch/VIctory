@@ -7,9 +7,11 @@
 //! presents. Nothing is recorded, and each span costs one relaxed load,
 //! unless the variable is set.
 //!
-//! `VICTORY_TRACE_FROM` (presents after the world's first frame, the
-//! first with 500 draws or more; 600 by default) is where recording starts and `VICTORY_TRACE_FRAMES` (30) how many
-//! presents it covers. The file is written on a thread of its own when
+//! Recording starts at the present after F9 is pressed (press it where
+//! the scene of interest is; F9 again later for another file,
+//! `name-2.json` and on), or by itself `VICTORY_TRACE_FROM` presents after
+//! the world's first frame (the first with 500 draws or more) if that is
+//! set. `VICTORY_TRACE_FRAMES` (30) is how many presents a window covers. The file is written on a thread of its own when
 //! the window ends. Spans past [`MOST`] in the window are dropped (and
 //! counted in the file's metadata).
 //!
@@ -207,17 +209,25 @@ pub(crate) fn present() {
         WORLD.store(n, Ordering::Relaxed);
         tracing::info!(present = n, "trace: the world's first frame");
     }
-    let world = WORLD.load(Ordering::Relaxed);
-    if world == 0 {
-        return;
-    }
-    let from = world + number("VICTORY_TRACE_FROM", 600);
     let frames = number("VICTORY_TRACE_FRAMES", 30).max(1);
-    if n == from {
+    let window = WINDOW.load(Ordering::Relaxed);
+    if window == 0 {
+        // A window opens at F9 (held at a present; the game's window need
+        // not have the keyboard's focus), or by itself once
+        // VICTORY_TRACE_FROM presents after the world's first frame if that
+        // is set (`VICTORY_TRACE_FROM=0`: only by key).
+        let world = WORLD.load(Ordering::Relaxed);
+        let from = number("VICTORY_TRACE_FROM", 0);
+        let by_count = from > 0 && world > 0 && n == world + from && TAKEN.load(Ordering::Relaxed) == 0;
+        if !(by_count || key_pressed()) {
+            return;
+        }
         let _ = epoch();
         SPANS.lock().unwrap_or_else(|e| e.into_inner()).reserve_exact(MOST);
+        WINDOW.store(n, Ordering::Relaxed);
         ON.store(true, Ordering::Relaxed);
-        tracing::info!(path = %path.display(), frames, "trace: recording");
+        tracing::info!(path = %numbered(path).display(), frames, present = n, "trace: recording");
+        return;
     }
     if on() {
         // The present itself, as a mark on the presenting thread.
@@ -228,16 +238,53 @@ pub(crate) fn present() {
             spans.push(Span { name: "present", thread, start: now, len: 0.0, arg: n });
         }
     }
-    if n == from + frames {
+    if n == window + frames {
         ON.store(false, Ordering::Relaxed);
         let spans = std::mem::take(&mut *SPANS.lock().unwrap_or_else(|e| e.into_inner()));
         let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let totals = std::mem::take(&mut *TOTALS.lock().unwrap_or_else(|e| e.into_inner()));
-        let path = path.clone();
+        DROPPED.store(0, Ordering::Relaxed);
+        let path = numbered(path);
+        TAKEN.fetch_add(1, Ordering::Relaxed);
         let _ = std::thread::Builder::new()
             .name("victory-trace-write".into())
             .spawn(move || write(&path, &spans, &threads, &totals, frames));
     }
+    // F9 again, after a window and once the key was let go: another window.
+    if n >= window + frames && !key_down() {
+        WINDOW.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The present that opened the window now recording or last recorded (0:
+/// none, or the key may open another), and the windows written so far.
+static WINDOW: AtomicU64 = AtomicU64::new(0);
+static TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// The file for the next window: the path given, then `name-2.json`, ...
+fn numbered(path: &std::path::Path) -> std::path::PathBuf {
+    let k = TAKEN.load(Ordering::Relaxed);
+    if k == 0 {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "json".into());
+    path.with_file_name(format!("{stem}-{}.{ext}", k + 1))
+}
+
+/// Whether F9 was pressed since the last asking, or is held now: at 3 fps
+/// a quick press falls between two presents.
+fn key_pressed() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F9};
+    // SAFETY: plain call.
+    (unsafe { GetAsyncKeyState(i32::from(VK_F9)) } as u16) & 0x8001 != 0
+}
+
+/// Whether F9 is held now.
+fn key_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F9};
+    // SAFETY: plain call.
+    (unsafe { GetAsyncKeyState(i32::from(VK_F9)) } as u16) & 0x8000 != 0
 }
 
 fn write(path: &std::path::Path, spans: &[Span], threads: &[(u32, String)], totals: &[(&'static str, u64, f64)], frames: u64) {
