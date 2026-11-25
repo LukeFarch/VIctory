@@ -1502,6 +1502,10 @@ struct CardWork {
     /// mapping): a plan takes one, `Host::card_done` gives it back.
     gather: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
     gathers: Vec<(ID3D12Resource, usize)>,
+    /// With [`card_scatter`]: its pass, and record buffers not in use
+    /// (buffer, mapping, bytes): a plan takes one for its sync list.
+    scatter: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
+    scatters: Vec<(ID3D12Resource, usize, u64)>,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -1709,6 +1713,74 @@ fn card_gather() -> bool {
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_GATHER").is_some_and(|v| v == "1"))
 }
 
+/// The card's side of a copy takes small ranges of its CPU side byte by
+/// byte, one group of 64 threads to a range (`card_scatter`): the ranges
+/// are (offset, bytes) pairs in `records`, from record `first` on. Whole
+/// dwords are stored; the bytes of a dword the range only partly covers
+/// go in with an atomic and/or, so two ranges that share a dword do not
+/// undo each other.
+pub(crate) const CARD_SCATTER: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0), SRV(t1)"
+cbuffer C : register(b0) {
+    uint count;
+    uint first;
+};
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+ByteAddressBuffer records : register(t1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
+    uint r = g.x + g.y * 65535u;
+    if (r >= count) return;
+    uint2 rec = records.Load2((first + r) * 8u);
+    uint lo = rec.x;
+    uint hi = rec.x + rec.y;
+    [loop]
+    for (uint w = (lo & ~3u) + t * 4u; w < hi; w += 256u) {
+        uint s = src.Load(w);
+        uint a = max(w, lo) - w;
+        uint b = min(w + 4u, hi) - w;
+        if (a == 0u && b == 4u) {
+            dst.Store(w, s);
+        } else {
+            uint mask = 0u;
+            [unroll]
+            for (uint k = 0u; k < 4u; k++) {
+                if (k >= a && k < b) mask |= 0xFFu << (k * 8u);
+            }
+            uint was;
+            dst.InterlockedAnd(w, ~mask, was);
+            dst.InterlockedOr(w, s & mask, was);
+        }
+    }
+}
+"#;
+
+/// Whether small ranges sent up to copies in the card's memory go in one
+/// pass of ours instead of a copy each (`VICTORY_CARD_SCATTER=1`; off by
+/// default), and the pieces hashed after them in runs, each once.
+///
+/// A title write merged into a quarantined page (633113d) sends up each
+/// run of bytes the title changed and no other, so as not to put the
+/// CPU's older bytes over what the card made between them: 1.6 to 5.4
+/// million ranges a frame in tonight's runs (against some 270 before it),
+/// each a copy command and a hash pass of its piece, 3 to 4 s of the
+/// frame. The same bytes, byte for byte, in one dispatch per copy.
+fn card_scatter() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SCATTER").is_some_and(|v| v == "1"))
+}
+
+/// Ranges below this many bytes go to the scatter pass, if a copy has at
+/// least [`SCATTER_FEW`] of them.
+const SCATTER_SMALL: usize = 4096;
+const SCATTER_FEW: usize = 16;
+
+/// Since the start, with [`card_scatter`]: ranges sent up by the scatter,
+/// and its passes.
+pub(crate) static SCATTER_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Since the start, with [`card_gather`]: pieces merged from a gather
 /// buffer, their bytes, and pieces found changed past a plan's room
 /// (fetched as before).
@@ -1793,6 +1865,8 @@ struct CardPlan {
     /// With [`card_gather`]: the buffer its compare copied the differing
     /// pieces into (buffer, mapping).
     gather: Option<(ID3D12Resource, usize)>,
+    /// With [`card_scatter`]: the records its sync list's scatter read.
+    scatter: Option<(ID3D12Resource, usize, u64)>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3518,6 +3592,20 @@ impl Host {
         if card_wide() {
             tracing::info!("card hash passes run 64 threads to a piece (VICTORY_CARD_WIDE_HASH=1 or VICTORY_CARD_GATHER=1)");
         }
+        let scatter = if card_scatter() {
+            match compile(CARD_SCATTER).and_then(|code| make(&code)) {
+                Ok(made) => {
+                    tracing::info!("card scatter on (VICTORY_CARD_SCATTER=1): small ranges sent up in one pass per copy, their pieces hashed once");
+                    Some(made)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no card scatter: its pass could not be made; ranges are copied one by one as before");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -3536,6 +3624,8 @@ impl Host {
                 fetched: None,
                 gather,
                 gathers: Vec::new(),
+                scatter,
+                scatters: Vec::new(),
                 taken: 0,
                 out: 0,
             })
@@ -3609,6 +3699,23 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // With the scatter: per copy, its small ranges, and the records of
+        // all of them in one buffer of the plan's.
+        let small_of = |ranges: &[(usize, usize)]| -> usize { ranges.iter().filter(|r| r.1 - r.0 < SCATTER_SMALL).count() };
+        let scattering = work.scatter.is_some() && dirty.iter().any(|(_, r)| small_of(r) >= SCATTER_FEW);
+        let mut scatter_buffer: Option<(ID3D12Resource, usize, u64)> = None;
+        if scattering {
+            let records: usize = dirty.iter().map(|(_, r)| small_of(r)).filter(|&n| n >= SCATTER_FEW).sum();
+            let want = (records as u64 * 8).next_multiple_of(1 << 20);
+            scatter_buffer = match work.scatters.iter().position(|b| b.2 >= want) {
+                Some(i) => Some(work.scatters.swap_remove(i)),
+                None => self.shared_buffer(want).map(|(buffer, data)| {
+                    name(&buffer, || "card scatter: ranges to send up".into());
+                    (buffer, data as usize, want)
+                }),
+            };
+        }
+        let mut scattered = 0usize;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -3625,12 +3732,57 @@ impl Host {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        let scatter_here = scatter_buffer.as_ref().zip(work.scatter.as_ref()).filter(|_| small_of(ranges) >= SCATTER_FEW);
+                        let mut copied = false;
+                        let first = scattered;
                         for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                            match scatter_here {
+                                Some(((_, data, _), _)) if b - a < SCATTER_SMALL => {
+                                    // SAFETY: the records buffer holds every
+                                    // small range of the plan (counted above).
+                                    (*data as *mut [u32; 2]).add(scattered).write([a as u32, (b - a) as u32]);
+                                    scattered += 1;
+                                }
+                                _ => {
+                                    list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                    copied = true;
+                                }
+                            }
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        let count = (scattered - first) as u32;
+                        let after_scatter = if let Some(((records, _, _), (root, pso))) = scatter_here
+                            && count > 0
+                        {
+                            list.ResourceBarrier(&[transition(
+                                &shadow.buffer,
+                                if copied { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_COMMON },
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            list.SetComputeRootSignature(root);
+                            list.SetPipelineState(pso);
+                            let constants = [count, first as u32];
+                            list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                            list.SetComputeRootShaderResourceView(1, staging.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootShaderResourceView(3, records.GetGPUVirtualAddress());
+                            let (x, y) = wide_groups(count);
+                            list.Dispatch(x, y, 1);
+                            SCATTER_STATS[0].fetch_add(u64::from(count), Ordering::Relaxed);
+                            SCATTER_STATS[1].fetch_add(1, Ordering::Relaxed);
+                            true
+                        } else {
+                            false
+                        };
                         let Some(before) = before else {
+                            if after_scatter {
+                                list.ResourceBarrier(&[transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COMMON,
+                                )]);
+                            }
                             continue;
                         };
                         // No twin (it cost the card the copy's size again,
@@ -3639,7 +3791,13 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if after_scatter {
+                            list.ResourceBarrier(&[transition(
+                                &shadow.buffer,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            )]);
+                        } else if !ranges.is_empty() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -3656,8 +3814,9 @@ impl Host {
                         } else {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        // The same pieces in fewer passes (`rehash_runs`; with
+                        // the scatter too, whose ranges are many and small).
+                        let runs = if rehash_runs() || after_scatter { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -3682,6 +3841,10 @@ impl Host {
             used.push((false, sync));
         }
         drop(order);
+        let scatter_buffer = scatter_buffer.filter(|_| scattered > 0).or_else(|| {
+            // Not used: back to the pool.
+            None
+        });
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -3689,6 +3852,7 @@ impl Host {
             lists: used,
             sent_as,
             gather: None,
+            scatter: scatter_buffer,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3829,6 +3993,9 @@ impl Host {
         }
         if let Some(gather) = plan.gather {
             work.gathers.push(gather);
+        }
+        if let Some(scatter) = plan.scatter {
+            work.scatters.push(scatter);
         }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
@@ -6566,6 +6733,14 @@ impl Meter {
                 if dropped > 0 {
                     tracing::info!(dropped, "presents dropped since the start, the swap chain's queue full (VICTORY_PRESENT_NO_WAIT=1)");
                 }
+            }
+            if card_scatter() {
+                static LAST_S: Mutex<[u64; 2]> = Mutex::new([0; 2]);
+                let now = SCATTER_STATS.each_ref().map(|c| c.load(Ordering::Relaxed));
+                let mut last = LAST_S.lock().unwrap_or_else(|e| e.into_inner());
+                let d: [u64; 2] = std::array::from_fn(|i| now[i] - last[i]);
+                *last = now;
+                tracing::info!("card scatter since the last such line: {} small ranges sent up in {} passes (instead of a copy and a hash pass each)", d[0], d[1]);
             }
             if card_gather() {
                 static LAST: Mutex<[u64; 3]> = Mutex::new([0; 3]);

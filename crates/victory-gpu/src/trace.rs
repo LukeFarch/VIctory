@@ -42,6 +42,7 @@ static WORLD: AtomicU64 = AtomicU64::new(0);
 /// A small number per thread for the file (thread ids are long).
 static NEXT_THREAD: AtomicUsize = AtomicUsize::new(1);
 
+#[derive(Clone)]
 struct Span {
     name: &'static str,
     thread: u32,
@@ -66,7 +67,7 @@ fn min_us() -> f64 {
 }
 
 /// Whether the window open now (or last) is a load profile (F10): longer
-/// (`VICTORY_TRACE_LOAD_FRAMES`, 150 presents), its own floor for spans
+/// (`VICTORY_TRACE_LOAD_FRAMES`, 60 presents), its own floor for spans
 /// kept one by one (`VICTORY_TRACE_LOAD_MIN_US`, 20), a file named
 /// `name-load-N.json`. Pressed while the world streams in (or anywhere it
 /// stutters), it says which loading work costs the time: file reads,
@@ -250,6 +251,12 @@ pub(crate) fn present() {
             return;
         }
         LOAD.store(load, Ordering::Relaxed);
+        FLUSHED.store(0, Ordering::Relaxed);
+        *PARTIAL.lock().unwrap_or_else(|e| e.into_inner()) = load.then(|| {
+            let full = numbered(path);
+            let stem = full.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            (full.with_file_name(format!("{stem}.partial.json")), false)
+        });
         COUNTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let shaders = crate::shader_cache::counts();
         *SHADERS_AT.lock().unwrap_or_else(|e| e.into_inner()) = shaders;
@@ -269,6 +276,13 @@ pub(crate) fn present() {
         if spans.len() < spans.capacity() {
             spans.push(Span { name: "present", thread, start: now, len: 0.0, arg: n });
         }
+    }
+    // A load profile is also written as it goes, every second present, to
+    // `name-load.partial.json` (a trace array the viewers read unfinished):
+    // a run stopped by its memory guard while the world loads keeps what
+    // was recorded until then.
+    if on() && LOAD.load(Ordering::Relaxed) && n > window && n < window + frames && (n - window) % 2 == 0 {
+        flush_partial();
     }
     if n == window + frames {
         ON.store(false, Ordering::Relaxed);
@@ -301,13 +315,74 @@ pub(crate) fn present() {
 static WINDOW: AtomicU64 = AtomicU64::new(0);
 static TAKEN: AtomicU64 = AtomicU64::new(0);
 
+/// The load profile's partial file and whether it was begun; spans
+/// written to it so far.
+static PARTIAL: Mutex<Option<(std::path::PathBuf, bool)>> = Mutex::new(None);
+static FLUSHED: AtomicUsize = AtomicUsize::new(0);
+
+/// Appends the spans recorded since the last flush, and the totals and
+/// counters so far, to the load profile's partial file (on a thread of its
+/// own; one at a time).
+fn flush_partial() {
+    let spans: Vec<Span> = {
+        let spans = SPANS.lock().unwrap_or_else(|e| e.into_inner());
+        let from = FLUSHED.swap(spans.len(), Ordering::Relaxed).min(spans.len());
+        spans[from..].to_vec()
+    };
+    let totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let _ = std::thread::Builder::new().name("victory-trace-partial".into()).spawn(move || {
+        use std::io::Write;
+        let mut partial = PARTIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((path, begun)) = partial.as_mut() else {
+            return;
+        };
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&*path);
+        let Ok(file) = file else {
+            return;
+        };
+        let mut out = std::io::BufWriter::new(file);
+        let _ = (|| -> std::io::Result<()> {
+            if !*begun {
+                writeln!(out, "[")?;
+                *begun = true;
+            }
+            for (n, name) in &threads {
+                let name: String = name.chars().filter(|c| *c != '"' && *c != '\\').collect();
+                writeln!(out, "{{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":1,\"tid\":{n},\"args\":{{\"name\":\"{name}\"}}}},")?;
+            }
+            for s in &spans {
+                if s.len == 0.0 {
+                    writeln!(out, "{{\"ph\":\"i\",\"s\":\"g\",\"name\":\"{}\",\"pid\":1,\"tid\":{},\"ts\":{:.3},\"args\":{{\"n\":{}}}}},", s.name, s.thread, s.start, s.arg)?;
+                } else {
+                    writeln!(out, "{{\"ph\":\"X\",\"name\":\"{}\",\"pid\":1,\"tid\":{},\"ts\":{:.3},\"dur\":{:.3},\"args\":{{\"n\":{}}}}},", s.name, s.thread, s.start, s.len, s.arg)?;
+                }
+            }
+            // The totals and counters so far, as a mark whose arguments
+            // hold them (the last such mark is the latest).
+            let totals: Vec<String> = totals.iter().map(|(name, n, us)| format!("\"{name}\":[{n},{:.0}]", us)).collect();
+            let counts: Vec<String> = counts.iter().map(|(name, v)| format!("\"{name}\":{v}")).collect();
+            let now = epoch().elapsed().as_secs_f64() * 1e6;
+            writeln!(
+                out,
+                "{{\"ph\":\"i\",\"s\":\"g\",\"name\":\"load profile so far\",\"pid\":1,\"tid\":0,\"ts\":{now:.3},\"args\":{{\"census\":{},\"counts\":{{{}}},\"totals_count_us\":{{{}}}}}}},",
+                crate::watch::census_json(),
+                counts.join(","),
+                totals.join(",")
+            )?;
+            out.flush()
+        })();
+    });
+}
+
 /// Shader counts when the window opened.
 static SHADERS_AT: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
 /// Presents the window open now covers.
 fn window_frames() -> u64 {
     if LOAD.load(Ordering::Relaxed) {
-        number("VICTORY_TRACE_LOAD_FRAMES", 150).max(1)
+        number("VICTORY_TRACE_LOAD_FRAMES", 60).max(1)
     } else {
         number("VICTORY_TRACE_FRAMES", 30).max(1)
     }
