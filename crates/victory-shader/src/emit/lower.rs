@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// UAV handles annotated rasterizer ordered.
+    #[cfg(test)]
+    pub rov_handles: u32,
     /// The functions the module calls (`dx.op.*`), by name.
     #[cfg(test)]
     pub functions: Vec<String>,
@@ -108,6 +111,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
+/// `src_pops_exiting_wave_id`, as a scalar source operand.
+const POPS_EXITING_WAVE_ID: u8 = 239;
+
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
@@ -1271,6 +1277,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.rov = x.io.pops;
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -2193,6 +2200,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
+            rov_handles: self.s.rov_handles,
+            #[cfg(test)]
             functions: self.s.m.function_names(),
             dxil: self.s.finish(),
             user_data,
@@ -2287,6 +2296,10 @@ impl<'a> Lower<'a> {
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
+            // No earlier wave overlaps (bit 31 clear): the program skips its
+            // wait, and the host orders the overlapping pixels' accesses
+            // instead (its UAVs are rasterizer ordered, `Shader::rov`).
+            Input::PopsCollision => return Val::I32(self.s.m.i32(0)),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
@@ -3363,6 +3376,10 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // The newest exited wave's id, which the POPS wait compares
+            // with the newest overlapping wave's: what it reads with no wave
+            // overlapping it (`Input::PopsCollision`) decides nothing.
+            Operand::Const(POPS_EXITING_WAVE_ID) if self.x.io.pops => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -11691,6 +11708,121 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    /// A pixel program that orders its overlapping waves (POPS), with one
+    /// user SGPR (a table: a 2D UAV at dword 0), so the primitive mask in s1
+    /// and the collision wave id in s2. `collision` is the instruction that
+    /// takes the overlap bit of s2 into s4.
+    fn pops_program(collision: u32, exiting: u32) -> Vec<u32> {
+        vec![
+            0xBE81_0380, // s_mov_b32 s1, 0 (table address high)
+            0xF40C_0200,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+            collision,
+            0xB984_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s4
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF85_0004, // s_cbranch_scc1 (no earlier wave overlaps) past the wait
+            0xBF8E_0001, // s_sleep 1
+            exiting,     // s5 from src_pops_exiting_wave_id
+            0xBF06_8005, // s_cmp_eq_u32 s5, 0
+            0xBF84_FFFC, // s_cbranch_scc0 back to the s_sleep
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_02F2, // v_mov_b32 v2, 1.0
+            0x7E06_02F2,
+            0x7E08_02F2,
+            0x7E0A_02F2, // v3..v5 = 1.0
+            0xF020_2F08,
+            0x0002_0200, // image_store v[2:5], v[0:1], s[8:15] dmask:0xf dim:2D
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            0xBF90_0007, // s_sendmsg MSG_ORDERED_PS_DONE
+            S_ENDPGM,
+        ]
+    }
+
+    /// s_lshr_b32 s4, s2, 31: the collision id's overlap bit.
+    const OVERLAP_BIT: u32 = 0x9004_9F02;
+    /// s_add_i32 s5, src_pops_exiting_wave_id, 0.
+    const EXITING: u32 = 0x8105_80EF;
+
+    fn lower_pixel(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+    }
+
+    /// The POPS wait reads the collision wave id the hardware loads after
+    /// the user data and primitive mask: it reads as "no earlier wave
+    /// overlaps", so the program skips its wait, and the UAV it orders is
+    /// rasterizer ordered instead.
+    #[test]
+    fn a_pops_wait_becomes_rasterizer_ordered_uavs() {
+        let l = lower_pixel(&pops_program(OVERLAP_BIT, EXITING)).unwrap();
+        // (The store's handle, and the one its format query makes.)
+        assert!(l.rov_handles > 0);
+    }
+
+    /// The SGPR after the primitive mask read as a whole number (not bit
+    /// fields of it, as the wait takes them) may be a user SGPR the layout
+    /// does not list: it stays a hardware SGPR input nothing gives.
+    #[test]
+    fn a_pops_collision_id_read_whole_is_refused() {
+        let words = pops_program(0xBE84_0302, EXITING); // s_mov_b32 s4, s2
+        let e = lower_pixel(&words).err().unwrap();
+        assert!(e.to_string().contains("a hardware SGPR input"), "{e}");
+    }
+
+    /// Without the POPS packer set, the program orders nothing: the SGPR
+    /// after the primitive mask stays a hardware SGPR input nothing gives.
+    #[test]
+    fn the_pops_exiting_wave_id_needs_a_pops_program() {
+        let mut words = pops_program(OVERLAP_BIT, EXITING);
+        words[4] = 0xBF80_0000; // s_nop 0 for the s_setreg
+        let e = lower_pixel(&words).err().unwrap();
+        assert!(e.to_string().contains("hardware SGPR"), "{e}");
     }
 
     #[test]
