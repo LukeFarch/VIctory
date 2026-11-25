@@ -304,9 +304,10 @@ fn write(path: &std::path::Path, spans: &[Span], threads: &[(u32, String)], tota
             .collect();
         writeln!(
             out,
-            "{{\"displayTimeUnit\":\"ms\",\"otherData\":{{\"dropped\":{},\"frames\":{frames},\"min_us\":{},\"totals\":{{{}}}}},\"traceEvents\":[",
+            "{{\"displayTimeUnit\":\"ms\",\"otherData\":{{\"dropped\":{},\"frames\":{frames},\"min_us\":{},\"census\":{},\"totals\":{{{}}}}},\"traceEvents\":[",
             DROPPED.load(Ordering::Relaxed),
             min_us(),
+            crate::watch::census_json(),
             totals.join(",")
         )?;
         for (n, name) in threads {

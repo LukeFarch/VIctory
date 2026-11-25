@@ -662,8 +662,8 @@ fn uncommitted_end(block: usize) -> usize {
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
-fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    let blocks = open_only(g, start, end);
+fn open(g: &mut Guards, start: usize, end: usize, why: Seen) -> bool {
+    let blocks = open_only(g, start, end, why);
     // The same bytes at their other addresses are written with them.
     let mut i = 0;
     while i < blocks.len() {
@@ -679,7 +679,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 
 /// [`open`] without a word to the other addresses of the blocks' bytes;
 /// the blocks it opened.
-fn open_only(g: &mut Guards, start: usize, end: usize) -> Vec<usize> {
+fn open_only(g: &mut Guards, start: usize, end: usize, why: Seen) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
@@ -693,6 +693,7 @@ fn open_only(g: &mut Guards, start: usize, end: usize) -> Vec<usize> {
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
+    census_forget(&blocks, why);
     blocks
 }
 
@@ -702,7 +703,7 @@ fn open_only(g: &mut Guards, start: usize, end: usize) -> Vec<usize> {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    open(&mut guards(), at, at.saturating_add(len), Seen::KernelWrite);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -732,7 +733,7 @@ pub(crate) fn own_write_begin(at: usize, len: usize) -> OwnWrite {
     let blocks: Vec<usize> = {
         // Not `open`: the other addresses of these bytes are told at the
         // end, in the journal, with no fault and no call to the system.
-        open_only(&mut guards(), at, end)
+        open_only(&mut guards(), at, end, Seen::CardAgain)
     };
     crate::descriptor::host::remapped(at, len);
     OwnWrite { blocks, at, len }
@@ -757,6 +758,9 @@ pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
         return None;
     }
     if w.blocks.is_empty() {
+        if census() {
+            seen(Seen::Unwatched, (w.at.saturating_add(w.len).div_ceil(BLOCK) - w.at / BLOCK) as u64);
+        }
         return writes(w.at, w.at.saturating_add(w.len), false).map(|(now, _)| now);
     }
     // The same bytes at their other addresses: written too, for the
@@ -781,6 +785,9 @@ pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
                 crate::inplace::twins(from * BLOCK, to * BLOCK, |_, twin| twins.push(twin / BLOCK));
             }
             i = j;
+        }
+        if census() {
+            census_mark(&g, &w.blocks, w.at, w.len);
         }
     }
     let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
@@ -861,10 +868,315 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.absent.remove(&block);
     }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
+    for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    census_forget(&blocks, Seen::Lost);
+}
+
+/// The read census (`VICTORY_READ_CENSUS=1`, diagnostics only, off by
+/// default): of the title memory our copy-backs write (what shaders made,
+/// put where the title's CPU code would see it), how much the title ever
+/// reads before the card writes it again. Each guarded block a copy-back
+/// writes is left with no access at all (it was read-only for the guards),
+/// and the first touch of it faults into our handler, which counts it, says
+/// whose code it was (the title's or ours, by the module of the faulting
+/// instruction) and how many frames after the copy-back, and puts the
+/// block back to read-only: what the block holds is the same either way,
+/// the bytes were copied back already. A copy-back into a block still
+/// waiting counts it as written again by the card with no read between.
+///
+/// What it is for: copying back only what the title reads (the copy-back's
+/// wait on the card was the biggest cost of the frame). The bytes nobody
+/// reads could stay the card's, as on the console, where the CPU and the
+/// card share one memory and nothing is copied at all.
+///
+/// Our own kernel reads of such a block (refreshes, `ReadProcessMemory`)
+/// open it and try again ([`census_open`]); the title's kernel I/O into it
+/// opens it first ([`writing`]). A kernel read of the title's (a file
+/// write from GPU memory) would fail while a block waits: none is known.
+/// Only blocks the guards hold are counted (the view memory); a copy-back
+/// elsewhere is only counted as not watched. The other addresses of the
+/// same bytes stay as they were, so a read through one of them is missed.
+fn census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_READ_CENSUS").is_some_and(|v| v == "1") && crate::inplace::level() == 0;
+        if on {
+            tracing::info!("read census on (VICTORY_READ_CENSUS=1): copied-back blocks are watched for the title's reads");
+        }
+        on
+    })
+}
+
+/// What the census counts, since the start (the memory line shows what
+/// changed since the line before).
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Seen {
+    /// Guarded blocks a copy-back wrote, and the bytes it wrote in them.
+    Copied,
+    CopiedBytes,
+    /// Copy-backs into memory the guards do not hold, in 64 KiB blocks.
+    Unwatched,
+    /// First touch by the title's code (any module but ours), reading;
+    /// and the bytes copied back into those blocks.
+    TitleRead,
+    TitleReadBytes,
+    /// First touch by our own code in place (texture detiling and the like).
+    OurRead,
+    /// First touch by the title's code, writing.
+    TitleWrite,
+    /// Copied back again before anything touched it: the card's bytes were
+    /// never read; and those bytes.
+    CardAgain,
+    CardAgainBytes,
+    /// Our kernel reads (refreshes of other copies of the same memory).
+    OurKernelRead,
+    /// The title's kernel I/O into it.
+    KernelWrite,
+    /// Its memory was mapped anew, or a guard changed it.
+    Lost,
+    /// Title reads by frames after the copy-back: same, 1, 2-4, 5-30, more.
+    Delay0,
+    Delay1,
+    Delay2,
+    Delay5,
+    Delay31,
+}
+const SEEN: usize = Seen::Delay31 as usize + 1;
+static SEEN_N: [std::sync::atomic::AtomicU64; SEEN] = [const { std::sync::atomic::AtomicU64::new(0) }; SEEN];
+fn seen(what: Seen, n: u64) {
+    SEEN_N[what as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Blocks waiting for their first touch (frame of the copy-back, bytes it
+/// wrote), and by 16 MiB region: blocks copied back, read by the title,
+/// read by us, copied back again unread.
+struct Census {
+    waiting: BTreeMap<usize, (u64, u32)>,
+    regions: BTreeMap<usize, [u64; 4]>,
+}
+static CENSUS: Mutex<Census> = Mutex::new(Census { waiting: BTreeMap::new(), regions: BTreeMap::new() });
+const REGION_SHIFT: u32 = 8; // 256 blocks of 64 KiB
+/// Modules of the title reads' instructions (base, count); 0 is free.
+static MODULES: [[std::sync::atomic::AtomicUsize; 2]; 8] = [const { [const { std::sync::atomic::AtomicUsize::new(0) }; 2] }; 8];
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    /// The base of the module holding `pc`, or null; what the exception
+    /// dispatcher itself uses, so safe in our handler.
+    fn RtlPcToFileHeader(pc: *const std::ffi::c_void, base: *mut *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+fn module_of(pc: usize) -> usize {
+    let mut base = std::ptr::null_mut();
+    // SAFETY: a lookup in the loader's tables; writes only `base`.
+    unsafe { RtlPcToFileHeader(pc as *const _, &mut base) };
+    base as usize
+}
+
+fn our_module() -> usize {
+    static OURS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *OURS.get_or_init(|| module_of(census as fn() -> bool as usize))
+}
+
+/// After a copy-back wrote `[at, at + len)` and the guards took `blocks`
+/// again: those still guarded wait for their first touch.
+fn census_mark(g: &Guards, blocks: &[usize], at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+    let _ = our_module();
+    let frame = crate::frame::current();
+    let end = at + len;
+    let mut c = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    for &block in blocks {
+        if !g.protected.contains(&block) {
+            continue;
+        }
+        let bytes = (end.min((block + 1) * BLOCK) - at.max(block * BLOCK)) as u32;
+        let mut old = 0;
+        // SAFETY: a guarded block of title view memory: read-only by our
+        // hand; only its protection changes.
+        if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_NOACCESS, &mut old) } == 0 {
+            continue;
+        }
+        c.waiting.insert(block, (frame, bytes));
+        c.regions.entry(block >> REGION_SHIFT).or_default()[0] += 1;
+        seen(Seen::Copied, 1);
+        seen(Seen::CopiedBytes, u64::from(bytes));
+    }
+}
+
+/// Blocks of `blocks` that waited are done waiting, for `why` (their
+/// protection was changed by the caller).
+fn census_forget(blocks: &[usize], why: Seen) {
+    if !census() || blocks.is_empty() {
+        return;
+    }
+    let mut c = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    if c.waiting.is_empty() {
+        return;
+    }
+    for &block in blocks {
+        if let Some((_, bytes)) = c.waiting.remove(&block) {
+            seen(why, 1);
+            if let Seen::CardAgain = why {
+                seen(Seen::CardAgainBytes, u64::from(bytes));
+                c.regions.entry(block >> REGION_SHIFT).or_default()[3] += 1;
+            }
+        }
+    }
+}
+
+/// The census's part of a fault at `at` (`write`: a write; `pc`: the
+/// faulting instruction): true if the block was waiting, now read-only
+/// again (the access is tried again, and a write then faults as a guard's).
+fn census_fault(g: &Guards, at: usize, write: bool, pc: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let block = at / BLOCK;
+    let mut c = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((frame, bytes)) = c.waiting.remove(&block) else {
+        return false;
+    };
+    let mut old = 0;
+    let back = if g.protected.contains(&block) { PAGE_READONLY } else { PAGE_READWRITE };
+    // SAFETY: a block we left with no access; back to what the guards hold.
+    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, back, &mut old) };
+    let module = module_of(pc);
+    let region = c.regions.entry(block >> REGION_SHIFT).or_default();
+    if module != 0 && module == our_module() {
+        region[2] += 1;
+        seen(Seen::OurRead, 1);
+        return true;
+    }
+    if write {
+        seen(Seen::TitleWrite, 1);
+        return true;
+    }
+    region[1] += 1;
+    seen(Seen::TitleRead, 1);
+    seen(Seen::TitleReadBytes, u64::from(bytes));
+    let late = crate::frame::current().saturating_sub(frame);
+    seen(
+        match late {
+            0 => Seen::Delay0,
+            1 => Seen::Delay1,
+            2..=4 => Seen::Delay2,
+            5..=30 => Seen::Delay5,
+            _ => Seen::Delay31,
+        },
+        1,
+    );
+    for slot in &MODULES {
+        let b = slot[0].load(Relaxed);
+        if b == module || (b == 0 && slot[0].compare_exchange(0, module, Relaxed, Relaxed).is_ok_and(|_| true)) {
+            slot[1].fetch_add(1, Relaxed);
+            break;
+        }
+    }
+    true
+}
+
+/// Our kernel read of title memory `[at, at + len)` failed: blocks there
+/// that wait for the census are read-only again, counted as read by us;
+/// true if any was (then the read is worth trying again).
+pub(crate) fn census_open(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    if !census() || len == 0 {
+        return false;
+    }
+    let g = guards();
+    let mut c = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    let blocks: Vec<usize> = c.waiting.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).map(|(&b, _)| b).collect();
+    for &block in &blocks {
+        c.waiting.remove(&block);
+        let back = if g.protected.contains(&block) { PAGE_READONLY } else { PAGE_READWRITE };
+        let mut old = 0;
+        // SAFETY: as in `census_fault`.
+        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, back, &mut old) };
+        seen(Seen::OurKernelRead, 1);
+    }
+    !blocks.is_empty()
+}
+
+/// For the memory line: what the census saw since the line before.
+pub(crate) fn census_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !census() {
+        return;
+    }
+    static LAST: Mutex<[u64; SEEN]> = Mutex::new([0; SEEN]);
+    let now: [u64; SEEN] = std::array::from_fn(|i| SEEN_N[i].load(Relaxed));
+    let d: [u64; SEEN] = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::array::from_fn(|i| now[i] - last[i]);
+        *last = now;
+        d
+    };
+    let s = |w: Seen| d[w as usize];
+    let (waiting, regions) = {
+        let c = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut r: Vec<(usize, [u64; 4])> = c.regions.iter().map(|(&k, &v)| (k, v)).collect();
+        r.sort_by_key(|(_, v)| std::cmp::Reverse(v[0]));
+        r.truncate(8);
+        (c.waiting.len(), r)
+    };
+    let regions: Vec<String> = regions
+        .iter()
+        .map(|(k, v)| format!("{:#x}: {} copied back, {} title-read, {} ours, {} unread when copied again", k << REGION_SHIFT << 16, v[0], v[1], v[2], v[3]))
+        .collect();
+    let modules: Vec<String> = MODULES
+        .iter()
+        .filter(|m| m[0].load(Relaxed) != 0)
+        .map(|m| format!("{} {}", module_name(m[0].load(Relaxed)), m[1].load(Relaxed)))
+        .collect();
+    tracing::info!(
+        "read census since the last such line: {} guarded blocks copied back ({} MB written), {} blocks copied back unwatched; first touches: title read {} ({} MB of copied-back bytes; frames after: same {}, 1 {}, 2-4 {}, 5-30 {}, more {}), our code in place {}, our kernel reads {}, title wrote first {}, title I/O {}; copied back again unread {} ({} MB); {} blocks waiting now",
+        s(Seen::Copied),
+        s(Seen::CopiedBytes) >> 20,
+        s(Seen::Unwatched),
+        s(Seen::TitleRead),
+        s(Seen::TitleReadBytes) >> 20,
+        s(Seen::Delay0),
+        s(Seen::Delay1),
+        s(Seen::Delay2),
+        s(Seen::Delay5),
+        s(Seen::Delay31),
+        s(Seen::OurRead),
+        s(Seen::OurKernelRead),
+        s(Seen::TitleWrite),
+        s(Seen::KernelWrite),
+        s(Seen::CardAgain),
+        s(Seen::CardAgainBytes) >> 20,
+        waiting,
+    );
+    tracing::info!("read census since the start, by 16 MiB region (most copied back first): {}; title reads by module: {}", regions.join("; "), modules.join(", "));
+}
+
+/// The census since the start, for a timeline file's metadata.
+pub(crate) fn census_json() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !census() {
+        return "null".into();
+    }
+    let names = [
+        "copied", "copied_bytes", "unwatched", "title_read", "title_read_bytes", "our_read", "title_write", "card_again", "card_again_bytes",
+        "our_kernel_read", "kernel_write", "lost", "delay_0", "delay_1", "delay_2_4", "delay_5_30", "delay_31",
+    ];
+    let parts: Vec<String> = names.iter().enumerate().map(|(i, n)| format!("\"{n}\":{}", SEEN_N[i].load(Relaxed))).collect();
+    format!("{{{}}}", parts.join(","))
+}
+
+fn module_name(base: usize) -> String {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+    let mut buf = [0u16; 260];
+    // SAFETY: a module base from the loader's tables; the buffer's length.
+    let n = unsafe { GetModuleFileNameW(base as _, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&buf[..n]);
+    let name = path.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+    if name.is_empty() { format!("{base:#x}") } else { name }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -879,6 +1191,20 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
+        // A block the read census left with no access: counted, and
+        // read-only again (a write then faults once more, as a guard's).
+        if census()
+            && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && census_fault(
+                &GUARDS.lock().unwrap_or_else(|e| e.into_inner()),
+                r.ExceptionInformation[1],
+                r.ExceptionInformation[0] == WRITE,
+                r.ExceptionAddress as usize,
+            )
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
@@ -891,7 +1217,7 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         // Not `guards()`: nothing recorded in the exception handler.
         let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-        if open(&mut g, at, at + 1) {
+        if open(&mut g, at, at + 1, Seen::TitleWrite) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
