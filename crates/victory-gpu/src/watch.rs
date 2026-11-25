@@ -944,8 +944,43 @@ enum Seen {
     Delay2,
     Delay5,
     Delay31,
+    /// Our kernel reads, by who read: the copy that copied the block back,
+    /// another copy that is a window, a title buffer's copy in the card's
+    /// memory, another title buffer's copy, a texture, something else.
+    ReadSame,
+    ReadWindow,
+    ReadCard,
+    ReadBuffer,
+    ReadTexture,
+    ReadOther,
 }
-const SEEN: usize = Seen::Delay31 as usize + 1;
+const SEEN: usize = Seen::ReadOther as usize + 1;
+
+thread_local! {
+    /// Who is reading or writing title memory on this thread now, for the
+    /// census: a copy's number and kind (1 window, 2 card buffer, 3 other
+    /// buffer, 4 texture), or (0, 0).
+    static WHO: std::cell::Cell<(u64, u8)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Until what it returns is dropped, title memory read or written on this
+/// thread is copy `id`'s (of `kind`, as [`WHO`]), for the census.
+pub(crate) fn census_who(id: u64, kind: u8) -> Who {
+    if !census() {
+        return Who(None);
+    }
+    Who(Some(WHO.with(|w| w.replace((id, kind)))))
+}
+
+/// [`census_who`]'s guard.
+pub(crate) struct Who(Option<(u64, u8)>);
+impl Drop for Who {
+    fn drop(&mut self) {
+        if let Some(was) = self.0 {
+            WHO.with(|w| w.set(was));
+        }
+    }
+}
 static SEEN_N: [std::sync::atomic::AtomicU64; SEEN] = [const { std::sync::atomic::AtomicU64::new(0) }; SEEN];
 fn seen(what: Seen, n: u64) {
     SEEN_N[what as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -955,7 +990,7 @@ fn seen(what: Seen, n: u64) {
 /// wrote), and by 16 MiB region: blocks copied back, read by the title,
 /// read by us, copied back again unread.
 struct Census {
-    waiting: BTreeMap<usize, (u64, u32)>,
+    waiting: BTreeMap<usize, (u64, u32, u64)>,
     regions: BTreeMap<usize, [u64; 4]>,
 }
 static CENSUS: Mutex<Census> = Mutex::new(Census { waiting: BTreeMap::new(), regions: BTreeMap::new() });
@@ -1001,7 +1036,7 @@ fn census_mark(g: &Guards, blocks: &[usize], at: usize, len: usize) {
         if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_NOACCESS, &mut old) } == 0 {
             continue;
         }
-        c.waiting.insert(block, (frame, bytes));
+        c.waiting.insert(block, (frame, bytes, WHO.with(|w| w.get().0)));
         c.regions.entry(block >> REGION_SHIFT).or_default()[0] += 1;
         seen(Seen::Copied, 1);
         seen(Seen::CopiedBytes, u64::from(bytes));
@@ -1019,7 +1054,7 @@ fn census_forget(blocks: &[usize], why: Seen) {
         return;
     }
     for &block in blocks {
-        if let Some((_, bytes)) = c.waiting.remove(&block) {
+        if let Some((_, bytes, _)) = c.waiting.remove(&block) {
             seen(why, 1);
             if let Seen::CardAgain = why {
                 seen(Seen::CardAgainBytes, u64::from(bytes));
@@ -1037,7 +1072,7 @@ fn census_fault(g: &Guards, at: usize, write: bool, pc: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let block = at / BLOCK;
     let mut c = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((frame, bytes)) = c.waiting.remove(&block) else {
+    let Some((frame, bytes, _)) = c.waiting.remove(&block) else {
         return false;
     };
     let mut old = 0;
@@ -1090,8 +1125,20 @@ pub(crate) fn census_open(at: usize, len: usize) -> bool {
     let g = guards();
     let mut c = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
     let blocks: Vec<usize> = c.waiting.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).map(|(&b, _)| b).collect();
+    let (reader, kind) = WHO.with(|w| w.get());
     for &block in &blocks {
-        c.waiting.remove(&block);
+        let writer = c.waiting.remove(&block).map_or(0, |w| w.2);
+        seen(
+            match kind {
+                _ if reader != 0 && reader == writer => Seen::ReadSame,
+                1 => Seen::ReadWindow,
+                2 => Seen::ReadCard,
+                3 => Seen::ReadBuffer,
+                4 => Seen::ReadTexture,
+                _ => Seen::ReadOther,
+            },
+            1,
+        );
         let back = if g.protected.contains(&block) { PAGE_READONLY } else { PAGE_READWRITE };
         let mut old = 0;
         // SAFETY: as in `census_fault`.
@@ -1152,6 +1199,15 @@ pub(crate) fn census_line() {
         s(Seen::CardAgainBytes) >> 20,
         waiting,
     );
+    tracing::info!(
+        "read census, our kernel reads by reader since the last such line: the copy that copied it back {}, a window {}, a buffer copy in the card's memory {}, another buffer copy {}, a texture {}, other {}",
+        s(Seen::ReadSame),
+        s(Seen::ReadWindow),
+        s(Seen::ReadCard),
+        s(Seen::ReadBuffer),
+        s(Seen::ReadTexture),
+        s(Seen::ReadOther),
+    );
     tracing::info!("read census since the start, by 16 MiB region (most copied back first): {}; title reads by module: {}", regions.join("; "), modules.join(", "));
 }
 
@@ -1164,6 +1220,7 @@ pub(crate) fn census_json() -> String {
     let names = [
         "copied", "copied_bytes", "unwatched", "title_read", "title_read_bytes", "our_read", "title_write", "card_again", "card_again_bytes",
         "our_kernel_read", "kernel_write", "lost", "delay_0", "delay_1", "delay_2_4", "delay_5_30", "delay_31",
+        "read_same", "read_window", "read_card", "read_buffer", "read_texture", "read_other",
     ];
     let parts: Vec<String> = names.iter().enumerate().map(|(i, n)| format!("\"{n}\":{}", SEEN_N[i].load(Relaxed))).collect();
     format!("{{{}}}", parts.join(","))

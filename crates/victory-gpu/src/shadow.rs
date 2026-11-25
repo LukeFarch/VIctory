@@ -2141,6 +2141,7 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+        let _who = crate::watch::census_who(self.id, self.census_kind());
         if self.place.is_some() {
             return 0;
         }
@@ -2292,6 +2293,7 @@ impl Shadow {
     /// writes into the copy are that flight's to merge; where they already
     /// differ from title memory the page stays stale, as before.
     fn relay_merge_locked(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> (usize, Option<(usize, usize, u64)>) {
+        let _who = crate::watch::census_who(self.id, self.census_kind());
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return (0, None);
@@ -2395,6 +2397,17 @@ impl Shadow {
     /// With [`relay`] several submissions may hold a range: `ranges` are
     /// those of one of them (each once), and a range is done with when the
     /// last submission that declared it is ([`Flights`]).
+    /// What the read census calls this copy (`crate::watch::census_who`).
+    fn census_kind(&self) -> u8 {
+        if self.window {
+            1
+        } else if self.card.is_some() {
+            2
+        } else {
+            3
+        }
+    }
+
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
         if self.place.is_some() {
             return;
@@ -2638,6 +2651,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let _who = crate::watch::census_who(self.id, self.census_kind());
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -2897,6 +2911,7 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        let _who = crate::watch::census_who(self.id, self.census_kind());
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
@@ -2982,6 +2997,7 @@ impl Shadow {
     /// here, and the title's bytes not yet sent up where the merge left
     /// them out, so it equals title memory wherever nothing else wrote.
     fn card_merge_relay_locked(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> (usize, Option<(usize, usize, u64)>) {
+        let _who = crate::watch::census_who(self.id, self.census_kind());
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return (0, None);

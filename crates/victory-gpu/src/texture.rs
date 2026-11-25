@@ -697,6 +697,7 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         let _z = crate::trace::zone("texture refresh");
+        let _who = crate::watch::census_who(0, 4);
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
