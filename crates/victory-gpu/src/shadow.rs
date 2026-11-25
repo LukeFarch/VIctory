@@ -71,6 +71,12 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Bytes reserved in `crate::rebar` (0: not in CPU-visible card memory).
+    /// Such a copy is write-combined for the CPU: reads of it are counted.
+    rebar: u64,
+    /// With `rebar`: shaders were found writing it, so it is let go as soon
+    /// as nothing holds it, and its memory's next copy is not placed.
+    move_out: std::sync::atomic::AtomicBool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -382,6 +388,12 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
+/// Whether a window of `size` bytes is one the card twin path might hold
+/// (`VICTORY_CARD_WINDOWS_MB` with `cards`): for `crate::rebar`'s levels.
+fn window_card_would(size: u64) -> bool {
+    window_card_most() != 0 && cards() && WINDOW_CARD_BYTES.load(Ordering::Relaxed) + size <= window_card_most()
+}
+
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
     if most == 0 || !cards() {
@@ -1245,6 +1257,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
         .iter()
         .map(|(shadow, address, end)| {
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
+            shadow.wc_read(to.saturating_sub(from));
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
@@ -1533,6 +1546,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if self.rebar != 0 {
+            crate::rebar::released(self.rebar);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -1713,7 +1729,7 @@ pub(crate) fn let_go_idle() {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && (crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES) || s.moves_out_now())
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
@@ -1727,6 +1743,9 @@ pub(crate) fn let_go_idle() {
         });
     }
     for shadow in gone {
+        if shadow.rebar != 0 && shadow.move_out.load(Ordering::Relaxed) {
+            crate::rebar::moved_out();
+        }
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
@@ -1859,9 +1878,49 @@ impl Shadow {
             },
             card: None,
             window: false,
+            rebar: 0,
+            move_out: std::sync::atomic::AtomicBool::new(false),
             place: None,
             owned: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// With `crate::rebar`: a placed copy shaders write, with nothing of
+    /// theirs left in it to copy back or keep (no declared range, no page
+    /// a quarantined pass owns): let go before it is idle.
+    fn moves_out_now(&self) -> bool {
+        if self.rebar == 0 || !self.move_out.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Asked under the windows' lock: never waits for these locks (a
+        // copy busy now is looked at again before the next submission).
+        let Ok(pending) = self.pending.try_lock() else {
+            return false;
+        };
+        let Ok(owned) = self.owned.try_lock() else {
+            return false;
+        };
+        pending.is_empty() && owned.is_empty()
+    }
+
+    /// With `crate::rebar`: the CPU reads `n` bytes of the copy.
+    #[inline]
+    fn wc_read(&self, n: usize) {
+        if self.rebar != 0 {
+            crate::rebar::cpu_reads(n);
+        }
+    }
+
+    /// With `crate::rebar`: shaders write a placed copy. The whole copy's
+    /// memory is noted (a later copy cut on another grid may hold any of
+    /// it), so that its next copy stays in the PC's memory, and the copy is
+    /// let go once nothing holds it.
+    fn shader_write_on_rebar(&self, len: u64) {
+        if self.rebar == 0 || len == 0 {
+            return;
+        }
+        crate::rebar::shader_wrote(self.start, self.len);
+        self.move_out.store(true, Ordering::Relaxed);
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1890,6 +1949,7 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        self.shader_write_on_rebar(len);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -1908,6 +1968,7 @@ impl Shadow {
         if len == 0 {
             return;
         }
+        self.shader_write_on_rebar(len);
         let (from, to) = (address as usize, (address + len) as usize);
         let frame = crate::frame::current();
         let asked = crate::watch::asking();
@@ -2011,6 +2072,7 @@ impl Shadow {
     /// into the copy, and `before` takes them. What the card made in the
     /// rest stays. Returns the bytes copied.
     fn merge_title(&self, lo: usize, before: &mut [u8]) -> usize {
+        self.wc_read(before.len());
         if fast_merge() {
             return self.merge_title_fast(lo, before);
         }
@@ -2146,6 +2208,7 @@ impl Shadow {
         }
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+        self.wc_read(taken);
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -2386,6 +2449,7 @@ impl Shadow {
         // SAFETY: inside the copy's mapping (checked above), read into
         // room just reserved; the card may write the mapping meanwhile, and
         // each byte read is one it held at some moment.
+        self.wc_read(n);
         unsafe {
             std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
             now.set_len(n);
@@ -2421,6 +2485,7 @@ impl Shadow {
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
+        self.wc_read(to.saturating_sub(from));
         let (start, data) = (self.start as usize, self.data as usize);
         let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
@@ -2862,6 +2927,7 @@ impl Shadow {
             }
             let n = hi - lo;
             let title = &mut title[..n];
+            self.wc_read(n);
             // SAFETY: offsets `[lo - start, hi - start)` lie in the mapping.
             let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start), n) };
             if crate::host::read_into(lo as *const u8, title) && *title == *held {
@@ -3344,6 +3410,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // In CPU-visible card memory (`crate::rebar`, `VICTORY_REBAR`): a
+        // small buffer at level 2, a big one (instead of the card twin) at
+        // level 3.
+        let kind = if big { crate::rebar::Kind::Big } else { crate::rebar::Kind::Buffer };
+        if let Some(shadow) = rebar_copy(kind, key.0, len, size, false) {
+            entry.shadow = Some(shadow);
+            return entry.shadow.clone();
+        }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -3391,6 +3465,30 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
+}
+
+/// A host copy in CPU-visible card memory (`D3D12_HEAP_TYPE_GPU_UPLOAD`,
+/// `crate::rebar`), if enabled, supported, within budget, and not memory
+/// shaders wrote through such a copy before.
+fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window: bool) -> Option<Arc<Shadow>> {
+    if crate::rebar::level() == 0 {
+        return None;
+    }
+    let written = crate::rebar::shader_written(start, len);
+    if !crate::rebar::reserve(kind, size, written) {
+        return None;
+    }
+    let Some((buffer, data)) = host()?.gpu_upload_buffer(size) else {
+        crate::rebar::released(size);
+        return None;
+    };
+    crate::host::name(&buffer, || format!("title {} {start:#x}+{len:#x} (rebar)", if window { "memory" } else { "buffer" }));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.window = window;
+    shadow.rebar = size;
+    Some(Arc::new(shadow))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3561,6 +3659,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
+    // In CPU-visible card memory (`crate::rebar`, `VICTORY_REBAR`). A
+    // window the card twin path would hold goes there only at level 3.
+    let kind = if window_card_would(len) { crate::rebar::Kind::Big } else { crate::rebar::Kind::Window };
+    if let Some(shadow) = rebar_copy(kind, start, len, len, true) {
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);

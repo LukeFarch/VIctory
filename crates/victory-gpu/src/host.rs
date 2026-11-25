@@ -622,6 +622,16 @@ fn create() -> windows::core::Result<Host> {
             } else {
                 tracing::info!(?gpu_upload, ?uma, ?existing, "host card: what it offers toward one memory");
             }
+            // `VICTORY_REBAR`: whether host copies may go to CPU-visible
+            // card memory, and the line that says so.
+            let card_budget = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+                .ok()
+                .and_then(|adapter| {
+                    let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own).ok().map(|()| own.Budget)
+                });
+            crate::rebar::probe(&device, card_budget);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -3839,6 +3849,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
+                    crate::rebar::flush_writes();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -4211,6 +4222,7 @@ impl Host {
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 if let Some(queue) = &copy_queue {
+                    crate::rebar::flush_writes();
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     fence.SetEventOnCompletion(sent, event)?;
@@ -4220,6 +4232,7 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                crate::rebar::flush_writes();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -4441,6 +4454,7 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    crate::rebar::flush_writes();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -4901,6 +4915,7 @@ impl Host {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
+                crate::rebar::flush_writes();
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -4942,6 +4957,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                crate::rebar::flush_writes();
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
                 let waited = self
@@ -6992,6 +7008,10 @@ impl Meter {
         .filter(|(name, _)| on(name))
         .map(|(_, tag)| tag)
         .collect();
+        let mut switches: Vec<String> = switches.into_iter().map(str::to_owned).collect();
+        if let Some(rebar) = crate::rebar::caption() {
+            switches.push(rebar);
+        }
         let text = format!(
             "J | GTA 6 | {fps:.1} fps {ms:.0} ms | CPU {cpu:.0} (copies {copy_ms:.0}, textures {texture_ms:.0}) GPU {gpu:.0} copy-back {back_ms:.0} ms | {draws:.0} draws | {private_gb:.1} GB{lighting} | textures due {due} (oldest {oldest} frames){}",
             if switches.is_empty() { String::new() } else { format!(" | {}", switches.join(" ")) }
@@ -7315,6 +7335,53 @@ impl Host {
                 .ok()?;
         }
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// A buffer in CPU-visible card memory (`D3D12_HEAP_TYPE_GPU_UPLOAD`,
+    /// Resizable BAR, [`crate::rebar`]) that shaders read and write and the
+    /// CPU maps (write-combined: writing is fast, reading is not). Starts
+    /// in the common state. From the VIctory fork vitutu1/victory-perf.
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and persistent mapping of a GPU upload buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => {
+                MADE[2].fetch_add(1, Ordering::Relaxed);
+                MADE[3].fetch_add(size, Ordering::Relaxed);
+                Some((buffer?, data.cast()))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no GPU upload buffer (ReBAR)");
+                None
+            }
+        }
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
