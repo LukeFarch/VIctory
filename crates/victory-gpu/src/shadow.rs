@@ -437,6 +437,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    crate::trace::count("card copies: looked at for changed ranges", carded.len() as u64);
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
@@ -449,7 +450,12 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 let ranges = std::mem::take(&mut *dirty);
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
+                    // Noted in the order of the sends (only here, under the
+                    // queue's order): the notes every fetch came after are
+                    // the first ones. Dropped as a prefix, not by a pass
+                    // over all of them for each copy at each submission.
+                    let done = sent.partition_point(|s| s.2 <= fetched);
+                    sent.drain(..done);
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
                 }
                 ranges
