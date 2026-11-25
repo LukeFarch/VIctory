@@ -58,7 +58,7 @@ struct Journal {
     kept: bool,
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
+static JOURNAL: std::sync::RwLock<Journal> = std::sync::RwLock::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
@@ -66,6 +66,27 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead_asked: 0,
     kept: false,
 });
+
+/// The journal, alone.
+fn journal() -> std::sync::RwLockWriteGuard<'static, Journal> {
+    crate::trace::rw("lock wait: write-watch journal", &JOURNAL)
+}
+
+/// The journal, shared with other readers: the refresh threads' answers
+/// from an asking made ahead ([`ask_ahead`], [`ask_once`]) only read it.
+fn journal_shared() -> std::sync::RwLockReadGuard<'static, Journal> {
+    crate::trace::shared("lock wait: write-watch journal (shared)", &JOURNAL)
+}
+
+/// Whether [`writes`] answers from an asking made ahead with the journal
+/// shared (`VICTORY_JOURNAL_SHARED=1`; off by default). In run 5's prison
+/// profile the refresh threads waited 459 ms a frame, summed, for the
+/// journal; most of their askings are answered from the journal alone,
+/// which needs no one else kept out. What is answered is the same.
+fn shared_answers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOURNAL_SHARED").is_some_and(|v| v == "1"))
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -98,7 +119,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let mut j = journal();
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -152,7 +173,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let mut j = journal();
     if !j.kept {
         j.ahead.clear();
     }
@@ -192,7 +213,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     ask_once_end();
     let _held = all_stripes();
     ask_ahead_held(ranges);
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let mut j = journal();
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -219,7 +240,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let mut j = journal();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -230,7 +251,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let mut j = journal();
     if !j.kept || len == 0 {
         return;
     }
@@ -327,7 +348,7 @@ fn known_view(first: usize) -> bool {
 /// The number of the latest asking: a page the journal notes written
 /// under a higher one was written after this call.
 pub(crate) fn asking() -> u64 {
-    crate::trace::lock("lock wait: write-watch journal", &JOURNAL).asked
+    journal_shared().asked
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -337,7 +358,7 @@ pub(crate) fn asking() -> u64 {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let j = journal_shared();
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -448,7 +469,7 @@ fn writes_unlocked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<
         Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
     };
     if !full {
-        let j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+        let j = journal_shared();
         if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
             return from_journal(&j, j.ahead_asked);
         }
@@ -496,7 +517,7 @@ fn writes_unlocked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<
             add(C::WatchUs, started.elapsed().as_micros() as u64);
             slow(started.elapsed().as_micros() as u64);
         }
-        let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+        let mut j = journal();
         let j = &mut *j;
         j.asked += 1;
         let now = j.asked;
@@ -518,9 +539,15 @@ fn writes_locked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(u
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
-    let j = &mut *j;
     let full = full_refresh();
+    if shared_answers() && !full {
+        let j = journal_shared();
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        }
+    }
+    let mut j = journal();
+    let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if !full && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -979,7 +1006,7 @@ pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
             census_mark(&g, &w.blocks, w.at, w.len);
         }
     }
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let mut j = journal();
     j.asked += 1;
     let now = j.asked;
     for &block in w.blocks.iter().chain(&twins) {
@@ -1170,7 +1197,7 @@ pub(crate) enum Kept {
 /// The pages of `[first, last)` the journal notes written, with the asking
 /// that last did.
 pub(crate) fn journal_written(first: usize, last: usize) -> Vec<(usize, u64)> {
-    let j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let j = journal_shared();
     j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
 }
 
@@ -1280,7 +1307,7 @@ pub(crate) fn resident_merge(at: usize, n: usize, merge: impl FnOnce(&mut [u8]) 
     resident_stat(8, n as u64);
     drop(r);
     drop(g);
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let mut j = journal();
     j.asked += 1;
     let now = j.asked;
     for page in at / PAGE..(at + n).div_ceil(PAGE) {
@@ -2091,7 +2118,7 @@ mod tests {
         crate::host::write_mapped((start + BLOCK + 8) as *mut u8, b"ours".as_ptr(), 4);
         let now = own_write_end(own).expect("guarded memory");
         {
-            let j = JOURNAL.lock().unwrap();
+            let j = JOURNAL.read().unwrap();
             assert_eq!(j.written.get(&((start + BLOCK) / PAGE)), Some(&now));
         }
         // Guarded again: the next asking finds nothing written.

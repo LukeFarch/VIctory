@@ -212,6 +212,40 @@ pub(crate) fn lock<'a, T>(name: &'static str, lock: &'a Mutex<T>) -> std::sync::
     guard
 }
 
+/// [`lock`] for a reader-writer lock, alone (`write`) or shared.
+#[inline]
+pub(crate) fn rw<'a, T>(name: &'static str, lock: &'a std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'a, T> {
+    if !on() {
+        return lock.write().unwrap_or_else(|e| e.into_inner());
+    }
+    if let Ok(guard) = lock.try_write() {
+        return guard;
+    }
+    let mut zone = zone(name);
+    let guard = lock.write().unwrap_or_else(|e| e.into_inner());
+    if zone.start.is_some_and(|s| s.elapsed().as_micros() < 20) {
+        zone.start = None;
+    }
+    guard
+}
+
+/// [`rw`], shared.
+#[inline]
+pub(crate) fn shared<'a, T>(name: &'static str, lock: &'a std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'a, T> {
+    if !on() {
+        return lock.read().unwrap_or_else(|e| e.into_inner());
+    }
+    if let Ok(guard) = lock.try_read() {
+        return guard;
+    }
+    let mut zone = zone(name);
+    let guard = lock.read().unwrap_or_else(|e| e.into_inner());
+    if zone.start.is_some_and(|s| s.elapsed().as_micros() < 20) {
+        zone.start = None;
+    }
+    guard
+}
+
 /// `WaitForSingleObject(event, INFINITE)`, recorded as a span.
 ///
 /// # Safety
