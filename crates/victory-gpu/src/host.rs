@@ -6091,6 +6091,12 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
+                    // With `wide_gpu_writes`: the copy's pending refresh and
+                    // then this snapshot are done with the next flush of
+                    // all, on the threads of the wide refresh.
+                    if wide_gpu_writes() && batch.write_after(shadow, *address, *len) {
+                        continue;
+                    }
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
@@ -6140,9 +6146,31 @@ fn wide_refresh() -> bool {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+/// Whether the refresh a shader-written range needs first (a `GpuWrite`
+/// step) waits for the next flush of all, with the range's snapshot after
+/// it, instead of being done at once on the submitting thread
+/// (`VICTORY_WIDE_GPU_WRITES=1`, with `VICTORY_WIDE_REFRESH=1`; off by
+/// default).
+///
+/// Run 14's prison profile: some 105 such refreshes a frame, 29 ms one
+/// after the other on the submitting thread ("refresh: one copy" outside
+/// the flush), while the wide threads waited for the next flush. With the
+/// switch each copy's job in the flush brings the copy up to date and then
+/// notes its shader-written ranges, in the order they were declared: what
+/// a copy's steps did in order is done in the same order, and copies have
+/// nothing to do with one another. A refresh of the copy declared after
+/// such a range is done after it, as before (the copy's entry is done at
+/// once then, and a new one begun).
+fn wide_gpu_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| wide_refresh() && std::env::var_os("VICTORY_WIDE_GPU_WRITES").is_some_and(|v| v == "1"))
+}
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Per copy: the range to refresh, and (with [`wide_gpu_writes`]) the
+    /// shader-written ranges to note after it, in order.
+    refreshes: Vec<BatchEntry>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6152,10 +6180,21 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
 }
 
+/// A copy's part of a [`Batch`]: copy, from, to, and the ranges its
+/// shaders write, noted after the refresh ([`wide_gpu_writes`]).
+type BatchEntry = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, Vec<(usize, usize)>);
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        // A range declared shader-written waits in the entry: this refresh
+        // comes after it, so the entry is done now and a new one begun.
+        if let Some(&at) = self.index.get(&key)
+            && !self.refreshes[at].3.is_empty()
+        {
+            self.flush_one(shadow);
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -6163,8 +6202,22 @@ impl Batch {
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), address, end, Vec::new()));
             }
+        }
+    }
+
+    /// With [`wide_gpu_writes`]: shaders write `[address, address + len)` of
+    /// `shadow`'s copy, which has a refresh pending here. The range is noted
+    /// after the refresh, when the entry is done; true. False if nothing is
+    /// pending for the copy (the caller notes the range at once).
+    fn write_after(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) -> bool {
+        match self.index.get(&(std::sync::Arc::as_ptr(shadow) as usize)) {
+            Some(&at) => {
+                self.refreshes[at].3.push((address, len));
+                true
+            }
+            None => false,
         }
     }
 
@@ -6174,12 +6227,28 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, from, to, writes) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        Self::entry(&shadow, from, to, &writes);
+    }
+
+    /// A copy's entry: its refresh, then the shader-written ranges noted.
+    fn entry(shadow: &crate::shadow::Shadow, from: usize, to: usize, writes: &[(usize, usize)]) {
+        Self::update(shadow, from, to);
+        for &(address, len) in writes {
+            #[cfg(feature = "diagnostics")]
+            let snapshot = std::time::Instant::now();
+            shadow.writing(address, len);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::GpuWrites, 1);
+                add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+            }
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6235,14 +6304,14 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, from, to, writes)| Box::new(move || Self::entry(&shadow, from, to, &writes)) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, from, to, writes) in self.refreshes.drain(..) {
+                Self::entry(&shadow, from, to, &writes);
             }
         }
         if ahead {
