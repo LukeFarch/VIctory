@@ -211,6 +211,31 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
+    // View memory first, without the journal held: the guards answer for
+    // the submission's view ranges joined (overlapping and touching ones
+    // once), and the journal takes the answers below. Asked under the
+    // journal, every refresh thread waited for the guards behind it (run
+    // 15: 2,660 askings a frame, 436 ms of guard waits, 213 of journal).
+    let views: Vec<((usize, usize), Option<Vec<usize>>)> = if views_once() {
+        let mut v: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter(|r| r.0 < r.1)
+            .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+            .filter(|&(first, _)| known_view(first))
+            .collect();
+        v.sort_unstable();
+        let mut joined: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+        for (a, b) in v {
+            match joined.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => joined.push((a, b)),
+            }
+        }
+        let _z = crate::trace::zone("guard: a submission's view ranges, once");
+        joined.into_iter().map(|(a, b)| ((a, b), guard(a * PAGE, b * PAGE))).collect()
+    } else {
+        Vec::new()
+    };
     let _held = all_stripes();
     ask_ahead_held(ranges);
     let mut j = journal();
@@ -233,21 +258,18 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
             continue;
         }
-        if !known_view(first) {
-            if ask_kernel(j, first, last) {
-                j.ahead.push((first, last));
+        if !known_view(first) && ask_kernel(j, first, last) {
+            j.ahead.push((first, last));
+        }
+    }
+    // The views' answers, under this asking.
+    let now = j.ahead_asked;
+    for ((first, last), pages) in views {
+        if let Some(pages) = pages {
+            for page in pages {
+                j.written.insert(page, now);
             }
-        } else if views_once() {
-            // View memory: the guards answer, once for the submission, as
-            // the kernel does for the rest.
-            let _z = crate::trace::zone("guard: a submission's view range, once");
-            if let Some(pages) = guard(first * PAGE, last * PAGE) {
-                let now = j.ahead_asked;
-                for page in pages {
-                    j.written.insert(page, now);
-                }
-                j.ahead.push((first, last));
-            }
+            j.ahead.push((first, last));
         }
     }
     j.kept = !j.ahead.is_empty();
