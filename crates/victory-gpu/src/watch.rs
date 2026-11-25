@@ -306,8 +306,19 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // `VICTORY_FULL_REFRESH=1`: every page asked about counts as written,
+    // so every host copy is brought up to date whole each time it is used
+    // (slow; to tell a missed write from another cause of a stale copy).
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let full = *FULL.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FULL_REFRESH").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_FULL_REFRESH=1: every page asked about counts as written; copies are refreshed whole (slow)");
+        }
+        on
+    });
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !full && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
             j.ahead_asked,
             j.written
@@ -358,6 +369,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
+    }
+    if full {
+        for page in first..last {
+            j.written.insert(page, now);
+        }
     }
     Some((
         now,
