@@ -578,6 +578,8 @@ impl Formats {
 struct Variants {
     regs: Vec<u8>,
     layout: Vec<u8>,
+    /// A blend state in place of the registers' (device method 0x1b8).
+    blend: Option<windows::Win32::Graphics::Direct3D12::D3D12_BLEND_DESC>,
     /// Boxed: [`host_pipeline_for`] hands out references into them, which
     /// must not move when the map grows.
     #[allow(clippy::redundant_allocation)]
@@ -605,6 +607,9 @@ pub(crate) fn host_pipeline_for<'a>(this: This, formats: &Formats) -> Option<&'a
                 *t = DXGI_FORMAT(f);
             }
             let mut state = host::GraphicsState::precompiled(&v.regs, &v.layout, targets, DXGI_FORMAT(formats.depth), formats.samples);
+            if let Some(blend) = v.blend {
+                state = state.with_blend(blend);
+            }
             if formats.rects {
                 state.rectangles();
             }
@@ -1222,7 +1227,7 @@ pub(crate) extern "system" fn create_precompiled_graphics(
             return E_NOTIMPL;
         }
         note_precompiled(0x1c8, &shaders.iter().collect::<Vec<_>>(), Some(&regs));
-        let variants = Variants { regs, layout, made: Mutex::new(HashMap::new()) };
+        let variants = Variants { regs, layout, blend: None, made: Mutex::new(HashMap::new()) };
         return hand_out_with(shaders, None, Some(Box::new(variants)), iid, out);
     }
     #[cfg(not(windows))]
@@ -1232,45 +1237,44 @@ pub(crate) extern "system" fn create_precompiled_graphics(
     }
 }
 
-/// Whether `desc` reads as a whole pipeline stream description: readable,
-/// of known subobjects that end where its size says, with at least one
-/// shader whose code is readable. For a method whose description is not
-/// known (device 0x1b8), before it is taken as one.
+/// Device method 0x1b8: a pipeline like `base` (one of ours) with some of
+/// its state replaced. `changes` points at `count` changes; the one kind
+/// seen (lighting test 4, every call with count 1) is kind 2, a
+/// `D3D12_BLEND_DESC` at +4. `None` where `base` is not one of our
+/// pipelines or a change is not of a known kind (the caller says so).
 #[cfg(windows)]
-pub(crate) fn is_stream(desc: usize) -> bool {
-    let mut head = [0u8; 16];
-    if desc < 0x10000 || !crate::host::read_into(desc as *const u8, &mut head) {
-        return false;
+pub(crate) fn create_variant(base: This, count: u32, changes: usize, iid: *const Iid, out: *mut This) -> Option<HRESULT> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_BLEND_DESC;
+    let mut head = [0u8; 8];
+    if base.is_null() || !crate::host::read_into(base.cast(), &mut head) {
+        return None;
     }
-    let size = u64::from_le_bytes(head[..8].try_into().unwrap_or_default()) as usize;
-    let at = u64::from_le_bytes(head[8..].try_into().unwrap_or_default()) as usize;
-    if !(8..=0x4000).contains(&size) || at < 0x10000 {
-        return false;
+    if u64::from_le_bytes(head) as usize != FUNCTIONS.0.as_ptr() as usize {
+        return None;
     }
-    let mut stream = vec![0u8; size];
-    if !crate::host::read_into(at as *const u8, &mut stream) {
-        return false;
+    let mut kind = [0u8; 4];
+    if count != 1 || changes < 0x10000 || !crate::host::read_into(changes as *const u8, &mut kind) || u32::from_le_bytes(kind) != 2 {
+        return None;
     }
-    let word = |i: usize| stream.get(i..i + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or_default()));
-    let (mut i, mut shaders) = (0, 0);
-    while i + 8 <= size {
-        let kind = u32::from_le_bytes(stream[i..i + 4].try_into().unwrap_or_default());
-        let Some((len, stage)) = subobject(kind) else {
-            return false;
+    let mut bytes = [0u8; size_of::<D3D12_BLEND_DESC>()];
+    if !crate::host::read_into((changes + 4) as *const u8, &mut bytes) {
+        return None;
+    }
+    // SAFETY: plain data of its size.
+    let blend: D3D12_BLEND_DESC = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) };
+    let p = pipeline(base);
+    if let Some(v) = p.variants.as_ref() {
+        let variants = Variants {
+            regs: v.regs.clone(),
+            layout: v.layout.clone(),
+            blend: Some(blend),
+            made: Mutex::new(HashMap::new()),
         };
-        if stage.is_some() {
-            let (code, bytes) = (word(i + 8) as usize, word(i + 16) as usize);
-            if code != 0 {
-                let mut magic = [0u8; 4];
-                if !(4..=1 << 26).contains(&bytes) || !crate::host::read_into(code as *const u8, &mut magic) {
-                    return false;
-                }
-                shaders += 1;
-            }
-        }
-        i += len;
+        return Some(hand_out_with(p.shaders.clone(), None, Some(Box::new(variants)), iid, out));
     }
-    i == size && shaders > 0
+    // None for a compute or plain-description pipeline: nothing to blend.
+    let graphics = Box::new(p.host.graphics.as_ref()?.with_blend(blend));
+    Some(hand_out_with(p.shaders.clone(), Some(graphics), None, iid, out))
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a

@@ -276,6 +276,31 @@ fn precompiled_inputs(layout: &[u8]) -> Vec<(CString, D3D12_INPUT_ELEMENT_DESC)>
 }
 
 impl GraphicsState {
+    /// The same state with another blend state (device method 0x1b8).
+    pub(crate) fn with_blend(&self, blend: D3D12_BLEND_DESC) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC { SemanticName: PCSTR(name.as_ptr().cast()), ..*e })
+            .collect();
+        GraphicsState {
+            blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            bounds: self.bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets: self.targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+
     /// The state of a pipeline of the precompiled method 0x1c8: from its
     /// register block (`regs`) and input layout block (`layout`), drawing
     /// into targets of `targets` and depth of `depth_format` (the method

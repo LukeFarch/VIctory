@@ -346,16 +346,16 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device method 0x1b8, a console pipeline creator (the title asks it for
-/// `ID3D12PipelineState`): `(this, a, b, desc?, riid, out)`, whose
-/// arguments are not known. Its first calls are logged with the 64 bytes
-/// behind each argument. Where one of them reads as a whole pipeline
-/// stream description ([`pipeline::is_stream`]: rdx, then r9) it is made
-/// as `CreatePipelineState` would (`VICTORY_DEVICE_1B8=0`: never);
-/// otherwise it is answered E_NOTIMPL, as before.
+/// Device method 0x1b8: `(this, base, count, changes, riid, out)`, a
+/// pipeline like `base` with `count` changes to its state (the title asks
+/// it for `ID3D12PipelineState`, with a blend state as the change:
+/// [`pipeline::create_variant`]). `VICTORY_DEVICE_1B8=0`: answered
+/// E_NOTIMPL, as before. The first 8 calls are logged, and up to 64 not
+/// understood with the 64 bytes behind its arguments.
 extern "system" fn probe_1b8(this: This, a: usize, b: usize, c: usize, iid: *const Iid, out: *mut This) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
+    let _ = this;
     let behind = |p: usize| -> String {
         #[cfg(windows)]
         {
@@ -368,26 +368,24 @@ extern "system" fn probe_1b8(this: This, a: usize, b: usize, c: usize, iid: *con
         String::new()
     };
     #[cfg(windows)]
-    let stream = std::env::var_os("VICTORY_DEVICE_1B8")
+    let made = std::env::var_os("VICTORY_DEVICE_1B8")
         .is_none_or(|v| v != "0")
-        .then(|| [a, c].into_iter().find(|&p| pipeline::is_stream(p)))
+        .then(|| pipeline::create_variant(a as This, b as u32, c, iid, out))
         .flatten();
     #[cfg(not(windows))]
-    let stream: Option<usize> = None;
-    if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
+    let made: Option<HRESULT> = None;
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || (made.is_none() && n < 64) {
         tracing::warn!(
             args = format_args!("{a:#x} {b:#x} {c:#x}"),
             at_a = %behind(a),
             at_c = %behind(c),
-            as_stream = ?stream.map(|p| if p == a { "rdx" } else { "r9" }),
+            made = ?made,
             caller = crate::object::caller(),
-            "device method 0x1b8 (a pipeline creator) called"
+            "device method 0x1b8 (a pipeline variant) called"
         );
     }
-    match stream {
-        Some(desc) => pipeline::create_stream(this, desc as *const pipeline::StreamDesc, iid, out),
-        None => E_NOTIMPL,
-    }
+    made.unwrap_or(E_NOTIMPL)
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
