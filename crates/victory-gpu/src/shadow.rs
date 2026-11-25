@@ -3140,6 +3140,49 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
+        // `VICTORY_CARD_RESIDENT=1`: kept, not written, if this copy holds
+        // title memory's bytes there (current for every page, so the card's
+        // bytes merged into its own are all that changes) and the memory
+        // is guarded view memory ([`crate::watch::resident`]).
+        if crate::watch::resident() {
+            let (first_page, last_page) = ((start + at) / PAGE, (start + at + n).div_ceil(PAGE));
+            let base = start / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut writes = crate::watch::journal_written(first_page, last_page).into_iter().peekable();
+            let current = (first_page..last_page).all(|page| {
+                let write = match writes.peek() {
+                    Some(&(p, w)) if p == page => {
+                        writes.next();
+                        w
+                    }
+                    _ => 0,
+                };
+                page >= base && copied.get(page - base).is_some_and(|&c| c != 0 && write <= c)
+            });
+            if current {
+                let ranges = outside(at, at + n, skip.clone());
+                let kept = crate::watch::resident_merge(start + at, n, |title| {
+                    let mut changed = false;
+                    for &(a, b) in &ranges {
+                        let (a, b) = (a - at, b - at);
+                        changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+                    }
+                    changed
+                });
+                match kept {
+                    crate::watch::Kept::No => {}
+                    crate::watch::Kept::Same => return (0, None),
+                    crate::watch::Kept::At(now) => {
+                        for page in first_page..last_page {
+                            if let Some(c) = copied.get_mut(page - base) {
+                                *c = (*c).max(now);
+                            }
+                        }
+                        return (n, None);
+                    }
+                }
+            }
+        }
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);

@@ -6297,7 +6297,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             break;
         }
         // A block the read census watches is opened and read, not zeros.
-        if info.State != MEM_COMMIT || (info.Protect == PAGE_NOACCESS && !crate::watch::census_open(at as usize, n)) {
+        if info.State != MEM_COMMIT || (info.Protect == PAGE_NOACCESS && !(crate::watch::census_open(at as usize, n) || crate::watch::resident_open(at as usize, n))) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -6348,7 +6348,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     }
     // A copied-back block the read census watches: opened, and read again.
     // SAFETY: as above.
-    crate::watch::census_open(src as usize, len)
+    (crate::watch::census_open(src as usize, len) || crate::watch::resident_open(src as usize, len))
         && unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
@@ -6732,6 +6732,7 @@ impl Meter {
             self.logged = std::time::Instant::now();
             crate::budget::line();
             crate::watch::census_line();
+            crate::watch::resident_line();
             if crate::draw::hold_unmapped_geometry() {
                 let held = crate::draw::HELD_DRAWS.load(Ordering::Relaxed);
                 tracing::info!(held, "draws held since the start because their geometry was not all mapped yet (VICTORY_HOLD_UNMAPPED_GEOMETRY=1)");

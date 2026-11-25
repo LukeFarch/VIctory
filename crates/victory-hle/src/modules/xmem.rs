@@ -581,7 +581,8 @@ fn written(slice: &Slice, n: usize) {
     };
     shown.sort_unstable();
     for run in shown.chunk_by(|a, b| a + PAGE == *b) {
-        victory_gpu::kernel_will_write(run[0], run.len() * PAGE);
+        // After the write: bytes the card left kept there are older.
+        victory_gpu::kernel_wrote(run[0], run.len() * PAGE);
     }
 }
 

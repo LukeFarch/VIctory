@@ -82,6 +82,12 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let _held = all_stripes();
+    ask_ahead_held(ranges);
+}
+
+/// [`ask_ahead`], with the stripes held ([`all_stripes`]).
+fn ask_ahead_held(ranges: &[(usize, usize)]) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -184,7 +190,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
-    ask_ahead(ranges);
+    let _held = all_stripes();
+    ask_ahead_held(ranges);
     let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -343,22 +350,177 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
-    let j = &mut *j;
+    if unlocked_ask() {
+        return writes_unlocked(start, end, guarded);
+    }
+    writes_locked(start, end, guarded)
+}
+
+/// Whether [`writes`] asks the kernel without holding the journal
+/// (`VICTORY_JOURNAL_UNLOCKED_ASK=1`; off by default).
+///
+/// The journal's lock was held across the kernel call and the view guards:
+/// in run 5's prison profile the refresh threads waited 459 ms a frame,
+/// summed, on it ("lock wait: write-watch journal"), behind each other's
+/// kernel calls. With the switch an asking holds only the stripes of the
+/// address space its range covers ([`STRIPES`]) across the kernel call,
+/// and the journal just to number the asking and note what it found.
+///
+/// Why this is safe: two askings whose ranges share a page share a stripe,
+/// so they are made one after the other, as before; an asking that resets
+/// a page notes it before another asking about the page can be made.
+/// Askings about different memory no longer wait for each other. The
+/// asking's number is taken after the kernel answered, so it is higher
+/// than any asking that noted pages meanwhile; the caller copies after
+/// [`writes`] returns, so a write the number puts before the copy is in
+/// the copy.
+fn unlocked_ask() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_JOURNAL_UNLOCKED_ASK").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_JOURNAL_UNLOCKED_ASK=1: write-watch askings hold address stripes, not the journal, across the kernel call");
+        }
+        on
+    })
+}
+
+/// Address-space stripes for [`unlocked_ask`]: stripe `k` holds every
+/// `STRIPE`-sized piece whose number is `k` modulo the count.
+const STRIPE: usize = 16 << 20;
+static STRIPES: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+
+/// The stripes of pages `[first, last)`, taken in order (so two askings
+/// never wait on each other's stripes in a cycle). The ahead askings
+/// ([`ask_ahead`], [`ask_once`]) take every stripe before the journal.
+fn stripes(first: usize, last: usize) -> Vec<std::sync::MutexGuard<'static, ()>> {
+    let (a, b) = (first * PAGE / STRIPE, (last * PAGE).div_ceil(STRIPE));
+    let mut held = [false; 64];
+    for s in a..b.max(a + 1) {
+        held[s % 64] = true;
+        if b - a >= 64 {
+            held = [true; 64];
+            break;
+        }
+    }
+    let mut _z = crate::trace::zone("lock wait: write-watch stripes");
+    held.iter()
+        .enumerate()
+        .filter(|&(_, &h)| h)
+        .map(|(k, _)| STRIPES[k].lock().unwrap_or_else(|e| e.into_inner()))
+        .collect()
+}
+
+/// Every stripe, for an asking that covers memory [`stripes`] cannot name
+/// in advance; none (and no cost) with the switch off.
+fn all_stripes() -> Vec<std::sync::MutexGuard<'static, ()>> {
+    if !unlocked_ask() {
+        return Vec::new();
+    }
+    let _z = crate::trace::zone("lock wait: write-watch stripes");
+    STRIPES.iter().map(|s| s.lock().unwrap_or_else(|e| e.into_inner())).collect()
+}
+
+fn full_refresh() -> bool {
     // `VICTORY_FULL_REFRESH=1`: every page asked about counts as written,
     // so every host copy is brought up to date whole each time it is used
     // (slow; to tell a missed write from another cause of a stale copy).
     static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let full = *FULL.get_or_init(|| {
+    *FULL.get_or_init(|| {
         let on = std::env::var_os("VICTORY_FULL_REFRESH").is_some_and(|v| v == "1");
         if on {
             tracing::warn!("VICTORY_FULL_REFRESH=1: every page asked about counts as written; copies are refreshed whole (slow)");
         }
         on
-    });
+    })
+}
+
+/// [`writes`] with [`unlocked_ask`].
+fn writes_unlocked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let full = full_refresh();
+    let from_journal = |j: &Journal, now: u64| {
+        Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    };
+    if !full {
+        let j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return from_journal(&j, j.ahead_asked);
+        }
+    }
+    let _held = stripes(first, last);
+    FOUND.with_borrow_mut(|found| {
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        found.resize(count.max(found.len()), 0);
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let mut _z = crate::trace::zone("GetWriteWatch: one range");
+        _z.arg(((last - first) * PAGE) as u64);
+        let view = guarded && known_view(first);
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = view || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        let guarded = if failed {
+            count = 0;
+            if !guarded {
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            let guarding = std::time::Instant::now();
+            let written = guard(first * PAGE, last * PAGE);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+            written?
+        } else {
+            Vec::new()
+        };
+        drop(_z);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            slow(started.elapsed().as_micros() as u64);
+        }
+        let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+        let j = &mut *j;
+        j.asked += 1;
+        let now = j.asked;
+        for page in found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
+            j.written.insert(page, now);
+        }
+        if full {
+            for page in first..last {
+                j.written.insert(page, now);
+            }
+        }
+        from_journal(j, now)
+    })
+}
+
+/// [`writes`] holding the journal across the kernel call, as before
+/// [`unlocked_ask`].
+fn writes_locked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    let j = &mut *j;
+    let full = full_refresh();
     // Asked ahead with the submission's other ranges: the journal has it.
     if !full && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -706,6 +868,8 @@ fn open(g: &mut Guards, start: usize, end: usize, why: Seen) -> bool {
 /// the blocks it opened.
 fn open_only(g: &mut Guards, start: usize, end: usize, why: Seen) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    // Kept blocks get the card's bytes before anything writes them.
+    resident_write(start / BLOCK, end.div_ceil(BLOCK), 4);
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
@@ -888,6 +1052,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    // Kept blocks: written in while they still show what was kept (before
+    // an unmapping), dropped if they show something new already.
+    resident_write(range.start, range.end, 5);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
@@ -898,6 +1065,349 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.clean.remove(&block);
     }
     census_forget(&blocks, Seen::Lost);
+}
+
+/// Whether what shaders wrote into guarded view memory stays the card's
+/// until something touches it (`VICTORY_CARD_RESIDENT=1`; off by default,
+/// and off with the read census, which uses the same protection).
+///
+/// A landing's copy-back read each piece of title memory the card wrote,
+/// merged the card's bytes in and wrote it back, and only then told the
+/// title the card was done: 150 ms a frame in run 5's prison profile, for
+/// memory the read census found the title's CPU code never reads (0 title
+/// reads of copied-back blocks). With the switch the merged bytes are kept
+/// here, block by block ([`Resident`]), the copy that sent them is noted
+/// current, and the block is left with no access. The first touch of it,
+/// whoever's, writes the card's bytes in before it goes on:
+///
+/// - a fault of the title's code or ours, read or write ([`install`]);
+/// - our kernel reads of title memory (refreshes, `ReadProcessMemory`:
+///   [`resident_open`], as [`census_open`]);
+/// - opening a guarded block for a write, the title's (a fault), the
+///   kernel's on the title's behalf ([`writing`]) or a copy-back's
+///   ([`own_write_begin`]): [`open_only`];
+/// - the runtime unmapping or remapping it ([`title_memory_remapped`]).
+///
+/// Writes the runtime made through its own view of the same physical pages
+/// (DirectStorage decoding in place) are newer than the card's bytes: those
+/// are dropped ([`kernel_wrote`]). A block shown at another title address
+/// too (a view twin) is never kept: a read there would not fault.
+/// The bytes a block gets are exactly the ones the copy-back would have
+/// written, at the first moment anything could see them.
+pub(crate) fn resident() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_RESIDENT").is_some_and(|v| v == "1") && !census();
+        if on {
+            tracing::info!(
+                "VICTORY_CARD_RESIDENT=1: what shaders wrote into view memory is written into title memory at its first touch, not at landing (cap {} MB)",
+                resident_cap() >> 20
+            );
+        }
+        on
+    })
+}
+
+/// The most bytes of blocks kept ([`resident`]), `VICTORY_CARD_RESIDENT_MB`
+/// (512 by default); past it a landing writes as before.
+fn resident_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_RESIDENT_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+            << 20
+    })
+}
+
+/// A block kept for [`resident`]: what title memory is to hold (its bytes
+/// when kept, with every merge since), and which of them the card wrote.
+struct Resident {
+    image: Box<[u8]>,
+    card: Box<[bool]>,
+}
+
+static RESIDENT: Mutex<BTreeMap<usize, Resident>> = Mutex::new(BTreeMap::new());
+/// Blocks in [`RESIDENT`], for the fault handler's look without a lock.
+static RESIDENT_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Since the start: blocks kept; merges into blocks already kept; blocks
+/// written in by a fault, by our kernel reads, by an opening for a write,
+/// by a remapping; blocks dropped (newer bytes, or the protection changed
+/// behind us); landings written as before (not view memory, twins, the
+/// cap, the copy not current); bytes merged without a write.
+pub(crate) static RESIDENT_STATS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+fn resident_stat(i: usize, n: u64) {
+    RESIDENT_STATS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn resident_lock() -> std::sync::MutexGuard<'static, BTreeMap<usize, Resident>> {
+    RESIDENT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What [`resident_merge`] did.
+pub(crate) enum Kept {
+    /// The checks failed before anything changed: write as before.
+    No,
+    /// The merge changed nothing in title memory.
+    Same,
+    /// Kept; the pages are noted written under this asking (for the other
+    /// copies of the memory), which the caller's copy is current for.
+    At(u64),
+}
+
+/// The pages of `[first, last)` the journal notes written, with the asking
+/// that last did.
+pub(crate) fn journal_written(first: usize, last: usize) -> Vec<(usize, u64)> {
+    let j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+}
+
+/// [`resident`]: title memory `[at, at + n)` is to get a copy-back's
+/// merge. If every block of it is guarded view memory with no twin, and
+/// room is left: `merge` gets what title memory holds there (the kept
+/// bytes where a block is kept already) and merges the card's bytes into
+/// it (true if it changed any); the result is kept, the new blocks left
+/// with no access, and the pages noted written. Lock order: the caller's
+/// copy, then the guards, then the kept blocks.
+pub(crate) fn resident_merge(at: usize, n: usize, merge: impl FnOnce(&mut [u8]) -> bool) -> Kept {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let _z = crate::trace::zone("card resident: keep a landing's merge");
+    if n == 0 {
+        return Kept::Same;
+    }
+    let (first, last) = (at / BLOCK, (at + n).div_ceil(BLOCK));
+    let g = guards();
+    if (first..last).any(|b| !g.protected.contains(&b)) {
+        resident_stat(7, 1);
+        return Kept::No;
+    }
+    let mut twin = false;
+    crate::inplace::twins(first * BLOCK, last * BLOCK, |_, _| twin = true);
+    if twin {
+        resident_stat(7, 1);
+        return Kept::No;
+    }
+    let mut r = resident_lock();
+    let new = (first..last).filter(|b| !r.contains_key(b)).count();
+    if (r.len() + new) * BLOCK > resident_cap() {
+        resident_stat(7, 1);
+        return Kept::No;
+    }
+    // What title memory holds there, block by block.
+    let mut blocks: Vec<(usize, Box<[u8]>, bool)> = Vec::with_capacity(last - first);
+    for b in first..last {
+        if let Some(k) = r.get(&b) {
+            blocks.push((b, k.image.clone(), false));
+            continue;
+        }
+        let mut image = vec![0u8; BLOCK].into_boxed_slice();
+        let mut done = 0;
+        // SAFETY: a local buffer of BLOCK bytes; the kernel checks the
+        // source (read-only by our hand, so readable if committed). Not
+        // `host::read`: its retry opens kept blocks, under the guards.
+        if unsafe { ReadProcessMemory(GetCurrentProcess(), (b * BLOCK) as *const _, image.as_mut_ptr().cast(), BLOCK, &mut done) } == 0 {
+            resident_stat(7, 1);
+            return Kept::No;
+        }
+        blocks.push((b, image, true));
+    }
+    let mut title = vec![0u8; n];
+    for (b, image, _) in &blocks {
+        let (lo, hi) = ((b * BLOCK).max(at), ((b + 1) * BLOCK).min(at + n));
+        title[lo - at..hi - at].copy_from_slice(&image[lo - b * BLOCK..hi - b * BLOCK]);
+    }
+    if !merge(&mut title) {
+        return Kept::Same;
+    }
+    for (b, image, fresh) in blocks {
+        let (lo, hi) = ((b * BLOCK).max(at), ((b + 1) * BLOCK).min(at + n));
+        let mut kept = match r.remove(&b) {
+            Some(k) => k,
+            None => Resident {
+                image,
+                card: vec![false; BLOCK].into_boxed_slice(),
+            },
+        };
+        for x in lo..hi {
+            let (i, t) = (x - b * BLOCK, title[x - at]);
+            if kept.image[i] != t {
+                kept.image[i] = t;
+                kept.card[i] = true;
+            }
+        }
+        if fresh {
+            let mut old = 0;
+            // SAFETY: a guarded block of title view memory: read-only by
+            // our hand; only its protection changes.
+            if unsafe { VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_NOACCESS, &mut old) } == 0 {
+                // Not kept after all: written now, as before.
+                write_kept(b, &kept);
+                continue;
+            }
+            resident_stat(0, 1);
+        } else {
+            resident_stat(1, 1);
+        }
+        r.insert(b, kept);
+    }
+    RESIDENT_N.store(r.len(), std::sync::atomic::Ordering::Release);
+    resident_stat(8, n as u64);
+    drop(r);
+    drop(g);
+    let mut j = crate::trace::lock("lock wait: write-watch journal", &JOURNAL);
+    j.asked += 1;
+    let now = j.asked;
+    for page in at / PAGE..(at + n).div_ceil(PAGE) {
+        j.written.insert(page, now);
+    }
+    Kept::At(now)
+}
+
+/// Writes the card's bytes of kept block `b` into title memory and leaves
+/// it read-only (guarded). The block has no access (it is kept).
+fn write_kept(b: usize, kept: &Resident) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: a kept block of title view memory, which we left with no
+    // access or read-only; written only where the card wrote, then back to
+    // read-only.
+    unsafe {
+        if VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) == 0 {
+            return;
+        }
+        let base = (b * BLOCK) as *mut u8;
+        let mut i = 0;
+        while i < BLOCK {
+            if !kept.card[i] {
+                i += 1;
+                continue;
+            }
+            let mut k = i + 1;
+            while k < BLOCK && kept.card[k] {
+                k += 1;
+            }
+            std::ptr::copy_nonoverlapping(kept.image.as_ptr().add(i), base.add(i), k - i);
+            i = k;
+        }
+        VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old);
+    }
+}
+
+/// Whether block `b` can be read now (committed, with some access).
+fn readable(b: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((b * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Protect != PAGE_NOACCESS
+}
+
+/// Whether block `b` still has no access, as we left it when kept: if not,
+/// what it shows changed behind us (remapped) and the kept bytes are old.
+fn still_kept(b: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((b * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_NOACCESS
+}
+
+/// Kept blocks of `[from, to)` (block numbers) are written in, for `why`
+/// (a stat: 2 fault, 3 our read, 4 opened for a write, 5 remapped), and
+/// read-only again; the guards are held by the caller. The blocks written.
+fn resident_write(from: usize, to: usize, why: usize) -> usize {
+    use std::sync::atomic::Ordering;
+    if RESIDENT_N.load(Ordering::Acquire) == 0 || from >= to {
+        return 0;
+    }
+    // No timeline zone: this runs in the fault handler too.
+    let mut r = resident_lock();
+    let blocks: Vec<usize> = r.range(from..to).map(|(&b, _)| b).collect();
+    let mut written = 0;
+    for b in blocks {
+        let Some(kept) = r.remove(&b) else { continue };
+        if still_kept(b) {
+            write_kept(b, &kept);
+            written += 1;
+            resident_stat(why, 1);
+        } else {
+            resident_stat(6, 1);
+        }
+    }
+    RESIDENT_N.store(r.len(), Ordering::Release);
+    written
+}
+
+/// [`resident`]: our kernel read of `[at, at + len)` failed; kept blocks
+/// there are written in (true if any was: the read is worth trying again).
+pub(crate) fn resident_open(at: usize, len: usize) -> bool {
+    if !resident() || RESIDENT_N.load(std::sync::atomic::Ordering::Acquire) == 0 || len == 0 {
+        return false;
+    }
+    let _z = crate::trace::zone("card resident: our read writes kept blocks in");
+    let _g = guards();
+    resident_write(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK), 3) > 0
+}
+
+/// The runtime wrote `[at, at + len)` through a view of its own of the
+/// same physical pages (DirectStorage decoding in place): the bytes are
+/// newer than any the card left kept there, which are dropped; then as
+/// [`writing`].
+pub fn kernel_wrote(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    if resident() && RESIDENT_N.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        let _g = guards();
+        let mut r = resident_lock();
+        let blocks: Vec<usize> = r.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).map(|(&b, _)| b).collect();
+        for b in blocks {
+            r.remove(&b);
+            let mut old = 0;
+            // SAFETY: a block we left with no access; back to read-only
+            // (guarded), which `writing` then opens.
+            unsafe { VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) };
+            resident_stat(6, 1);
+        }
+        RESIDENT_N.store(r.len(), std::sync::atomic::Ordering::Release);
+    }
+    writing(at, len);
+}
+
+/// For the memory line: what [`resident`] did since the line before.
+pub(crate) fn resident_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !resident() {
+        return;
+    }
+    static LAST: Mutex<[u64; 9]> = Mutex::new([0; 9]);
+    let now: [u64; 9] = std::array::from_fn(|i| RESIDENT_STATS[i].load(Relaxed));
+    let d: [u64; 9] = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::array::from_fn(|i| now[i] - last[i]);
+        *last = now;
+        d
+    };
+    let held = RESIDENT_N.load(Relaxed);
+    tracing::info!(
+        "card resident (VICTORY_CARD_RESIDENT=1): {} blocks kept, {} merged again, {:.1} MB merged with no write; written in at first touch: {} by a fault, {} by our reads, {} opened for a write, {} remapped; {} dropped (newer bytes); {} landings written as before; {} blocks ({} MB) kept now",
+        d[0],
+        d[1],
+        d[8] as f64 / 1e6,
+        d[2],
+        d[3],
+        d[4],
+        d[5],
+        d[6],
+        d[7],
+        held,
+        (held * BLOCK) >> 20
+    );
 }
 
 /// The read census (`VICTORY_READ_CENSUS=1`, diagnostics only, off by
@@ -1273,6 +1783,24 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
+        // A block kept for the card ([`resident`]): its bytes written in,
+        // read-only again; the access is tried again (a write then faults
+        // once more, as a guard's). A read of a block another thread wrote
+        // in since this one faulted is tried again too (a write goes on to
+        // the guard below).
+        if RESIDENT_N.load(std::sync::atomic::Ordering::Acquire) > 0
+            && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && resident()
+        {
+            let block = r.ExceptionInformation[1] / BLOCK;
+            let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+            if resident_write(block, block + 1, 2) > 0
+                || (r.ExceptionInformation[0] != WRITE && g.protected.contains(&block) && !still_kept(block) && readable(block))
+            {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
         // A block the read census left with no access: counted, and
         // read-only again (a write then faults once more, as a guard's).
         if census()
