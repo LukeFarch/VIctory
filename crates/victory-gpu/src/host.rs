@@ -6187,11 +6187,28 @@ impl Meter {
             self.logged = std::time::Instant::now();
             crate::budget::line();
             {
-                let [kept, given, over] = crate::shadow::OWNED.each_ref().map(|c| c.load(Ordering::Relaxed));
-                if kept + given + over > 0 {
+                // Whether the lighting was fed: its passes ran, not dropped.
+                let [traced, untraced, built, unbuilt, blocked] = crate::pipeline::take_fed();
+                if traced + untraced + built + unbuilt + blocked > 0 {
+                    let fed = if traced > 0 && untraced == 0 && unbuilt == 0 {
+                        "FED"
+                    } else if traced > 0 {
+                        "PART"
+                    } else {
+                        "UNFED"
+                    };
                     tracing::info!(
-                        "quarantined ranges, since the start: {} MB left as the card made them at a refresh; {given} given back (the title wrote them, or no pass for two frames); {} MB re-uploaded from title memory over them (VICTORY_QUARANTINE_OWN=0)",
+                        "lighting {fed} since the last such line: ray-traced dispatches {traced} run, {untraced} dropped; structure builder dispatches {built} run, {unbuilt} dropped; {blocked} ms waited for pipelines (VICTORY_PIPELINE_BLOCK=1)"
+                    );
+                }
+            }
+            {
+                let [kept, wrote, idle, over, merged, whole] = crate::shadow::OWNED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                if kept + wrote + idle + over + whole > 0 {
+                    tracing::info!(
+                        "quarantined pages since the last such line: {} MB left as the card made them at refreshes; {wrote} title writes merged ({} KB), {whole} copied whole once (first title write); {idle} given back with no pass lately; {} MB re-uploaded over them (VICTORY_QUARANTINE_OWN=0)",
                         kept >> 20,
+                        merged >> 10,
                         over >> 20
                     );
                 }

@@ -245,6 +245,7 @@ pub(crate) fn ready(
     addresses: &[u64],
     constants: &[u32],
     writes: bool,
+    quarantined: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -298,6 +299,14 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    // A quarantined pass that stores by address: what it may have stored
+    // is the card's, in every copy it can reach (`Shadow::gpu_owned`).
+    // `VICTORY_QUARANTINE_OWN_ADDRESS=0`: not, as before.
+    const OWNED: usize = usize::MAX - 0x6f;
+    static BY_ADDRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let own = quarantined
+        && *BY_ADDRESS.get_or_init(|| std::env::var_os("VICTORY_QUARANTINE_OWN_ADDRESS").is_none_or(|v| v != "0"))
+        && list.first_use(OWNED);
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
@@ -305,6 +314,9 @@ pub(crate) fn ready(
         }
         if writes && (first_write || n >= numbered) {
             shadow.gpu_writes(list, start, len);
+        }
+        if own || (quarantined && n >= numbered) {
+            shadow.gpu_owned(start, len);
         }
     }
     if first_read {

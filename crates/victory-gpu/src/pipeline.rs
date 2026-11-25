@@ -812,7 +812,20 @@ static DISPATCHES: Mutex<Option<Dispatches>> = Mutex::new(None);
 /// Counts a dispatch of the pipeline `this`, run on the host or dropped.
 #[cfg(windows)]
 pub(crate) fn note_dispatch(this: This, ran: bool) {
-    if !drop_reasons() || this.is_null() {
+    if this.is_null() {
+        return;
+    }
+    {
+        let p = pipeline(this);
+        let i = usize::from(!ran);
+        if p.tracer {
+            FED[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if p.builder {
+            FED[2 + i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if !drop_reasons() {
         return;
     }
     let mut all = DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
@@ -825,6 +838,21 @@ pub(crate) fn note_dispatch(this: This, ran: bool) {
     } else {
         entry.2 += 1;
     }
+}
+
+/// Since the last memory line: dispatches of the passes that walk the
+/// ray-tracing structures that ran and that were dropped, then the same
+/// for the structure builder's ([`take_fed`]).
+#[cfg(windows)]
+static FED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`FED`], read and cleared: tracer dispatches run and dropped, builder
+/// dispatches run and dropped; and milliseconds waited for pipelines with
+/// `VICTORY_PIPELINE_BLOCK=1`.
+#[cfg(windows)]
+pub(crate) fn take_fed() -> [u64; 5] {
+    let [a, b, c, d] = FED.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
+    [a, b, c, d, make::BLOCKED_MS.swap(0, std::sync::atomic::Ordering::Relaxed)]
 }
 
 /// Compute pipelines none of whose dispatches has run: how many, their

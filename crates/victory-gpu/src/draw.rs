@@ -787,7 +787,8 @@ impl State {
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        let quarantined = crate::pipeline::quarantined(self.pipeline as This);
+        crate::memory::ready(list, heap, &addresses, &constants, writes, quarantined)
     }
 
     /// The bound heap holding `handle`.
