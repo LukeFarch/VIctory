@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// With `rebar`: shaders were found writing it, so it is let go as soon
     /// as nothing holds it, and its memory's next copy is not placed.
     move_out: std::sync::atomic::AtomicBool,
+    /// With `crate::rebar` on: shaders' writes to the copy were noted
+    /// (once a copy).
+    shader_noted: std::sync::atomic::AtomicBool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -1880,6 +1883,7 @@ impl Shadow {
             window: false,
             rebar: 0,
             move_out: std::sync::atomic::AtomicBool::new(false),
+            shader_noted: std::sync::atomic::AtomicBool::new(false),
             place: None,
             owned: Mutex::new(BTreeMap::new()),
         }
@@ -1915,12 +1919,17 @@ impl Shadow {
     /// memory is noted (a later copy cut on another grid may hold any of
     /// it), so that its next copy stays in the PC's memory, and the copy is
     /// let go once nothing holds it.
+    ///
+    /// Copies in the PC's memory note it too (once a copy): what they show
+    /// keeps a later copy of the same memory out of card memory.
     fn shader_write_on_rebar(&self, len: u64) {
-        if self.rebar == 0 || len == 0 {
+        if len == 0 || crate::rebar::level() == 0 || self.shader_noted.swap(true, Ordering::Relaxed) {
             return;
         }
-        crate::rebar::shader_wrote(self.start, self.len);
-        self.move_out.store(true, Ordering::Relaxed);
+        crate::rebar::shader_wrote(self.start, self.len, self.rebar != 0);
+        if self.rebar != 0 {
+            self.move_out.store(true, Ordering::Relaxed);
+        }
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -3474,8 +3483,11 @@ fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window:
     if crate::rebar::level() == 0 {
         return None;
     }
+    // Probation: only memory that had a copy before, which shaders never
+    // wrote (`crate::rebar::seen_before`).
+    let known = crate::rebar::seen_before(start, len);
     let written = crate::rebar::shader_written(start, len);
-    if !crate::rebar::reserve(kind, size, written) {
+    if !known || !crate::rebar::reserve(kind, size, written) {
         return None;
     }
     let Some((buffer, data)) = host()?.gpu_upload_buffer(size) else {

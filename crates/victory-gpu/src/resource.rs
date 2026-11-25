@@ -1986,6 +1986,13 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+        // A buffer shaders may write (unordered access: compute output such
+        // as hair strands, run 12): its memory never goes to CPU-visible
+        // card memory (`crate::rebar`), as a buffer or inside a window.
+        const UNORDERED: u32 = 4;
+        if desc.flags & UNORDERED != 0 && crate::rebar::level() != 0 {
+            crate::rebar::shader_wrote(resource.data() as u64, desc.width, false);
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }

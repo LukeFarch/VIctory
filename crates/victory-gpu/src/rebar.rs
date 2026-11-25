@@ -243,6 +243,16 @@ pub(crate) fn reserve(kind: Kind, size: u64, cpu_read: bool) -> bool {
     if level == 0 || !supported() {
         return false;
     }
+    if STATS[0].load(Ordering::Relaxed) >= read_stop() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                read_mb = STATS[0].load(Ordering::Relaxed) >> 20,
+                "Resizable BAR: the CPU read too much back from card memory; no more copies are placed (VICTORY_REBAR_READ_STOP_MB)"
+            );
+        });
+        return false;
+    }
     let host = crate::host::host();
     let card = host.and_then(|h| h.video_memory()).map(|[b, u, ..]| (b, u));
     let ask = Ask {
@@ -305,9 +315,10 @@ static SHADER_PAGES: std::sync::Mutex<std::collections::BTreeSet<u64>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 const PIECE: u64 = 1 << 16;
 
-/// Shaders write `[start, start + len)` of a placed copy: noted, so that
-/// no later copy of it is placed. Returns whether it was new.
-pub(crate) fn shader_wrote(start: u64, len: u64) -> bool {
+/// Shaders write `[start, start + len)` of a host copy (placed or not):
+/// noted, so that no later copy of it is placed. Returns whether it was
+/// new.
+pub(crate) fn shader_wrote(start: u64, len: u64, placed: bool) -> bool {
     if len == 0 {
         return false;
     }
@@ -316,7 +327,7 @@ pub(crate) fn shader_wrote(start: u64, len: u64) -> bool {
     for page in start / PIECE..=(start + len - 1) / PIECE {
         new |= pages.insert(page);
     }
-    if new {
+    if new && placed {
         let n = STATS[2].fetch_add(1, Ordering::Relaxed);
         if n < 8 || n.is_power_of_two() {
             tracing::info!(
@@ -330,7 +341,39 @@ pub(crate) fn shader_wrote(start: u64, len: u64) -> bool {
     new
 }
 
-/// Whether shaders wrote any of `[start, start + len)` through a placed
+/// 64 KiB pages of title memory a host copy (any) was made of before.
+static SEEN: std::sync::Mutex<std::collections::BTreeSet<u64>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Probation (run 12: shaders wrote hundreds of the windows placed while
+/// the game loaded, and a copy that views made earlier still name cannot
+/// be let go, so they stayed placed and the CPU read 92 MB a frame back
+/// from card memory): a copy is placed only when every page of it had a
+/// copy before (in the PC's memory, where shaders' writes to it were
+/// seen) and shaders wrote none of them. Notes `[start, start + len)` as
+/// seen, and returns whether all of it was before.
+pub(crate) fn seen_before(start: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let pages = start / PIECE..=(start + len - 1) / PIECE;
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = true;
+    for page in pages {
+        all &= !seen.insert(page);
+    }
+    all
+}
+
+/// `VICTORY_REBAR_READ_STOP_MB` (default 512): once the CPU read this much
+/// from placed copies, no more are placed (each read is uncached).
+fn read_stop() -> u64 {
+    static STOP: OnceLock<u64> = OnceLock::new();
+    *STOP.get_or_init(|| {
+        std::env::var("VICTORY_REBAR_READ_STOP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20
+    })
+}
+
+/// Whether shaders wrote any of `[start, start + len)` through a host
 /// copy before ([`shader_wrote`]).
 pub(crate) fn shader_written(start: u64, len: u64) -> bool {
     if len == 0 {
@@ -493,11 +536,22 @@ mod written_tests {
     use super::*;
 
     #[test]
+    fn a_copy_is_seen_before_only_when_every_page_was() {
+        let base = 0x6666_0000_0000u64;
+        assert!(!seen_before(base, 0x40_0000));
+        assert!(seen_before(base, 0x40_0000));
+        assert!(seen_before(base + 0x1_0000, 0x1_0000));
+        assert!(!seen_before(base + 0x3f_0000, 0x2_0000));
+        assert!(seen_before(base + 0x3f_0000, 0x2_0000));
+        assert!(!seen_before(base, 0));
+    }
+
+    #[test]
     fn shader_written_pages_are_found_by_overlap() {
         let base = 0x7777_0000_0000u64;
         assert!(!shader_written(base, 0x10000));
-        assert!(shader_wrote(base + 0x2_0010, 4));
-        assert!(!shader_wrote(base + 0x2_0020, 4));
+        assert!(shader_wrote(base + 0x2_0010, 4, true));
+        assert!(!shader_wrote(base + 0x2_0020, 4, false));
         assert!(shader_written(base, 0x3_0000));
         assert!(!shader_written(base, 0x2_0000));
         assert!(shader_written(base + 0x2_ffff, 1));
