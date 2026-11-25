@@ -98,6 +98,12 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// A container's hash as the log names it.
+#[cfg(windows)]
+fn shader_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex()[..16].to_owned()
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -856,9 +862,9 @@ fn missed(slot: usize, why: &str) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(slot == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
-    // A geometry pipeline's miss is always said: there are few, and each
-    // is a pass the frame goes without.
-    if calls <= 4 || calls.is_power_of_two() || why.contains("stage Es") || why.contains("geometry") {
+    // The first 64 are said (each is a pass the frame goes without), and
+    // one with a program of a merged stage always.
+    if calls <= 64 || calls.is_power_of_two() || why.contains("stage Es") {
         tracing::warn!(slot = format_args!("{slot:#x}"), calls, why, "a precompiled pipeline is not made: the title goes without it");
     }
 }
@@ -1024,9 +1030,14 @@ pub(crate) extern "system" fn create_precompiled_graphics(
             }
         }
         let Some(vertex) = vertex else {
-            let with = if geometry.is_some() { " beside the geometry program" } else { "" };
-            let all = more.as_ref().map_or(&w[..], |m| &m[..]);
-            missed(0x1c8, &format!("no vertex program{with} (description {all:x?})"));
+            // Said with every program the index knows anywhere in the
+            // description's first 32 words, to learn a layout from.
+            let wide = words::<32>(desc);
+            let all = wide.as_ref().map_or(&w[..], |m| &m[..]);
+            let found: Vec<String> = (5..all.len().saturating_sub(1))
+                .filter_map(|at| precompiled(all, at).map(|(stage, c)| format!("word {at}: {stage} {}", shader_hash(&c))))
+                .collect();
+            missed(0x1c8, &format!("no vertex program (programs found: {found:?}, description {all:x?})"));
             return E_NOTIMPL;
         };
         let mut shaders = vec![shader("vertex", &vertex)];
