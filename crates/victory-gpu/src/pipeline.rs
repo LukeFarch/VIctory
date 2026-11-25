@@ -1177,6 +1177,16 @@ pub(crate) extern "system" fn create_precompiled_graphics(
                 }
             }
         }
+        // `VICTORY_PRECOMPILED_MESH=1`: make these as mesh pipelines. Off
+        // by default: the host refused them all (E_INVALIDARG, run
+        // 2026-11-25), and a pipeline handed out that the host then
+        // refuses draws nothing, where the title, told E_NOTIMPL, draws
+        // the same things another way (people and walls went missing).
+        static MESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if mesh.is_some() && !*MESH.get_or_init(|| std::env::var_os("VICTORY_PRECOMPILED_MESH").is_some_and(|v| v == "1")) {
+            missed(0x1c8, "a mesh program (made with VICTORY_PRECOMPILED_MESH=1)");
+            return E_NOTIMPL;
+        }
         if mesh.is_some() && (vertex.is_some() || geometry.is_some()) {
             missed(0x1c8, "a mesh program beside a vertex or geometry program");
             return E_NOTIMPL;
