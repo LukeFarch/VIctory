@@ -14,6 +14,16 @@
 //! wholly uncommitted are skipped while they remain so; one query can
 //! confirm a whole region, including ordinary reservations between views.
 //!
+//! The title shows one physical page at several addresses. A block is
+//! noted clean only while every other address of its bytes is read-only
+//! too ([`guard_twins`]), and a write taken at one address makes the blocks
+//! at the others not clean ([`stale_twins`]); so does a view mapped anew
+//! ([`view_mapped`]). Before, a copy was guarded at its own address alone,
+//! and a write through another left it as it was for the rest of the run:
+//! the first room's walls were missing in every run without this and
+//! there in every run with it (runs G0 and G1). `VICTORY_VIEW_TWINS=0`:
+//! as before.
+//!
 //! shortcut: writes into physical pages through another view (xmem's
 //! `write_physical`, DirectStorage's page destinations) are not seen at
 //! the guarded addresses; they go to the texture pool, whose textures are
@@ -464,8 +474,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
+                // Written through the runtime or at another address,
+                // still read-only.
                 g.clean.insert(block);
+                guard_twins(&mut g, block, block + 1);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -545,15 +557,77 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     };
     if set(from, to) {
         note(g, from, to);
+        guard_twins(g, from, to);
         return;
     }
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
+            guard_twins(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
         }
     }
+}
+
+/// Whether the other addresses of a block's bytes are guarded with it
+/// (`VICTORY_VIEW_TWINS=0`: no, as before).
+fn view_twins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_TWINS").is_none_or(|v| v != "0"))
+}
+
+/// Twin blocks made read-only, and twin blocks made not clean by a write
+/// at another address; since the start.
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Blocks `[from, to)` were just noted clean: every other address that
+/// shows their bytes is made read-only too, so that a write through it
+/// faults ([`stale_twins`]). Such a block is not noted clean: the copies
+/// taken through it have not taken the bytes, and a block that is
+/// read-only and not clean is reported written at their next check.
+fn guard_twins(g: &mut Guards, from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    if !view_twins() {
+        return;
+    }
+    crate::inplace::twins(from * BLOCK, to * BLOCK, |_, twin| {
+        let twin = twin / BLOCK;
+        if g.protected.contains(&twin) {
+            return;
+        }
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        if unsafe { VirtualProtect((twin * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+            g.protected.insert(twin);
+            let n = TWINS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 {
+                tracing::info!("a block of title memory is shown at another address too: guarded there as well (VICTORY_VIEW_TWINS=0: not)");
+            }
+        }
+    });
+}
+
+/// Blocks `[from, to)` are written, or can be without a fault: the blocks
+/// at the other addresses of their bytes are no longer clean. They stay
+/// read-only, so no call to the system is made for them.
+fn stale_twins(g: &mut Guards, from: usize, to: usize) {
+    if !view_twins() {
+        return;
+    }
+    crate::inplace::twins(from * BLOCK, to * BLOCK, |_, twin| {
+        if g.clean.remove(&(twin / BLOCK)) {
+            TWINS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// The runtime mapped a view at `[at, at + len)` (`crate::inplace`): it is
+/// writable and not guarded, so what a copy took through another address
+/// of the same bytes can change with no fault. Those blocks are no longer
+/// clean; their next check guards this view with them.
+pub(crate) fn view_mapped(at: usize, len: usize) {
+    stale_twins(&mut guards(), at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
@@ -575,6 +649,23 @@ fn uncommitted_end(block: usize) -> usize {
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    let blocks = open_only(g, start, end);
+    // The same bytes at their other addresses are written with them.
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
+            j += 1;
+        }
+        stale_twins(g, blocks[i], blocks[j - 1] + 1);
+        i = j;
+    }
+    !blocks.is_empty()
+}
+
+/// [`open`] without a word to the other addresses of the blocks' bytes;
+/// the blocks it opened.
+fn open_only(g: &mut Guards, start: usize, end: usize) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
@@ -588,7 +679,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    !blocks.is_empty()
+    blocks
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -624,10 +715,9 @@ pub(crate) struct OwnWrite {
 pub(crate) fn own_write_begin(at: usize, len: usize) -> OwnWrite {
     let end = at.saturating_add(len);
     let blocks: Vec<usize> = {
-        let mut g = guards();
-        let blocks = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
-        open(&mut g, at, end);
-        blocks
+        // Not `open`: the other addresses of these bytes are told at the
+        // end, in the journal, with no fault and no call to the system.
+        open_only(&mut guards(), at, end)
     };
     crate::descriptor::host::remapped(at, len);
     OwnWrite { blocks, at, len }
@@ -653,6 +743,10 @@ pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
     if w.blocks.is_empty() {
         return writes(w.at, w.at.saturating_add(w.len), false).map(|(now, _)| now);
     }
+    // The same bytes at their other addresses: written too, for the
+    // copies taken there. Said in the journal (they stay read-only and
+    // clean, so a title write through them still faults).
+    let mut twins: Vec<usize> = Vec::new();
     {
         let mut g = guards();
         let mut i = 0;
@@ -667,13 +761,16 @@ pub(crate) fn own_write_end(w: OwnWrite) -> Option<u64> {
             if !g.protected.contains(&from) {
                 protect(&mut g, from, to);
             }
+            if view_twins() {
+                crate::inplace::twins(from * BLOCK, to * BLOCK, |_, twin| twins.push(twin / BLOCK));
+            }
             i = j;
         }
     }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.asked += 1;
     let now = j.asked;
-    for &block in &w.blocks {
+    for &block in w.blocks.iter().chain(&twins) {
         for page in block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE {
             j.written.insert(page, now);
         }
