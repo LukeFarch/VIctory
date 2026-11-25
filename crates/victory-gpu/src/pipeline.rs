@@ -719,6 +719,94 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
     drops
 }
 
+/// Things found wrong with a draw or dispatch since the last
+/// [`take_faults`], by kind: what a counted line every 5 s says in every
+/// build, so that a picture with something missing names why.
+#[cfg(windows)]
+static FAULTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Counts one fault of `kind`.
+#[cfg(windows)]
+pub(crate) fn note_fault(kind: &'static str) {
+    if !drop_reasons() {
+        return;
+    }
+    let mut faults = FAULTS.lock().unwrap_or_else(|e| e.into_inner());
+    let faults = faults.get_or_insert_with(HashMap::new);
+    match faults.get_mut(kind) {
+        Some(n) => *n += 1,
+        None => {
+            faults.insert(kind.to_owned(), 1);
+        }
+    }
+}
+
+/// Counts one fault of `kind` for the pipeline `this`, by its shaders.
+#[cfg(windows)]
+pub(crate) fn note_fault_of(kind: &'static str, this: This) {
+    if !drop_reasons() || this.is_null() {
+        return;
+    }
+    let why = format!("{kind}: {:?}", pipeline(this).shaders);
+    let mut faults = FAULTS.lock().unwrap_or_else(|e| e.into_inner());
+    *faults.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+}
+
+/// The faults counted since the last call, most first.
+#[cfg(windows)]
+pub(crate) fn take_faults() -> Vec<(String, u64)> {
+    let faults = FAULTS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut faults: Vec<(String, u64)> = faults.into_iter().flatten().collect();
+    faults.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    faults
+}
+
+/// Per compute pipeline since the start: its shaders, dispatches run,
+/// dispatches dropped, and whether [`take_lost`] has said it.
+#[cfg(windows)]
+type Dispatches = HashMap<usize, (String, u64, u64, bool)>;
+#[cfg(windows)]
+static DISPATCHES: Mutex<Option<Dispatches>> = Mutex::new(None);
+
+/// Counts a dispatch of the pipeline `this`, run on the host or dropped.
+#[cfg(windows)]
+pub(crate) fn note_dispatch(this: This, ran: bool) {
+    if !drop_reasons() || this.is_null() {
+        return;
+    }
+    let mut all = DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = all
+        .get_or_insert_with(HashMap::new)
+        .entry(this as usize)
+        .or_insert_with(|| (format!("{:?}", pipeline(this).shaders), 0, 0, false));
+    if ran {
+        entry.1 += 1;
+    } else {
+        entry.2 += 1;
+    }
+}
+
+/// Compute pipelines none of whose dispatches has run: how many, their
+/// dropped dispatches, and the shaders of those not said before that were
+/// dispatched at most four times (a pass the title runs once, a model
+/// unpacked at load, say, is lost for the run when it is dropped).
+#[cfg(windows)]
+pub(crate) fn take_lost() -> (u64, u64, Vec<String>) {
+    let mut all = DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut never, mut dropped, mut new) = (0, 0, Vec::new());
+    for (shaders, ran, lost, said) in all.iter_mut().flat_map(|all| all.values_mut()) {
+        if *ran == 0 && *lost > 0 {
+            never += 1;
+            dropped += *lost;
+            if !*said && *lost <= 4 {
+                *said = true;
+                new.push(format!("{shaders} x{lost}"));
+            }
+        }
+    }
+    (never, dropped, new)
+}
+
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     if code.code.is_null() || code.size == 0 {

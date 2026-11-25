@@ -1973,6 +1973,7 @@ fn elements_inside(first: u64, count: u32, element: u64, width: u64) -> u32 {
 /// Diagnostics: a buffer view left null for shaders that pick views by
 /// index, and why. Told at each doubling of the distinct views of a kind.
 fn left_null(why: &'static str, unordered: bool, address: u64, len: u64, element: u64, first: u64) {
+    crate::pipeline::note_fault(why);
     if !cfg!(feature = "diagnostics") {
         return;
     }

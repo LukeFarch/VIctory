@@ -830,9 +830,12 @@ impl State {
             }
             count = slot + 1;
             if v.address == 0 || v.size == 0 {
+                crate::pipeline::note_fault("a draw's input layout reads a vertex slot the title set no buffer for (drawn with nothing there)");
                 continue;
             }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                crate::pipeline::note_fault("a draw's vertex buffer has no host copy (drawn with nothing there)");
+                crate::pipeline::note_fault_of("vertex buffer without a host copy", self.pipeline as This);
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -851,6 +854,11 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                crate::pipeline::note_fault(if v.address == 0 || v.size == 0 {
+                    "an indexed draw with no index buffer set (dropped)"
+                } else {
+                    "an indexed draw's index buffer has no host copy (dropped)"
+                });
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -952,6 +960,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                crate::pipeline::note_fault("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -962,6 +971,7 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                    crate::pipeline::note_fault("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
                 Some(ready)
@@ -1019,6 +1029,7 @@ impl State {
                         static RT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         if !*RT.get_or_init(|| std::env::var_os("VICTORY_RT_SHADOWS").is_none_or(|v| v != "0")) {
                             once!("VICTORY_RT_SHADOWS=0: a ray-traced shadow program is not run");
+                            crate::pipeline::note_fault("VICTORY_RT_SHADOWS=0: a ray-traced shadow program is not run");
                             return false;
                         }
                         match self.heap_view_addresses(list) {
@@ -1032,6 +1043,7 @@ impl State {
                             },
                             None => {
                                 once!("a shader takes the address of a buffer view it picks, and there is no table of them");
+                                crate::pipeline::note_fault("a shader takes the address of a buffer view it picks, and there is no table of them");
                                 return false;
                             }
                         }
@@ -1058,6 +1070,7 @@ impl State {
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
+                        crate::pipeline::note_fault("a shader reads a root view the title did not set (it reads nothing)");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
@@ -1119,6 +1132,7 @@ impl State {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
                         once!(slot, "a shader writes through a root view the title did not set");
+                        crate::pipeline::note_fault("a shader writes through a root view the title did not set");
                         None
                     }
                 };
@@ -1166,6 +1180,7 @@ impl State {
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
                 once!("a root UAV of a buffer whose host copy shaders cannot write");
+                crate::pipeline::note_fault("a root UAV of a buffer whose host copy shaders cannot write");
                 return None;
             }
             Some(s)
@@ -1180,6 +1195,7 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
+                crate::pipeline::note_fault("a root UAV with nothing to bind: the draw is dropped");
                 return false;
             };
             ready(a, &s);
@@ -1203,6 +1219,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
+            crate::pipeline::note_fault("a root UAV without a bound view heap: the draw is dropped");
             return false;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
@@ -1210,7 +1227,11 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
+                if address.is_some() && shadow.is_none() {
+                    crate::pipeline::note_fault("a root view shaders write has no host copy of its buffer (written nowhere)");
+                }
                 let Some(index) = host.dynamic(1) else {
+                    crate::pipeline::note_fault("no free slot for a root view (dropped)");
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1269,6 +1290,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
+            crate::pipeline::note_fault("a root SRV without a bound view heap: the draw is dropped");
             return false;
         };
         // A view that begins early is another view than one that does not
@@ -1281,7 +1303,11 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                if address.is_some() && shadow.is_none() {
+                    crate::pipeline::note_fault("a root view shaders read has no host copy of its buffer (they read nothing)");
+                }
                 let Some(index) = host.dynamic(1) else {
+                    crate::pipeline::note_fault("no free slot for a root view (dropped)");
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1800,6 +1826,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_dispatch(self.pipeline as This, false);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -1807,6 +1834,7 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) {
             if !crate::pipeline::builder_runs() {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
+                crate::pipeline::note_dispatch(self.pipeline as This, false);
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 #[cfg(feature = "diagnostics")]
                 self.list_dropped_roots([x, y, z]);
@@ -1817,6 +1845,7 @@ impl State {
         // Passes that walk the structures run only while the builder does.
         if crate::pipeline::is_tracer(self.pipeline as This) && !crate::pipeline::tracer_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_dispatch(self.pipeline as This, false);
             crate::pipeline::note_why("a ray-traced pass, held back while the structure builder does not run".to_owned());
             return;
         }
@@ -1826,6 +1855,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_dispatch(self.pipeline as This, false);
             crate::pipeline::note_drop(self.pipeline as This);
             #[cfg(feature = "diagnostics")]
             self.list_dropped_roots([x, y, z]);
@@ -1837,6 +1867,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_dispatch(self.pipeline as This, false);
             crate::pipeline::note_drop(self.pipeline as This);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -1868,6 +1899,7 @@ impl State {
             _ => unsafe { list.list.Dispatch(x, y, z) },
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        crate::pipeline::note_dispatch(self.pipeline as This, true);
     }
 
     /// What a draw or dispatch runs, for the device-removed report

@@ -6165,6 +6165,25 @@ impl Meter {
             crate::budget::line();
             // Why draws and dispatches were not run, since the last such
             // line (the diagnostics build has them in its frame report).
+            {
+                let faults = crate::pipeline::take_faults();
+                let all: u64 = faults.iter().map(|(_, n)| n).sum();
+                if all > 0 {
+                    let text: Vec<String> = faults.iter().take(24).map(|(why, n)| format!("{n} x {why}")).collect();
+                    tracing::info!(
+                        "draw faults since the last such line: {all} of {} kinds; most first: {}",
+                        faults.len(),
+                        text.join(" | ")
+                    );
+                }
+                let (never, dropped, new) = crate::pipeline::take_lost();
+                if never > 0 {
+                    tracing::info!(
+                        "compute pipelines none of whose dispatches has run: {never} ({dropped} dispatches dropped since the start); new ones dispatched at most four times (once-only passes): {}",
+                        if new.is_empty() { "none".to_owned() } else { new.join(" | ") }
+                    );
+                }
+            }
             #[cfg(not(feature = "diagnostics"))]
             {
                 let drops = crate::pipeline::take_drops();
