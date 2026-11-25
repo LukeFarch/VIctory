@@ -336,8 +336,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (on by default since the dirty-copies
+/// rebuild; `VICTORY_TEXTURE_NO_WAIT=0` waits, as before).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -357,9 +357,19 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+///
+/// Also with the switch: a texture read in place whose hash changed is
+/// copied out of title memory while the lock is held, and the lock is let
+/// go before it is detiled. Detiling is most of a refresh's time, and the
+/// runtime's remapping (the title's own streaming thread) waited behind it.
+///
+/// Made the default after run 29 (fcc9eb9, fast build), whose diner frame
+/// line had 2,904 ms of "textures" in one frame, 2,886 ms of it "waiting
+/// for title memory to hold still", and frames of 557 and 975 ms of the
+/// same around it.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -781,7 +791,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -851,7 +861,7 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -860,7 +870,19 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        if no_wait() {
+            // Copied out under the lock, detiled after it is let go
+            // (`no_wait`): the runtime's remapping does not wait for the
+            // detile.
+            with_read(size, |read| {
+                read.copy_from_slice(tiled);
+                drop(mapped);
+                self.detile(read);
+            });
+        } else {
+            self.detile(tiled);
+            drop(mapped);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size

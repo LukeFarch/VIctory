@@ -6086,6 +6086,13 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            {
+                let [settled, left] = [0, 1].map(|i| crate::shadow::SETTLED[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+                tracing::info!(
+                    "copy-back's own writes per frame: {settled:.1} MB of pages left current in their copy (not copied up again), \
+                     {left:.1} MB copied again because title memory differed (VICTORY_SETTLE_OWN=0 copies them all again, as before)"
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
