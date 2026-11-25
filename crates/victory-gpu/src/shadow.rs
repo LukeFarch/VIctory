@@ -1815,6 +1815,8 @@ impl Shadow {
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        crate::trace::count("host copies: made", 1);
+        crate::trace::count("host copies: bytes made", len);
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {

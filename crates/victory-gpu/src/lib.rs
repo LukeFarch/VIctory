@@ -73,6 +73,20 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// A span on the timeline (`VICTORY_TRACE`) from now until the value is
+/// dropped, for the runtime's own work (file reads and the like).
+#[cfg(windows)]
+pub fn trace_zone(name: &'static str) -> impl Drop {
+    trace::zone(name)
+}
+
+/// Adds `n` to the timeline window's counter `name` (`VICTORY_TRACE`):
+/// bytes read, requests, things made.
+#[cfg(windows)]
+pub fn trace_count(name: &'static str, n: u64) {
+    trace::count(name, n);
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

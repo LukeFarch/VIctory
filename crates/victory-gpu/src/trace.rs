@@ -60,8 +60,34 @@ static TOTALS: Mutex<Vec<(&'static str, u64, f64)>> = Mutex::new(Vec::new());
 /// [`TOTALS`] (`VICTORY_TRACE_MIN_US`, 5): a frame makes tens of
 /// thousands of copy refreshes of a few microseconds.
 fn min_us() -> f64 {
-    static MIN: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| number("VICTORY_TRACE_MIN_US", 5) as f64)
+    static MIN: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    let (frame, load) = *MIN.get_or_init(|| (number("VICTORY_TRACE_MIN_US", 5) as f64, number("VICTORY_TRACE_LOAD_MIN_US", 20) as f64));
+    if LOAD.load(Ordering::Relaxed) { load } else { frame }
+}
+
+/// Whether the window open now (or last) is a load profile (F10): longer
+/// (`VICTORY_TRACE_LOAD_FRAMES`, 150 presents), its own floor for spans
+/// kept one by one (`VICTORY_TRACE_LOAD_MIN_US`, 20), a file named
+/// `name-load-N.json`. Pressed while the world streams in (or anywhere it
+/// stutters), it says which loading work costs the time: file reads,
+/// shaders translated or taken from the cache, pipelines loaded or made
+/// by the driver, textures and host copies brought up to date, with the
+/// window's counters (bytes, requests) in the file's metadata.
+static LOAD: AtomicBool = AtomicBool::new(false);
+
+/// The window's counters by name ([`count`]).
+static COUNTS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+/// Adds `n` to the window's counter `name`, while a window records.
+pub(crate) fn count(name: &'static str, n: u64) {
+    if !on() {
+        return;
+    }
+    let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    match counts.iter_mut().find(|c| std::ptr::eq(c.0, name)) {
+        Some(c) => c.1 += n,
+        None => counts.push((name, n)),
+    }
 }
 
 /// Thread numbers and names, for the file.
@@ -209,8 +235,8 @@ pub(crate) fn present() {
         WORLD.store(n, Ordering::Relaxed);
         tracing::info!(present = n, "trace: the world's first frame");
     }
-    let frames = number("VICTORY_TRACE_FRAMES", 30).max(1);
     let window = WINDOW.load(Ordering::Relaxed);
+    let frames = if window == 0 { 0 } else { window_frames() };
     if window == 0 {
         // A window opens at F9 (held at a present; the game's window need
         // not have the keyboard's focus), or by itself once
@@ -219,9 +245,15 @@ pub(crate) fn present() {
         let world = WORLD.load(Ordering::Relaxed);
         let from = number("VICTORY_TRACE_FROM", 0);
         let by_count = from > 0 && world > 0 && n == world + from && TAKEN.load(Ordering::Relaxed) == 0;
-        if !(by_count || key_pressed()) {
+        let load = !by_count && key_pressed(VK_F10);
+        if !(by_count || load || key_pressed(VK_F9)) {
             return;
         }
+        LOAD.store(load, Ordering::Relaxed);
+        COUNTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let shaders = crate::shader_cache::counts();
+        *SHADERS_AT.lock().unwrap_or_else(|e| e.into_inner()) = shaders;
+        let frames = window_frames();
         let _ = epoch();
         SPANS.lock().unwrap_or_else(|e| e.into_inner()).reserve_exact(MOST);
         WINDOW.store(n, Ordering::Relaxed);
@@ -243,15 +275,23 @@ pub(crate) fn present() {
         let spans = std::mem::take(&mut *SPANS.lock().unwrap_or_else(|e| e.into_inner()));
         let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let totals = std::mem::take(&mut *TOTALS.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut counts = std::mem::take(&mut *COUNTS.lock().unwrap_or_else(|e| e.into_inner()));
+        {
+            let (hits, misses) = crate::shader_cache::counts();
+            let (h0, m0) = *SHADERS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            counts.push(("shaders from the cache", hits - h0));
+            counts.push(("shaders translated", misses - m0));
+        }
         DROPPED.store(0, Ordering::Relaxed);
         let path = numbered(path);
         TAKEN.fetch_add(1, Ordering::Relaxed);
         let _ = std::thread::Builder::new()
             .name("victory-trace-write".into())
-            .spawn(move || write(&path, &spans, &threads, &totals, frames));
+            .spawn(move || write(&path, &spans, &threads, &totals, &counts, frames));
     }
-    // F9 again, after a window and once the key was let go: another window.
-    if n >= window + frames && !key_down() {
+    // F9 or F10 again, after a window and once the keys were let go:
+    // another window.
+    if n >= window + frames && !key_down(VK_F9) && !key_down(VK_F10) {
         WINDOW.store(0, Ordering::Relaxed);
     }
 }
@@ -261,33 +301,49 @@ pub(crate) fn present() {
 static WINDOW: AtomicU64 = AtomicU64::new(0);
 static TAKEN: AtomicU64 = AtomicU64::new(0);
 
+/// Shader counts when the window opened.
+static SHADERS_AT: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// Presents the window open now covers.
+fn window_frames() -> u64 {
+    if LOAD.load(Ordering::Relaxed) {
+        number("VICTORY_TRACE_LOAD_FRAMES", 150).max(1)
+    } else {
+        number("VICTORY_TRACE_FRAMES", 30).max(1)
+    }
+}
+
 /// The file for the next window: the path given, then `name-2.json`, ...
+/// (`name-load...` for a load profile).
 fn numbered(path: &std::path::Path) -> std::path::PathBuf {
     let k = TAKEN.load(Ordering::Relaxed);
-    if k == 0 {
-        return path.to_path_buf();
-    }
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = path.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "json".into());
+    let stem = if LOAD.load(Ordering::Relaxed) { format!("{stem}-load") } else { stem };
+    if k == 0 {
+        return path.with_file_name(format!("{stem}.{ext}"));
+    }
     path.with_file_name(format!("{stem}-{}.{ext}", k + 1))
 }
 
-/// Whether F9 was pressed since the last asking, or is held now: at 3 fps
-/// a quick press falls between two presents.
-fn key_pressed() -> bool {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F9};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_F9, VK_F10};
+
+/// Whether `key` was pressed since the last asking, or is held now: at 3
+/// fps a quick press falls between two presents.
+fn key_pressed(key: windows_sys::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: plain call.
-    (unsafe { GetAsyncKeyState(i32::from(VK_F9)) } as u16) & 0x8001 != 0
+    (unsafe { GetAsyncKeyState(i32::from(key)) } as u16) & 0x8001 != 0
 }
 
-/// Whether F9 is held now.
-fn key_down() -> bool {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F9};
+/// Whether `key` is held now.
+fn key_down(key: windows_sys::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: plain call.
-    (unsafe { GetAsyncKeyState(i32::from(VK_F9)) } as u16) & 0x8000 != 0
+    (unsafe { GetAsyncKeyState(i32::from(key)) } as u16) & 0x8000 != 0
 }
 
-fn write(path: &std::path::Path, spans: &[Span], threads: &[(u32, String)], totals: &[(&'static str, u64, f64)], frames: u64) {
+fn write(path: &std::path::Path, spans: &[Span], threads: &[(u32, String)], totals: &[(&'static str, u64, f64)], counts: &[(&'static str, u64)], frames: u64) {
     use std::io::Write;
     let file = match std::fs::File::create(path) {
         Ok(f) => f,
@@ -304,10 +360,12 @@ fn write(path: &std::path::Path, spans: &[Span], threads: &[(u32, String)], tota
             .collect();
         writeln!(
             out,
-            "{{\"displayTimeUnit\":\"ms\",\"otherData\":{{\"dropped\":{},\"frames\":{frames},\"min_us\":{},\"census\":{},\"totals\":{{{}}}}},\"traceEvents\":[",
+            "{{\"displayTimeUnit\":\"ms\",\"otherData\":{{\"dropped\":{},\"frames\":{frames},\"min_us\":{},\"census\":{},\"load\":{},\"counts\":{{{}}},\"totals\":{{{}}}}},\"traceEvents\":[",
             DROPPED.load(Ordering::Relaxed),
             min_us(),
             crate::watch::census_json(),
+            LOAD.load(Ordering::Relaxed),
+            counts.iter().map(|(n, v)| format!("\"{n}\":{v}")).collect::<Vec<_>>().join(","),
             totals.join(",")
         )?;
         for (n, name) in threads {

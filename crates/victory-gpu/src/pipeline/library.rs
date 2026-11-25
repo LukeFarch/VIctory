@@ -511,9 +511,11 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    let _z = crate::trace::zone("pipeline: load or make");
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        let _m = crate::trace::zone("pipeline: made (driver compile)");
         return create();
     };
     let began = std::time::Instant::now();
@@ -540,7 +542,10 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        {
+            let _m = crate::trace::zone("pipeline: made (driver compile)");
+            create()?
+        }
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {

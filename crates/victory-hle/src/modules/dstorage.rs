@@ -922,6 +922,13 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
+    #[cfg(windows)]
+    let _z = victory_gpu::trace_zone("DirectStorage: file read");
+    #[cfg(windows)]
+    {
+        victory_gpu::trace_count("DirectStorage: requests read", 1);
+        victory_gpu::trace_count("DirectStorage: bytes read", out.len() as u64);
+    }
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
