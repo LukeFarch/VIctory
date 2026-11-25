@@ -530,7 +530,7 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
+        if dred_part("device") {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
@@ -1212,6 +1212,25 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
+}
+
+/// The two things device-removed data adds, apart: `VICTORY_D3D12_DRED=device`
+/// asks the device for breadcrumbs and page faults and records no marker
+/// commands; `=markers` records the marker commands on a device made as
+/// without it. Any other value: both. (Run E1b: the first room's walls
+/// were drawn with it on and not without, twice; this says which half.)
+fn dred_part(part: &str) -> bool {
+    dred_on() && std::env::var("VICTORY_D3D12_DRED").is_ok_and(|v| v != ["markers", "device"][usize::from(part == "markers")])
+}
+
+/// `VICTORY_FRAME_SLEEP_MS`: the frame thread sleeps this long before each
+/// present, to tell what time alone changes from what a switch changes.
+pub(crate) fn frame_sleep() {
+    static MS: OnceLock<u64> = OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("VICTORY_FRAME_SLEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
 }
 
 /// Indirect mesh dispatches since the last frame line: the largest group
@@ -5153,7 +5172,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        if !dred_part("markers") {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -6355,6 +6374,7 @@ impl Host {
         frame: u64,
         rect: Option<[u32; 4]>,
     ) -> Option<bool> {
+        frame_sleep();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
