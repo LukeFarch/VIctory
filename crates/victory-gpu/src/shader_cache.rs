@@ -129,10 +129,22 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let _z = crate::trace::zone("shader: from the cache or translated");
     let translate = |c: &[u8]| {
         let _t = crate::trace::zone("shader: translated (cache miss)");
+        // (the hash a run's log names it by, for the switches that pick programs by it)
+        victory_shader::emit::set_container_hash(&blake3::hash(c).to_hex()[..16]);
         victory_shader::emit::translate(c).map_err(|e| e.to_string())
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            // A container `VICTORY_WAVE_WIDE_ONLY` names is translated another way: its own
+            // key, so the switch translates only those again (the rest stay cached).
+            let hash = blake3::hash(container).to_hex();
+            if victory_shader::emit::wave_wide_listed(&hash[..16]) {
+                let key = *blake3::hash(&[&build()[..], b"VICTORY_WAVE_WIDE_ONLY"].concat()).as_bytes();
+                cached(cache, &key, container, translate)
+            } else {
+                cached(cache, build(), container, translate)
+            }
+        }
         None => translate(container),
     }
 }
