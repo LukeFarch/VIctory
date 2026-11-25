@@ -307,6 +307,8 @@ pub(crate) fn ready(
     let own = quarantined
         && *BY_ADDRESS.get_or_init(|| std::env::var_os("VICTORY_QUARANTINE_OWN_ADDRESS").is_none_or(|v| v != "0"))
         && list.first_use(OWNED);
+    let mut _z = crate::trace::zone("memory: every numbered copy refreshed and declared (by-address pass)");
+    _z.arg(if first_read || first_write { m.copies.len() as u64 } else { (m.copies.len() - numbered) as u64 });
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {

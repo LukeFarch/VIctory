@@ -52,6 +52,9 @@ struct Journal {
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
     ahead_asked: u64,
+    /// Of pages the kernel found written: which of their 4 KiB pieces, by
+    /// asking, the latest few ([`merge_4k`]).
+    pieces: BTreeMap<usize, [(u64, u16); PIECE_HISTORY]>,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
@@ -64,8 +67,71 @@ static JOURNAL: std::sync::RwLock<Journal> = std::sync::RwLock::new(Journal {
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
+    pieces: BTreeMap::new(),
     kept: false,
 });
+
+/// Askings of a page's 4 KiB pieces kept ([`Journal::pieces`]).
+const PIECE_HISTORY: usize = 4;
+
+/// Whether quarantine merges read only the 4 KiB pieces of a page the
+/// kernel found written (`VICTORY_MERGE_4K=1`; off by default). The
+/// journal is kept by 64 KiB page, and a title write of a few bytes made a
+/// merge read and compare all 64 KiB: 2,240 merges a frame in run 15's
+/// prison profile, 618 ms summed. The kernel answers by 4 KiB page; those
+/// answers are kept too, and a merge takes the pieces written since its
+/// last (the whole page where the journal knows less: a write the guards
+/// or we noted, or an older asking than it keeps).
+pub(crate) fn merge_4k() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_4K").is_some_and(|v| v == "1"))
+}
+
+/// Notes the kernel's answer `at` (a written 4 KiB page) under `now`.
+fn note_piece(j: &mut Journal, at: usize, now: u64) {
+    if !merge_4k() {
+        return;
+    }
+    let bit = 1u16 << ((at % PAGE) / KERNEL_PAGE);
+    let hist = j.pieces.entry(at / PAGE).or_insert([(0, 0); PIECE_HISTORY]);
+    if hist[0].0 == now {
+        hist[0].1 |= bit;
+        return;
+    }
+    hist.rotate_right(1);
+    hist[0] = (now, bit);
+}
+
+/// The 4 KiB pieces of page `page` written after asking `since`, as a
+/// mask (bit `k`: bytes `k * 4096..(k + 1) * 4096` of the page); all of
+/// them where the journal cannot tell.
+pub(crate) fn pieces_since(page: usize, since: u64) -> u16 {
+    let j = journal_shared();
+    let last = j.written.get(&page).copied().unwrap_or(0);
+    if last <= since {
+        return 0;
+    }
+    let Some(hist) = j.pieces.get(&page) else {
+        return u16::MAX;
+    };
+    // A later write than the kernel's answers (the guards', ours): all.
+    if hist[0].0 < last {
+        return u16::MAX;
+    }
+    let mut mask = 0;
+    for &(asked, bits) in hist {
+        if asked == 0 {
+            // Fewer askings than kept: every one since is here.
+            return mask;
+        }
+        if asked <= since {
+            return mask;
+        }
+        mask |= bits;
+    }
+    // Older askings than kept may be after `since`.
+    u16::MAX
+}
 
 /// The journal, alone.
 fn journal() -> std::sync::RwLockWriteGuard<'static, Journal> {
@@ -356,8 +422,9 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     }
     let now = j.ahead_asked;
     for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+        let at = j.found[k];
+        j.written.insert(at / PAGE, now);
+        note_piece(j, at, now);
     }
     true
 }
@@ -575,6 +642,9 @@ fn writes_unlocked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<
         for page in found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
             j.written.insert(page, now);
         }
+        for &at in &found[..count] {
+            note_piece(j, at, now);
+        }
         if full {
             for page in first..last {
                 j.written.insert(page, now);
@@ -654,6 +724,10 @@ fn writes_locked(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(u
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
+    }
+    for k in 0..count {
+        let at = j.found[k];
+        note_piece(j, at, now);
     }
     if full {
         for page in first..last {

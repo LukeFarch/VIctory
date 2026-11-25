@@ -118,6 +118,10 @@ struct Owned {
 /// were kept).
 pub(crate) static OWNED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Since the start (`VICTORY_MERGE_4K=1`): quarantine merges made by 4 KiB
+/// piece, and the pieces they read (of 16 a page).
+pub(crate) static MERGE_4K: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether ranges quarantined passes write are left to the card
 /// (`VICTORY_QUARANTINE_OWN=0`: not, as before, only counted).
 fn own() -> bool {
@@ -2041,6 +2045,7 @@ impl Shadow {
         let mut kept: Vec<(usize, usize)> = Vec::new();
         for (&page, o) in owned.range_mut(range) {
             if written.get(&page).is_some_and(|&w| w > o.asked) {
+                let since = o.asked;
                 o.asked = now;
                 if !merge() {
                     OWNED[1].fetch_add(1, Ordering::Relaxed);
@@ -2052,7 +2057,26 @@ impl Shadow {
                     Some(before) => {
                         let _m = crate::trace::zone("refresh: merge a title write into a quarantined page");
                         OWNED[1].fetch_add(1, Ordering::Relaxed);
-                        OWNED[4].fetch_add(self.merge_title(o.lo, before) as u64, Ordering::Relaxed);
+                        let mask = if crate::watch::merge_4k() { crate::watch::pieces_since(page, since) } else { u16::MAX };
+                        let merged = if mask == u16::MAX {
+                            self.merge_title(o.lo, before)
+                        } else {
+                            // Only the 4 KiB pieces the kernel found written.
+                            let mut merged = 0;
+                            for k in 0..16 {
+                                if mask & (1 << k) == 0 {
+                                    continue;
+                                }
+                                let (a, b) = ((page * PAGE + k * 4096).max(o.lo), (page * PAGE + (k + 1) * 4096).min(o.hi));
+                                if a < b {
+                                    merged += self.merge_title(a, &mut before[a - o.lo..b - o.lo]);
+                                }
+                            }
+                            MERGE_4K[0].fetch_add(1, Ordering::Relaxed);
+                            MERGE_4K[1].fetch_add(u64::from(mask.count_ones()), Ordering::Relaxed);
+                            merged
+                        };
+                        OWNED[4].fetch_add(merged as u64, Ordering::Relaxed);
                     }
                     // The first time: copied whole this once (the card's
                     // bytes in it are lost until its passes run again), and

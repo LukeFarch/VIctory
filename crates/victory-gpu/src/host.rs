@@ -7076,10 +7076,12 @@ impl Meter {
                 let [kept, wrote, idle, over, merged, whole] = crate::shadow::OWNED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
                 if kept + wrote + idle + over + whole > 0 {
                     tracing::info!(
-                        "quarantined pages since the last such line: {} MB left as the card made them at refreshes; {wrote} title writes merged ({} KB), {whole} copied whole once (first title write); {idle} given back with no pass lately; {} MB re-uploaded over them (VICTORY_QUARANTINE_OWN=0)",
+                        "quarantined pages since the last such line: {} MB left as the card made them at refreshes; {wrote} title writes merged ({} KB), {whole} copied whole once (first title write); {idle} given back with no pass lately; {} MB re-uploaded over them (VICTORY_QUARANTINE_OWN=0); since the start, {} merges by 4 KiB piece reading {} pieces (VICTORY_MERGE_4K=1)",
                         kept >> 20,
                         merged >> 10,
-                        over >> 20
+                        over >> 20,
+                        crate::shadow::MERGE_4K[0].load(Ordering::Relaxed),
+                        crate::shadow::MERGE_4K[1].load(Ordering::Relaxed)
                     );
                 }
             }
