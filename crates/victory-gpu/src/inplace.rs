@@ -275,9 +275,97 @@ struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// Where each 64 KiB of a section is shown: by section and offset, the
+    /// addresses ([`twins`]). Only views that begin on such a boundary in
+    /// both.
+    shown: BTreeMap<(usize, u64), Vec<usize>>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> =
+    Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new(), shown: BTreeMap::new() });
+
+/// How many 64 KiB pieces of sections are shown at more than one address
+/// now: while none is, [`twins`] has nothing to say and takes no lock.
+static SHOWN_TWICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A piece shown at more addresses than this has no twins: the page a
+/// title maps wherever it has nothing to show is at thousands, and a write
+/// to it means nothing to any copy.
+const MOST_TWINS: usize = 32;
+
+const PIECE: usize = crate::watch::PAGE;
+
+impl Views {
+    fn show(&mut self, at: usize, len: usize, section: usize, offset: u64) {
+        if !at.is_multiple_of(PIECE) || !(offset as usize).is_multiple_of(PIECE) {
+            return;
+        }
+        for k in 0..len / PIECE {
+            let at = at + k * PIECE;
+            let shown = self.shown.entry((section, offset + (k * PIECE) as u64)).or_default();
+            if !shown.contains(&at) {
+                shown.push(at);
+                if shown.len() == 2 {
+                    SHOWN_TWICE.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn hide(&mut self, at: usize, len: usize, section: usize, offset: u64) {
+        if !at.is_multiple_of(PIECE) || !(offset as usize).is_multiple_of(PIECE) {
+            return;
+        }
+        for k in 0..len / PIECE {
+            let key = (section, offset + (k * PIECE) as u64);
+            let Some(shown) = self.shown.get_mut(&key) else {
+                continue;
+            };
+            let before = shown.len();
+            shown.retain(|&a| a != at + k * PIECE);
+            if before >= 2 && shown.len() < 2 {
+                SHOWN_TWICE.fetch_sub(1, Ordering::Relaxed);
+            }
+            if shown.is_empty() {
+                self.shown.remove(&key);
+            }
+        }
+    }
+}
+
+/// The other addresses that show the same bytes as each 64 KiB piece of
+/// `[start, end)` (whole pieces): `each(piece, twin)` for every one, both
+/// addresses. The title shows one physical page at several addresses, and
+/// a write through one of them changes what a host copy took through
+/// another (`crate::watch`'s guard).
+pub(crate) fn twins(start: usize, end: usize, mut each: impl FnMut(usize, usize)) {
+    if SHOWN_TWICE.load(Ordering::Relaxed) == 0 || start >= end {
+        return;
+    }
+    let v = views();
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    let from = first.unwrap_or(start);
+    for (&base, &(len, section, offset)) in v.views.range(from..end) {
+        if !base.is_multiple_of(PIECE) || !(offset as usize).is_multiple_of(PIECE) {
+            continue;
+        }
+        let (a, b) = (base.max(start) / PIECE, (base + len).min(end).div_ceil(PIECE));
+        for piece in a..b {
+            let piece = piece * PIECE;
+            let Some(shown) = v.shown.get(&(section, offset + (piece - base) as u64)) else {
+                continue;
+            };
+            if shown.len() < 2 || shown.len() > MOST_TWINS {
+                continue;
+            }
+            for &twin in shown {
+                if twin != piece {
+                    each(piece, twin);
+                }
+            }
+        }
+    }
+}
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -294,7 +382,16 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    {
+        let mut v = views();
+        if let Some((len, section, offset)) = v.views.insert(at, (len, section, offset)) {
+            v.hide(at, len, section, offset);
+        }
+        v.show(at, len, section, offset);
+    }
+    // The new view is writable: what it shows can change under the copies
+    // taken through its twins.
+    crate::watch::view_mapped(at, len);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -309,7 +406,9 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        if let Some((len, section, offset)) = v.views.remove(&base) {
+            v.hide(base, len, section, offset);
+        }
     }
 }
 
@@ -1048,6 +1147,31 @@ mod tests {
     }
 
     /// What the runtime forgets when memory is mapped anew.
+    #[test]
+    fn twins_are_the_other_addresses_of_the_same_bytes() {
+        let (a, b) = (0x7_5000_0000usize, 0x7_6000_0000usize);
+        let twins_of = |start: usize, end: usize| {
+            let mut out = Vec::new();
+            twins(start, end, |piece, twin| out.push((piece, twin)));
+            out
+        };
+        // Four pieces of section 91 at `a`; its third and fourth again at `b`.
+        title_memory_view(a, 4 * K64, 91, 0);
+        assert!(twins_of(a, a + 4 * K64).is_empty());
+        title_memory_view(b, 2 * K64, 91, 2 * K64 as u64);
+        assert_eq!(twins_of(a, a + 4 * K64), [(a + 2 * K64, b), (a + 3 * K64, b + K64)]);
+        assert_eq!(twins_of(b + K64, b + 2 * K64), [(b + K64, a + 3 * K64)]);
+        // From the middle of a view on, and nothing for another section.
+        assert_eq!(twins_of(a + 3 * K64, a + 4 * K64), [(a + 3 * K64, b + K64)]);
+        title_memory_view(b + 2 * K64, K64, 92, 0);
+        assert!(twins_of(b + 2 * K64, b + 3 * K64).is_empty());
+        // A view that goes takes its addresses with it.
+        views_gone(b, K64);
+        assert!(twins_of(a, a + 4 * K64).is_empty());
+        views_gone(a, 4 * K64);
+        views_gone(b + 2 * K64, K64);
+    }
+
     #[test]
     fn remapped_memory_forgets_its_views() {
         let at = 0x7_4000_0000usize;
