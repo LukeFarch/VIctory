@@ -349,7 +349,8 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// Device method 0x1b8: `(this, base, count, changes, riid, out)`, a
 /// pipeline like `base` with `count` changes to its state (the title asks
 /// it for `ID3D12PipelineState`, with a blend state as the change:
-/// [`pipeline::create_variant`]). `VICTORY_DEVICE_1B8=0`: answered
+/// [`pipeline::create_variant`]; `VICTORY_DEVICE_1B8=keep` makes it
+/// with the base's own blend state). `VICTORY_DEVICE_1B8=0`: answered
 /// E_NOTIMPL, as before. The first 8 calls are logged, and up to 64 not
 /// understood with the 64 bytes behind its arguments.
 extern "system" fn probe_1b8(this: This, a: usize, b: usize, c: usize, iid: *const Iid, out: *mut This) -> HRESULT {

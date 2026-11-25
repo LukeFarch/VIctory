@@ -1261,19 +1261,41 @@ pub(crate) fn create_variant(base: This, count: u32, changes: usize, iid: *const
         return None;
     }
     // SAFETY: plain data of its size.
-    let blend: D3D12_BLEND_DESC = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) };
+    let mut blend: D3D12_BLEND_DESC = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) };
     let p = pipeline(base);
+    // `VICTORY_DEVICE_1B8=keep`: the variant keeps the base's blend state
+    // (an A/B: whether a regression comes from the blend state asked for,
+    // or from the title's taking another path once variants exist).
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let keep = *KEEP.get_or_init(|| std::env::var_os("VICTORY_DEVICE_1B8").is_some_and(|v| v == "keep"));
+    let rt = blend.RenderTarget[0];
+    tracing::info!(
+        base = ?base,
+        shaders = ?p.shaders,
+        precompiled = p.variants.is_some(),
+        keep,
+        blend = format_args!(
+            "on {} src {} dst {} op {} src_a {} dst_a {} op_a {} mask {:#x} independent {}",
+            rt.BlendEnable.0, rt.SrcBlend.0, rt.DestBlend.0, rt.BlendOp.0, rt.SrcBlendAlpha.0,
+            rt.DestBlendAlpha.0, rt.BlendOpAlpha.0, rt.RenderTargetWriteMask, blend.IndependentBlendEnable.0
+        ),
+        "pipeline variant"
+    );
     if let Some(v) = p.variants.as_ref() {
         let variants = Variants {
             regs: v.regs.clone(),
             layout: v.layout.clone(),
-            blend: Some(blend),
+            blend: (!keep).then_some(blend),
             made: Mutex::new(HashMap::new()),
         };
         return Some(hand_out_with(p.shaders.clone(), None, Some(Box::new(variants)), iid, out));
     }
     // None for a compute or plain-description pipeline: nothing to blend.
-    let graphics = Box::new(p.host.graphics.as_ref()?.with_blend(blend));
+    let g = p.host.graphics.as_ref()?;
+    if keep {
+        blend = g.blend();
+    }
+    let graphics = Box::new(g.with_blend(blend));
     Some(hand_out_with(p.shaders.clone(), Some(graphics), None, iid, out))
 }
 

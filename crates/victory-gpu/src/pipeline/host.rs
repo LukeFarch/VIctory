@@ -276,6 +276,10 @@ fn precompiled_inputs(layout: &[u8]) -> Vec<(CString, D3D12_INPUT_ELEMENT_DESC)>
 }
 
 impl GraphicsState {
+    pub(crate) fn blend(&self) -> D3D12_BLEND_DESC {
+        self.blend
+    }
+
     /// The same state with another blend state (device method 0x1b8).
     pub(crate) fn with_blend(&self, blend: D3D12_BLEND_DESC) -> GraphicsState {
         let names = self.names.clone();
