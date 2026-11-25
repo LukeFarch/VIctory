@@ -1375,6 +1375,34 @@ fn resident_write(from: usize, to: usize, why: usize) -> usize {
     written
 }
 
+/// [`resident`]: the runtime now shows bytes `[offset, offset + len)` of
+/// `section` at another address too (a new view). A kept block of those
+/// bytes would have a twin the title can write through without a fault,
+/// and its kept bytes would then be written in over the title's newer
+/// ones at the first touch of the old address (runs 7 and 8, at the
+/// diner's teardown, as the title moved its pages): written in now,
+/// before the runtime returns the new view to the title.
+pub(crate) fn resident_shown(section: usize, offset: u64, len: usize) {
+    use std::sync::atomic::Ordering;
+    if !resident() || RESIDENT_N.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let _g = guards();
+    let mut r = resident_lock();
+    let end = offset.saturating_add(len as u64);
+    let blocks: Vec<usize> = r.iter().filter(|(_, k)| k.section.0 == section && k.section.1 < end && k.section.1 + BLOCK as u64 > offset).map(|(&b, _)| b).collect();
+    for b in blocks {
+        let Some(kept) = r.remove(&b) else { continue };
+        if still_kept(b) {
+            write_kept(b, &kept);
+            resident_stat(5, 1);
+        } else {
+            resident_stat(6, 1);
+        }
+    }
+    RESIDENT_N.store(r.len(), Ordering::Release);
+}
+
 /// [`resident`]: our kernel read of `[at, at + len)` failed; kept blocks
 /// there are written in (true if any was: the read is worth trying again).
 pub(crate) fn resident_open(at: usize, len: usize) -> bool {

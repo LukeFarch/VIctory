@@ -383,6 +383,8 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         }
         v.show(at, len, section, offset);
     }
+    // Kept blocks of these bytes get a twin here: written in first.
+    crate::watch::resident_shown(section, offset, len);
     // The new view is writable: what it shows can change under the copies
     // taken through its twins.
     crate::watch::view_mapped(at, len);
