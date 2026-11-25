@@ -104,12 +104,20 @@ fn note_bits(j: &mut Journal, page: usize, bit: u16, now: u64) {
         return;
     }
     let hist = j.pieces.entry(page).or_insert([(0, 0); PIECE_HISTORY]);
-    if hist[0].0 == now {
-        hist[0].1 |= bit;
+    // Askings are not always noted in order (an ahead asking's number can
+    // be older than a later asking's): kept by number, not by arrival.
+    if let Some(e) = hist.iter_mut().find(|e| e.0 == now) {
+        e.1 |= bit;
         return;
     }
-    hist.rotate_right(1);
-    hist[0] = (now, bit);
+    // The oldest (or an empty slot) gives way, unless all are newer.
+    let oldest = (0..PIECE_HISTORY).min_by_key(|&k| hist[k].0).unwrap_or(0);
+    if hist[oldest].0 != 0 && hist[oldest].0 > now {
+        // Older than everything kept: `pieces_since` answers all for any
+        // `since` before the oldest kept, which covers this one.
+        return;
+    }
+    hist[oldest] = (now, bit);
 }
 
 /// The 4 KiB pieces of page `page` written after asking `since`, as a
@@ -125,22 +133,14 @@ pub(crate) fn pieces_since(page: usize, since: u64) -> u16 {
         return u16::MAX;
     };
     // A later write than the kernel's answers (the guards', ours): all.
-    if hist[0].0 < last {
+    if hist.iter().all(|e| e.0 < last) {
         return u16::MAX;
     }
-    let mut mask = 0;
-    for &(asked, bits) in hist {
-        if asked == 0 {
-            // Fewer askings than kept: every one since is here.
-            return mask;
-        }
-        if asked <= since {
-            return mask;
-        }
-        mask |= bits;
+    // Every kept slot after `since`: older askings than kept may be too.
+    if hist.iter().all(|e| e.0 != 0 && e.0 > since) {
+        return u16::MAX;
     }
-    // Older askings than kept may be after `since`.
-    u16::MAX
+    hist.iter().filter(|e| e.0 > since).fold(0, |mask, e| mask | e.1)
 }
 
 /// The journal, alone.
