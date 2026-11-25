@@ -6975,7 +6975,10 @@ impl Meter {
             }
         };
         let lighting = ["", " | lighting FED", " | lighting PART", " | lighting UNFED"][usize::from(LIGHTING.load(Ordering::Relaxed)).min(3)];
-        let waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed);
+        // Textures due for upload (written and not uploaded yet) and how many
+        // frames the oldest has waited; the queue's other slots are only
+        // waiting for their memory or their next look.
+        let [due, oldest] = [1, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
         let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
         let switches: Vec<&str> = [
             ("VICTORY_CARD_RESIDENT", "resident"),
@@ -6990,7 +6993,7 @@ impl Meter {
         .map(|(_, tag)| tag)
         .collect();
         let text = format!(
-            "J | GTA 6 | {fps:.1} fps {ms:.0} ms | CPU {cpu:.0} (copies {copy_ms:.0}, textures {texture_ms:.0}) GPU {gpu:.0} copy-back {back_ms:.0} ms | {draws:.0} draws | {private_gb:.1} GB{lighting} | textures waiting {waiting}{}",
+            "J | GTA 6 | {fps:.1} fps {ms:.0} ms | CPU {cpu:.0} (copies {copy_ms:.0}, textures {texture_ms:.0}) GPU {gpu:.0} copy-back {back_ms:.0} ms | {draws:.0} draws | {private_gb:.1} GB{lighting} | textures due {due} (oldest {oldest} frames){}",
             if switches.is_empty() { String::new() } else { format!(" | {}", switches.join(" ")) }
         );
         let mut text: Vec<u16> = text.encode_utf16().collect();
