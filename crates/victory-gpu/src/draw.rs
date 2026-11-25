@@ -1660,8 +1660,21 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
+        // While catching up: `VICTORY_TEXTURE_CATCHUP_MB` and
+        // `VICTORY_TEXTURE_CATCHUP_MS` widen the bytes and the time a pass
+        // may spend (256 MB, 1500 ms unless set), to drain a long queue
+        // faster at the cost of longer frames while it lasts.
+        static CATCHUP: std::sync::OnceLock<(u64, std::time::Duration)> = std::sync::OnceLock::new();
+        let catchup = *CATCHUP.get_or_init(|| {
+            let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+            (
+                number("VICTORY_TEXTURE_CATCHUP_MB").map_or(PER_FRAME_CATCHING_UP, |mb| mb.clamp(64, 1024) << 20),
+                number("VICTORY_TEXTURE_CATCHUP_MS")
+                    .map_or(SPAN_CATCHING_UP, |ms| std::time::Duration::from_millis(ms.clamp(250, 5000))),
+            )
+        });
         let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
-            (PER_FRAME_CATCHING_UP, SPAN_CATCHING_UP)
+            catchup
         } else {
             (PER_FRAME, SPAN)
         };
@@ -1714,9 +1727,16 @@ impl State {
                     // dark surface in the PNG to the texture not there.
                     #[cfg(feature = "diagnostics")]
                     crate::capture::op(std::ptr::from_ref(list) as usize, || {
+                        // desc[0] is the view's DXGI format; the resource
+                        // words carry its kind, size and mips. A view with
+                        // address 0 points at no memory at all (a title
+                        // placeholder), not at a texture still streaming in.
+                        let what = if address == 0 { "TEXTURE NULLVIEW" } else { "TEXTURE BLANK" };
                         format!(
-                            "TEXTURE BLANK slot {index} unmapped: memory {address:#x}+{len:#x} T# {:08x?}",
-                            &desc[..desc.len().min(8)]
+                            "{what} slot {index} not mapped: memory {address:#x}+{len:#x} dxgi_format {} resource {:x?} view {:x?}",
+                            desc[0],
+                            &resource[..resource.len().min(10)],
+                            &desc[..desc.len().min(12)]
                         )
                     });
                     // Streamed out: what the slot showed is let go.
@@ -1730,8 +1750,9 @@ impl State {
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(std::ptr::from_ref(list) as usize, || {
                             format!(
-                                "TEXTURE PART slot {index} waits for more: {mapped:#x} of memory {address:#x}+{len:#x} mapped, T# {:08x?}",
-                                &desc[..desc.len().min(8)]
+                                "TEXTURE PART slot {index} waits for more: {mapped:#x} of memory {address:#x}+{len:#x} mapped, dxgi_format {} resource {:x?}",
+                                desc[0],
+                                &resource[..resource.len().min(10)]
                             )
                         });
                         host.texture_slot_later(index, write, frame, most);
