@@ -924,6 +924,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .file;
     let started = std::time::Instant::now();
     let mut done = 0;
+    let mut refused = 0;
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
     let result = loop {
         if done == out.len() {
             break Ok(());
@@ -931,6 +933,27 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
+            // The kernel found the destination read-only: the GPU side
+            // guarded it again after it was opened (a copy taken through
+            // any view of its pages guards them all), and the kernel does
+            // not fault into the guard. Opened again and read again; the
+            // request failed here before, and the title broke on it.
+            Err(error) if refused < 64 && matches!(error.raw_os_error(), Some(1784 | 998)) => {
+                refused += 1;
+                let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        offset = request.offset,
+                        len = out.len(),
+                        times = n,
+                        "dstorage: the kernel refused a guarded destination; opened and read again"
+                    );
+                }
+                victory_gpu::kernel_will_write(out.as_ptr() as usize, out.len());
+                if refused > 4 {
+                    std::thread::yield_now();
+                }
+            }
             Err(error) => break Err(from_win32(&error)),
         }
     };
@@ -962,7 +985,10 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        // As above: this view of the pages may be guarded too.
+        let bytes = window.bytes();
+        victory_gpu::kernel_will_write(bytes.as_ptr() as usize, bytes.len());
+        return fill(bytes).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
