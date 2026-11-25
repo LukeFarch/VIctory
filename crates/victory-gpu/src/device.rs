@@ -346,36 +346,48 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device method 0x1b8, a console method of unknown purpose: answered
-/// E_NOTIMPL as an unwritten one is, with its first four arguments and
-/// the 64 bytes behind each that points at readable memory logged (the
-/// first 8 calls), so that what it asks can be read.
-extern "system" fn probe_1b8(_: This, a: usize, b: usize, c: usize, d: usize) -> HRESULT {
+/// Device method 0x1b8, a console pipeline creator (the title asks it for
+/// `ID3D12PipelineState`): `(this, a, b, desc?, riid, out)`, whose
+/// arguments are not known. Its first calls are logged with the 64 bytes
+/// behind each argument. Where one of them reads as a whole pipeline
+/// stream description ([`pipeline::is_stream`]: rdx, then r9) it is made
+/// as `CreatePipelineState` would (`VICTORY_DEVICE_1B8=0`: never);
+/// otherwise it is answered E_NOTIMPL, as before.
+extern "system" fn probe_1b8(this: This, a: usize, b: usize, c: usize, iid: *const Iid, out: *mut This) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
-    if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
-        let behind = |p: usize| -> String {
-            #[cfg(windows)]
-            {
-                let mut bytes = [0u8; 64];
-                if p >= 0x10000 && crate::host::read_into(p as *const u8, &mut bytes) {
-                    return bytes.iter().map(|b| format!("{b:02x}")).collect();
-                }
+    let behind = |p: usize| -> String {
+        #[cfg(windows)]
+        {
+            let mut bytes = [0u8; 64];
+            if p >= 0x10000 && crate::host::read_into(p as *const u8, &mut bytes) {
+                return bytes.iter().map(|b| format!("{b:02x}")).collect();
             }
-            let _ = p;
-            String::new()
-        };
+        }
+        let _ = p;
+        String::new()
+    };
+    #[cfg(windows)]
+    let stream = std::env::var_os("VICTORY_DEVICE_1B8")
+        .is_none_or(|v| v != "0")
+        .then(|| [a, c].into_iter().find(|&p| pipeline::is_stream(p)))
+        .flatten();
+    #[cfg(not(windows))]
+    let stream: Option<usize> = None;
+    if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
         tracing::warn!(
-            args = format_args!("{a:#x} {b:#x} {c:#x} {d:#x}"),
+            args = format_args!("{a:#x} {b:#x} {c:#x}"),
             at_a = %behind(a),
-            at_b = %behind(b),
             at_c = %behind(c),
-            at_d = %behind(d),
+            as_stream = ?stream.map(|p| if p == a { "rdx" } else { "r9" }),
             caller = crate::object::caller(),
-            "device method 0x1b8 (unknown) called; answered E_NOTIMPL"
+            "device method 0x1b8 (a pipeline creator) called"
         );
     }
-    E_NOTIMPL
+    match stream {
+        Some(desc) => pipeline::create_stream(this, desc as *const pipeline::StreamDesc, iid, out),
+        None => E_NOTIMPL,
+    }
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
