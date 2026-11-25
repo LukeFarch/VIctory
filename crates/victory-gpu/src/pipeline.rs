@@ -856,7 +856,9 @@ fn missed(slot: usize, why: &str) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(slot == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
-    if calls <= 4 || calls.is_power_of_two() {
+    // A geometry pipeline's miss is always said: there are few, and each
+    // is a pass the frame goes without.
+    if calls <= 4 || calls.is_power_of_two() || why.contains("stage Es") || why.contains("geometry") {
         tracing::warn!(slot = format_args!("{slot:#x}"), calls, why, "a precompiled pipeline is not made: the title goes without it");
     }
 }
@@ -997,15 +999,22 @@ pub(crate) extern "system" fn create_precompiled_graphics(
         };
         let mut vertex = None;
         let mut pixel = None;
-        for at in [5, 9] {
+        let mut geometry = None;
+        // Two programs for sure; a third (a geometry pipeline's) may follow
+        // them where the description is that long.
+        let more = words::<17>(desc);
+        let third = more.as_ref().filter(|m| precompiled(&m[..], 13).is_some());
+        let programs = [5, 9].map(|at| (&w[..], at)).into_iter().chain(third.map(|m| (&m[..], 13)));
+        for (w, at) in programs {
             if w[at] == 0 {
                 continue;
             }
-            match precompiled(&w, at) {
+            match precompiled(w, at) {
                 Some((stage, c)) if stage == "Vs" => vertex = Some(c),
                 Some((stage, c)) if stage == "Ps" => pixel = Some(c),
+                Some((stage, c)) if stage == "Gs" => geometry = Some(c),
                 Some((stage, _)) => {
-                    missed(0x1c8, &format!("code found in a container of stage {stage}"));
+                    missed(0x1c8, &format!("code found in a container of stage {stage} (word {at}, description {w:x?})"));
                     return E_NOTIMPL;
                 }
                 None => {
@@ -1015,11 +1024,20 @@ pub(crate) extern "system" fn create_precompiled_graphics(
             }
         }
         let Some(vertex) = vertex else {
-            missed(0x1c8, &format!("no vertex program (description {:x?})", &w[..13]));
+            let with = if geometry.is_some() { " beside the geometry program" } else { "" };
+            let all = more.as_ref().map_or(&w[..], |m| &m[..]);
+            missed(0x1c8, &format!("no vertex program{with} (description {all:x?})"));
             return E_NOTIMPL;
         };
         let mut shaders = vec![shader("vertex", &vertex)];
         shaders.extend(pixel.map(|p| shader("pixel", &p)));
+        if let Some(g) = geometry {
+            let g = shader("geometry", &g);
+            // Each one named: these are few, and a missing one empties
+            // what the title voxelizes.
+            tracing::info!(slot = "0x1c8", geometry = %g.hash, vertex = %shaders[0].hash, word_13 = third.is_some(), "precompiled pipeline with a geometry program");
+            shaders.push(g);
+        }
         let hashes: Vec<&str> = shaders.iter().map(|s| s.hash.as_str()).collect();
         if crate::precompiled::skipped(&hashes) {
             missed(0x1c8, "VICTORY_PRECOMPILED_SKIP/ONLY");
