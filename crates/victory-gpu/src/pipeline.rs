@@ -1111,8 +1111,11 @@ pub(crate) extern "system" fn create_precompiled_graphics(
         let mut vertex = None;
         let mut pixel = None;
         let mut geometry = None;
-        // Two programs for sure; a third (a geometry pipeline's) may follow
-        // them where the description is that long.
+        let mut mesh = None;
+        // Two programs for sure; a third follows them at word 13 in a mesh
+        // pipeline's description (a mesh program there, the pixel program
+        // at word 5 and no vertex program: run L1), and a geometry
+        // pipeline's is looked for there too.
         let more = words::<17>(desc);
         let third = more.as_ref().filter(|m| precompiled(&m[..], 13).is_some());
         let programs = [5, 9].map(|at| (&w[..], at)).into_iter().chain(third.map(|m| (&m[..], 13)));
@@ -1124,6 +1127,7 @@ pub(crate) extern "system" fn create_precompiled_graphics(
                 Some((stage, c)) if stage == "Vs" => vertex = Some(c),
                 Some((stage, c)) if stage == "Ps" => pixel = Some(c),
                 Some((stage, c)) if stage == "Gs" => geometry = Some(c),
+                Some((stage, c)) if stage == "Ms" => mesh = Some(c),
                 Some((stage, _)) => {
                     missed(0x1c8, &format!("code found in a container of stage {stage} (word {at}, description {w:x?})"));
                     return E_NOTIMPL;
@@ -1134,7 +1138,16 @@ pub(crate) extern "system" fn create_precompiled_graphics(
                 }
             }
         }
-        let Some(vertex) = vertex else {
+        if mesh.is_some() && (vertex.is_some() || geometry.is_some()) {
+            missed(0x1c8, "a mesh program beside a vertex or geometry program");
+            return E_NOTIMPL;
+        }
+        let first = match (mesh, vertex) {
+            (Some(m), _) => Some(shader("mesh", &m)),
+            (None, Some(v)) => Some(shader("vertex", &v)),
+            (None, None) => None,
+        };
+        let Some(first) = first else {
             // Said with every program the index knows anywhere in the
             // description's first 32 words, to learn a layout from.
             let wide = words::<32>(desc);
@@ -1142,10 +1155,10 @@ pub(crate) extern "system" fn create_precompiled_graphics(
             let found: Vec<String> = (5..all.len().saturating_sub(1))
                 .filter_map(|at| precompiled(all, at).map(|(stage, c)| format!("word {at}: {stage} {}", shader_hash(&c))))
                 .collect();
-            missed(0x1c8, &format!("no vertex program (programs found: {found:?}, description {all:x?})"));
+            missed(0x1c8, &format!("no vertex or mesh program (programs found: {found:?}, description {all:x?})"));
             return E_NOTIMPL;
         };
-        let mut shaders = vec![shader("vertex", &vertex)];
+        let mut shaders = vec![first];
         shaders.extend(pixel.map(|p| shader("pixel", &p)));
         if let Some(g) = geometry {
             let g = shader("geometry", &g);
