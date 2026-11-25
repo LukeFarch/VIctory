@@ -2,8 +2,8 @@
 //! window to present on.
 //!
 //! By default CPU and GPU overlap ([`pipelined`]): the title's submissions
-//! are prepared on a thread of their own ([`ahead`]), sent without a wait
-//! ([`late`]) and copied back by another ([`relay`]).
+//! are sent without a wait ([`late`]) and copied back by a thread of
+//! their own ([`relay`]).
 //! `VICTORY_PIPELINE=0` waits for every submission, as before.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1676,8 +1676,8 @@ pub(crate) fn late() -> bool {
 
 /// Whether CPU and GPU overlap by default: submissions are sent ahead at
 /// stage 3 ([`late_free_present`]), what shaders wrote is copied back by
-/// the relay at its second stage ([`relay_exact`]), and the title's
-/// submissions are prepared on a thread of their own ([`ahead`]).
+/// the relay at its second stage ([`relay_exact`]). (Preparing on a
+/// thread of its own, [`ahead`], is not part of it: run 30.)
 /// `VICTORY_PIPELINE=0` turns all of it off at once: every submission is
 /// prepared, sent, waited for and copied back on the title's thread, as
 /// before. The single switches (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`,
@@ -2338,7 +2338,15 @@ fn late_threads() {
 }
 
 /// Whether the title's submissions are prepared on a thread of their own
-/// (`VICTORY_SUBMIT_THREAD`; on with [`late`] unless `0`).
+/// (`VICTORY_SUBMIT_THREAD=1`, with [`late`]; off by default).
+///
+/// Off since run 30: with it Lucia's cloth shirt shifted and shards showed,
+/// and with `VICTORY_SUBMIT_THREAD=0` (run 30a) both were gone. The title
+/// rewrites memory its lists read (vertex and cloth buffers) soon after
+/// its call to execute, before it is told anything, so preparing must read
+/// that memory inside the call. A copy taken at the call would be the same
+/// reads and the same cost, plus memory the PC does not have (30.4 of
+/// 31.1 GB in use), so the switch stays for comparison only.
 ///
 /// With [`late`] alone the card runs while we prepare, but the preparing
 /// (title memory copied into host copies, textures detiled, snapshots,
@@ -2371,7 +2379,7 @@ fn late_threads() {
 /// console's card reads it too.
 pub(crate) fn ahead() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| late() && std::env::var_os("VICTORY_SUBMIT_THREAD").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| late() && std::env::var_os("VICTORY_SUBMIT_THREAD").is_some_and(|v| v == "1"))
 }
 
 /// The most submissions the line of [`ahead`] holds before the title's
@@ -2501,7 +2509,7 @@ fn ahead_threads() {
         match std::thread::Builder::new().name("victory-submit".into()).spawn(ahead_worker) {
             Ok(_) => tracing::info!(
                 most = ahead_most(),
-                "the title's submissions are prepared and sent by a thread of their own (VICTORY_SUBMIT_THREAD=0 turns it off)"
+                "the title's submissions are prepared and sent by a thread of their own (VICTORY_SUBMIT_THREAD=1)"
             ),
             Err(e) => fail(format_args!("no thread to prepare the title's submissions (VICTORY_SUBMIT_THREAD=0 runs without): {e}")),
         }
