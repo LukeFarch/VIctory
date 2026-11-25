@@ -77,6 +77,11 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host sets: the number of
+/// the first thread group in x, for a dispatch of more groups than the host
+/// runs in one dimension (65,535), which it runs in parts. No program asks
+/// for it yet: until the translator does, such a dispatch runs as before.
+pub const USER_GROUP_BASE: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
