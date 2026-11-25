@@ -2415,6 +2415,7 @@ impl Shadow {
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
+                crate::dirty::check_changed(start + at, host, old);
                 // Title memory with the GPU's bytes put in; the copy takes
                 // the title's bytes in turn.
                 // Without a branch, so the loop runs many bytes at a time:
@@ -2547,6 +2548,7 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return (0, None);
         }
+        crate::dirty::check_changed(start + at, now, held);
         if !merge_piece(now, held, title) {
             return (0, None);
         }
@@ -3230,6 +3232,7 @@ impl Shadow {
         title.resize(n, 0);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
+            crate::dirty::check_changed(start + at, gpu, old);
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
@@ -3377,6 +3380,9 @@ impl Shadow {
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
+            if mapped {
+                crate::dirty::check_changed(start + at + a, &gpu[a..b], &held[a..b]);
+            }
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);

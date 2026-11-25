@@ -3537,7 +3537,7 @@ impl Host {
     }
 
     /// An allocator and a closed list for a prelude.
-    fn make_prelude(&self) -> Option<Prelude> {
+    pub(crate) fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
@@ -3767,6 +3767,16 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
+    /// With the dirty-page mask (`crate::dirty`): if a list of `runs`
+    /// bound it, the list of ours that takes submission `number`'s marks
+    /// back, to be executed after them.
+    fn dirty_after(&self, runs: &[&HostList], number: u64) -> Option<ID3D12CommandList> {
+        if crate::dirty::mode() == 0 || !runs.iter().any(|l| l.used(crate::dirty::USED)) {
+            return None;
+        }
+        crate::dirty::after(self, number)
+    }
+
     fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
         let _z = crate::trace::zone("card copies: send changed ranges, record compare");
         use std::sync::Arc;
@@ -4415,6 +4425,9 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
+                for flight in &flights {
+                    crate::dirty::landed(flight.number);
+                }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
                 let mut back: Vec<Declared> = Vec::new();
@@ -4875,6 +4888,7 @@ impl Host {
                     let Late::Run(flight) = item else {
                         continue;
                     };
+                    crate::dirty::landed(flight.number);
                     if let Some(card) = &flight.card {
                         self.card_back(card, submitted, &mut seen);
                     }
@@ -5147,9 +5161,14 @@ impl Host {
             let mut _x = crate::trace::zone("submit: ExecuteCommandLists and signal");
             _x.arg(lists.len() as u64);
             // SAFETY: closed lists; the fence is ours.
+            let dirty = self.dirty_after(runs, this_submission);
+            // SAFETY: as above.
             let signalled = unsafe {
                 crate::rebar::flush_writes();
                 self.queue.ExecuteCommandLists(&lists);
+                if let Some(d) = &dirty {
+                    self.queue.ExecuteCommandLists(&[Some(d.clone())]);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
             drop(_x);
@@ -5194,6 +5213,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        let dirty = self.dirty_after(runs, this_submission);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -5201,6 +5221,11 @@ impl Host {
             unsafe {
                 crate::rebar::flush_writes();
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len()
+                    && let Some(d) = &dirty
+                {
+                    self.queue.ExecuteCommandLists(&[Some(d.clone())]);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -5275,6 +5300,7 @@ impl Host {
             ));
         }
         submitting(3, runs.len());
+        crate::dirty::landed(this_submission);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -6227,6 +6253,12 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether the list asked about `key` since the reset
+    /// ([`HostList::first_use`]).
+    pub(crate) fn used(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -7136,6 +7168,7 @@ impl Meter {
                     );
                 }
             }
+            crate::dirty::line();
             {
                 let [guarded, stale] = crate::watch::TWINS.each_ref().map(|c| c.load(Ordering::Relaxed));
                 if guarded + stale > 0 {
