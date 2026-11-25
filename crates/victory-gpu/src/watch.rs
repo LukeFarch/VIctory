@@ -435,14 +435,19 @@ fn guard_ask() -> bool {
 }
 
 /// Whether [`writes`] goes straight to the guards for a range whose first
-/// block they hold (on by default; `VICTORY_GUARD_FIRST=0` asks the kernel
-/// first, as before, and goes to the guards when that fails).
+/// block they hold (`VICTORY_GUARD_FIRST=1`; off by default: the kernel is
+/// asked first, and the guards only when that fails).
 ///
-/// The guards hold only view memory, which the kernel cannot write-watch:
-/// for it the asking always failed, a system call for nothing.
+/// Off since run P1 (52e8c46), which loaded bodies late and drew black
+/// figures: the guards' "absent" set also takes blocks of write-watched
+/// reservations that were not committed yet (`is_view` counts a range with
+/// nothing there as a view), and once the title commits them they were
+/// guarded read-only in place of being write-watched. A kernel or storage
+/// read into such memory is then refused (the run's log: "the kernel
+/// refused a read's destination"). Only with that fixed can this be on.
 fn guard_first() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !guard_ask() && std::env::var_os("VICTORY_GUARD_FIRST").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| !guard_ask() && std::env::var_os("VICTORY_GUARD_FIRST").is_some_and(|v| v == "1"))
 }
 
 /// Whether the guards hold the block of `at` (read-only by our hand, or
