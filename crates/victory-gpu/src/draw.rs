@@ -1651,9 +1651,28 @@ impl State {
             (PER_FRAME, SPAN)
         };
         let began = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let due_count = due.len();
+        #[cfg(feature = "diagnostics")]
+        let mut looked = 0usize;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
+                // In captured frames: how many due slots this frame's pass
+                // left blank for want of time or bytes.
+                #[cfg(feature = "diagnostics")]
+                crate::capture::op(std::ptr::from_ref(list) as usize, || {
+                    format!(
+                        "TEXTURE QUEUE pass stopped: {} of {due_count} due slots left for later ({} MB staged, {} ms)",
+                        due_count - looked,
+                        SPENT.load(Ordering::Relaxed) >> 20,
+                        began.elapsed().as_millis()
+                    )
+                });
                 break;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                looked += 1;
             }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
@@ -1675,6 +1694,16 @@ impl State {
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                    // In captured frames: which slot stays blank, and the
+                    // memory and T# words that would fill it, to trace a
+                    // dark surface in the PNG to the texture not there.
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::op(std::ptr::from_ref(list) as usize, || {
+                        format!(
+                            "TEXTURE BLANK slot {index} unmapped: memory {address:#x}+{len:#x} T# {:08x?}",
+                            &desc[..desc.len().min(8)]
+                        )
+                    });
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
                     host.texture_slot_later(index, write, frame, most);
@@ -1683,6 +1712,13 @@ impl State {
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        crate::capture::op(std::ptr::from_ref(list) as usize, || {
+                            format!(
+                                "TEXTURE PART slot {index} waits for more: {mapped:#x} of memory {address:#x}+{len:#x} mapped, T# {:08x?}",
+                                &desc[..desc.len().min(8)]
+                            )
+                        });
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
